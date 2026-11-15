@@ -8,6 +8,7 @@ const image_mod = @import("image.zig");
 pub const Image = image_mod.Image;
 pub const ImageOpts = image_mod.ImageOpts;
 pub const Fit = image_mod.Fit;
+pub const SvgIcon = image_mod.SvgIcon;
 
 pub const Align = enum { left, center, right };
 
@@ -26,6 +27,9 @@ pub const Command = union(enum) {
     /// A loaded image (see `Window.loadImage`) fitted into `rect`. Drawn as nothing if the
     /// handle is not (or no longer) valid for the window.
     image: struct { rect: Rect, image: Image, opts: ImageOpts },
+    /// A loaded SVG icon (see `Window.loadSvg`) fitted (contain, centred, snapped to device
+    /// pixels) into `rect` and tinted with `color`. Nothing if the handle is not valid.
+    svg_icon: struct { rect: Rect, icon: SvgIcon, color: Color },
     /// Restricts drawing to `Rect` (intersected with any clip already active)
     /// until the matching `pop_clip`.
     push_clip: Rect,
@@ -101,6 +105,12 @@ pub const DisplayList = struct {
         l.push(.{ .image = .{ .rect = r, .image = img, .opts = opts } });
     }
 
+    /// Draws the SVG icon `icon` in `r` (contain-fit, centred) in `color`: a monochrome icon is
+    /// painted in that colour, a colour icon is multiplied by it (white = unchanged).
+    pub fn svgIcon(l: *DisplayList, r: Rect, icon: SvgIcon, color: Color) void {
+        l.push(.{ .svg_icon = .{ .rect = r, .icon = icon, .color = color } });
+    }
+
     pub fn text(l: *DisplayList, x: f32, y: f32, size: f32, color: Color, alignment: Align, str: []const u8) void {
         const copy = l.arena.allocator().dupe(u8, str) catch @panic("out of memory");
         l.push(.{ .text = .{ .x = x, .y = y, .str = copy, .size = size, .color = color, .alignment = alignment } });
@@ -139,4 +149,12 @@ test "image records one command with its options" {
     try std.testing.expectEqual(@as(usize, 1), l.cmds.items.len);
     try std.testing.expectEqual(Fit.cover, l.cmds.items[0].image.opts.fit);
     try std.testing.expectEqual(@as(u32, 1), l.cmds.items[0].image.image.id);
+}
+
+test "svgIcon records one command" {
+    var l = DisplayList.init(std.testing.allocator);
+    defer l.deinit();
+    l.svgIcon(.{ .x = 1, .y = 2, .w = 16, .h = 16 }, .{ .id = 4, .aspect = 1 }, .{ .r = 1, .g = 2, .b = 3 });
+    try std.testing.expectEqual(@as(usize, 1), l.cmds.items.len);
+    try std.testing.expectEqual(@as(u32, 4), l.cmds.items[0].svg_icon.icon.id);
 }

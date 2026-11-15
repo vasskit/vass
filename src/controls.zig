@@ -33,7 +33,7 @@ pub const ToggleOpts = struct {
 
 pub const Segment = struct {
     /// Drawn left of the label (or alone); null for none.
-    icon: ?icons.Icon = null,
+    icon: ?icons.Source = null,
     /// Text; empty for an icon-only segment.
     label: []const u8 = "",
 };
@@ -237,7 +237,7 @@ pub fn segmented(ui: *Ui, r: Rect, items: []const Segment, selected: *usize, opt
         const cw = segmentContentW(ui, s, size, opts);
         var x = seg.x + (seg.w - cw) / 2;
         if (s.icon) |ic| {
-            icons.draw(ui.list, ic, .{ .x = x, .y = seg.y + (seg.h - opts.icon_size) / 2, .w = opts.icon_size, .h = opts.icon_size }, col, 1);
+            icons.drawSource(ui.list, ic, .{ .x = x, .y = seg.y + (seg.h - opts.icon_size) / 2, .w = opts.icon_size, .h = opts.icon_size }, col, 1);
             x += opts.icon_size + 5;
         }
         if (s.label.len > 0) ui.list.textWeighted(x, textY(seg, size), size, col, .left, .medium, s.label);

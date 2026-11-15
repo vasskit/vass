@@ -22,6 +22,47 @@ pub const Icon = enum {
     plus,
 };
 
+pub const SvgIcon = gfx.SvgIcon;
+
+/// Where an icon comes from: one of the built-in line icons or a loaded SVG. Widgets that
+/// take an icon accept either: write `.search` (a built-in, through a declaration literal)
+/// or `.{ .svg = my_icon }`; `Source.from` converts an `Icon` or `SvgIcon` value.
+pub const Source = union(enum) {
+    builtin: Icon,
+    svg: SvgIcon,
+
+    pub const sidebar: Source = .{ .builtin = .sidebar };
+    pub const chevron_right: Source = .{ .builtin = .chevron_right };
+    pub const chevron_down: Source = .{ .builtin = .chevron_down };
+    pub const chevron_left: Source = .{ .builtin = .chevron_left };
+    pub const arrow_left: Source = .{ .builtin = .arrow_left };
+    pub const arrow_right: Source = .{ .builtin = .arrow_right };
+    pub const search: Source = .{ .builtin = .search };
+    pub const panel_right: Source = .{ .builtin = .panel_right };
+    pub const more: Source = .{ .builtin = .more };
+    pub const sliders: Source = .{ .builtin = .sliders };
+    pub const arrow_up: Source = .{ .builtin = .arrow_up };
+    pub const plus: Source = .{ .builtin = .plus };
+
+    /// Accepts a `Source`, an `Icon`, an `SvgIcon` or an enum literal naming a built-in.
+    pub fn from(x: anytype) Source {
+        const T = @TypeOf(x);
+        if (T == Source) return x;
+        if (T == Icon or T == @TypeOf(.enum_literal)) return .{ .builtin = x };
+        if (T == SvgIcon) return .{ .svg = x };
+        @compileError("icons.Source.from: expected Icon, SvgIcon or Source, found " ++ @typeName(T));
+    }
+};
+
+/// Draws `src` centred in `r` in `color`. A built-in is stroked with `weight`; an SVG icon is
+/// contain-fitted and tinted (its own stroke widths apply; `weight` is ignored).
+pub fn drawSource(list: *gfx.DisplayList, src: Source, r: Rect, color: Color, weight: f32) void {
+    switch (src) {
+        .builtin => |ic| draw(list, ic, r, color, weight),
+        .svg => |sv| list.svgIcon(r, sv, color),
+    }
+}
+
 /// Draws `icon` centred in `r`, scaled to its shorter side, stroked in `color`.
 /// `weight` scales the stroke (1 = about 1.5 pt at 18 pt).
 pub fn draw(list: *gfx.DisplayList, icon: Icon, r: Rect, color: Color, weight: f32) void {
@@ -146,4 +187,29 @@ test "icons centre in a non-square rect and scale with the short side" {
     const v = l.cmds.items[0].line; // vertical bar at design x = 9
     try std.testing.expectEqual(@as(f32, 50), v.x0);
     try std.testing.expectEqual(@as(f32, 3), v.y0);
+}
+
+test "every built-in has a Source declaration, and Source.from accepts all forms" {
+    inline for (comptime std.enums.values(Icon)) |ic| {
+        const src: Source = @field(Source, @tagName(ic));
+        try std.testing.expectEqual(ic, src.builtin);
+    }
+    const ic: Icon = .more;
+    try std.testing.expectEqual(Icon.more, Source.from(ic).builtin);
+    try std.testing.expectEqual(Icon.plus, Source.from(.plus).builtin);
+    try std.testing.expectEqual(@as(u32, 3), Source.from(SvgIcon{ .id = 3 }).svg.id);
+    const s: Source = .search;
+    try std.testing.expectEqual(Icon.search, Source.from(s).builtin);
+}
+
+test "drawSource records a built-in as strokes and an SVG as one command" {
+    var l = gfx.DisplayList.init(std.testing.allocator);
+    defer l.deinit();
+    const r: Rect = .{ .x = 0, .y = 0, .w = 16, .h = 16 };
+    drawSource(&l, .plus, r, Color.hex(0xffffff), 1);
+    try std.testing.expect(l.cmds.items.len >= 2);
+    l.reset();
+    drawSource(&l, .{ .svg = .{ .id = 9, .aspect = 1 } }, r, Color.hex(0xffffff), 1);
+    try std.testing.expectEqual(@as(usize, 1), l.cmds.items.len);
+    try std.testing.expectEqual(@as(u32, 9), l.cmds.items[0].svg_icon.icon.id);
 }

@@ -7,8 +7,12 @@ const Color = geom.Color;
 const keys = @import("keys.zig");
 const image_mod = @import("image.zig");
 const decode_mod = @import("decode.zig");
+const svg_mod = @import("svg.zig");
+const raster_mod = @import("raster.zig");
+const svg_cache = @import("svg_cache.zig");
 pub const Image = image_mod.Image;
 pub const ImageOpts = image_mod.ImageOpts;
+pub const SvgIcon = image_mod.SvgIcon;
 
 const c = struct {
     const SdlWindow = opaque {};
@@ -566,6 +570,26 @@ var next_image_id: u32 = 1;
 /// Textures are downscaled (box filter) to at most this many pixels per side.
 const max_texture_side: u32 = 2048;
 
+/// SVG icon ids, like image ids: unique across windows, never reused.
+var next_svg_id: u32 = 1;
+/// Icon textures are never larger than this per side (bigger requests are scaled down).
+const max_svg_side: u32 = 1024;
+
+pub const SvgError = svg_mod.Error;
+/// How an SVG is rasterised.
+pub const SvgOptions = struct {
+    /// Keep the SVG's own colours and gradients (a logo or illustration). The colour passed
+    /// when drawing then multiplies them (white = as authored), and `currentColor` is white.
+    /// False (the default): a monochrome icon; every painted shape is ink, drawn in the
+    /// colour passed when drawing.
+    color: bool = false,
+};
+const SvgEntry = struct { doc: svg_mod.Doc, color: bool };
+
+fn destroySvgTexture(_: void, t: ?*c.Texture) void {
+    if (t) |tex| c.SDL_DestroyTexture(tex);
+}
+
 pub const ImageError = decode_mod.Error || error{ FileReadFailed, TextureFailed };
 
 const CachedText = struct { tex: *c.Texture, w: f32, h: f32, last_frame: u64 };
@@ -597,6 +621,9 @@ pub const Window = struct {
     clip_n: usize = 0,
     font_set: ?FontSet = null,
     images: std.AutoHashMapUnmanaged(u32, ImageTex) = .empty,
+    svgs: std.AutoHashMapUnmanaged(u32, SvgEntry) = .empty,
+    /// Rasterised icons per (icon, pixel size); a null texture marks a size that failed.
+    svg_cache: svg_cache.Cache(?*c.Texture) = .{},
 
     pub fn init(gpa: std.mem.Allocator, opts: WindowOptions) !Window {
         if (live_windows == 0) {
@@ -633,6 +660,10 @@ pub const Window = struct {
         var imgs = w.images.valueIterator();
         while (imgs.next()) |t| c.SDL_DestroyTexture(t.tex);
         w.images.deinit(w.gpa);
+        w.svg_cache.deinit(w.gpa, {}, destroySvgTexture);
+        var docs = w.svgs.valueIterator();
+        while (docs.next()) |e| e.doc.deinit();
+        w.svgs.deinit(w.gpa);
         for (w.fonts.items) |f| c.TTF_CloseFont(f.font);
         w.fonts.deinit(w.gpa);
         w.verts.deinit(w.gpa);
@@ -772,6 +803,133 @@ pub const Window = struct {
         return .{ .w = t.w, .h = t.h };
     }
 
+    // ---- SVG icons ----------------------------------------------------
+
+    /// Parses an SVG as a monochrome icon (see `svg.zig` for what is supported). Nothing is
+    /// rasterised yet: that happens on first draw, once per pixel size (cached, bounded).
+    /// Fails with `InvalidSvg` or `TooComplex`.
+    pub fn loadSvg(w: *Window, bytes: []const u8) SvgError!SvgIcon {
+        return w.loadSvgOpts(bytes, .{});
+    }
+
+    pub fn loadSvgOpts(w: *Window, bytes: []const u8, opts: SvgOptions) SvgError!SvgIcon {
+        var doc = try svg_mod.parse(w.gpa, bytes);
+        errdefer doc.deinit();
+        const new_id = next_svg_id;
+        try w.svgs.put(w.gpa, new_id, .{ .doc = doc, .color = opts.color });
+        next_svg_id += 1;
+        return .{ .id = new_id, .aspect = doc.aspect() };
+    }
+
+    /// Frees the icon and its cached textures; the handle (and copies) draw nothing afterwards.
+    /// Call between frames (never while a display list that uses it is being rendered).
+    pub fn unloadSvg(w: *Window, icon: SvgIcon) void {
+        if (w.svgs.fetchRemove(icon.id)) |kv| {
+            var doc = kv.value.doc;
+            doc.deinit();
+            w.svg_cache.removeIcon(w.gpa, icon.id, {}, destroySvgTexture);
+        }
+    }
+
+    pub fn hasSvg(w: *const Window, icon: SvgIcon) bool {
+        return icon.isValid() and w.svgs.contains(icon.id);
+    }
+
+    /// Number of icon textures currently cached (for tests and diagnostics).
+    pub fn svgTextureCount(w: *const Window) usize {
+        return w.svg_cache.count();
+    }
+
+    /// The device-pixel size an icon drawn into `r` gets: contain-fit, rounded to whole pixels.
+    /// Pure; shared with the drawing code.
+    pub fn svgPixelSize(r: geom.Rect, aspect: f32, density: f32) ?struct { w: u32, h: u32 } {
+        const sw = r.w * density;
+        const sh = r.h * density;
+        if (!(sw >= 1 and sh >= 1) or !(aspect > 0) or !std.math.isFinite(sw) or !std.math.isFinite(sh)) return null;
+        var wpx: f32 = undefined;
+        var hpx: f32 = undefined;
+        if (aspect >= 1) {
+            wpx = @round(@min(sw, sh * aspect));
+            hpx = @round(wpx / aspect);
+        } else {
+            hpx = @round(@min(sh, sw / aspect));
+            wpx = @round(hpx * aspect);
+        }
+        wpx = @max(wpx, 1);
+        hpx = @max(hpx, 1);
+        const big = @max(wpx, hpx);
+        const lim: f32 = @floatFromInt(max_svg_side);
+        if (big > lim) {
+            wpx = @max(1, @round(wpx * lim / big));
+            hpx = @max(1, @round(hpx * lim / big));
+        }
+        return .{ .w = @intFromFloat(wpx), .h = @intFromFloat(hpx) };
+    }
+
+    fn makeSvgTexture(w: *Window, e: *const SvgEntry, wpx: u32, hpx: u32) ?*c.Texture {
+        const n = @as(usize, wpx) * hpx;
+        const rgba = w.gpa.alloc(u8, n * 4) catch return null;
+        defer w.gpa.free(rgba);
+        if (e.color) {
+            const px = raster_mod.renderRgba(w.gpa, &e.doc, wpx, hpx, .{ .r = 255, .g = 255, .b = 255 }) catch return null;
+            defer w.gpa.free(px);
+            @memcpy(rgba, px);
+        } else {
+            const mask = raster_mod.renderMask(w.gpa, &e.doc, wpx, hpx) catch return null;
+            defer w.gpa.free(mask);
+            // Premultiplied white: the tint colour then scales it at draw time.
+            for (mask, 0..) |a, i| rgba[i * 4 ..][0..4].* = .{ a, a, a, a };
+        }
+        const tex = c.SDL_CreateTexture(w.ren, c.PIXELFORMAT_RGBA32, c.TEXTUREACCESS_STATIC, @intCast(wpx), @intCast(hpx)) orelse return null;
+        if (!c.SDL_UpdateTexture(tex, null, rgba.ptr, @intCast(wpx * 4))) {
+            c.SDL_DestroyTexture(tex);
+            return null;
+        }
+        _ = c.SDL_SetTextureBlendMode(tex, c.BLENDMODE_BLEND_PREMULTIPLIED);
+        _ = c.SDL_SetTextureScaleMode(tex, c.SCALEMODE_LINEAR);
+        return tex;
+    }
+
+    fn drawSvg(w: *Window, r: geom.Rect, icon: SvgIcon, color: Color) void {
+        const e = w.svgs.getPtr(icon.id) orelse return;
+        if (color.a == 0) return;
+        const d = w.density;
+        const aspect = e.doc.aspect();
+        const sz = svgPixelSize(r, aspect, d) orelse return;
+        const k = svg_cache.key(icon.id, sz.w, sz.h);
+        const tex_opt: ?*c.Texture = w.svg_cache.get(k, w.frame) orelse blk: {
+            const t = w.makeSvgTexture(e, sz.w, sz.h);
+            w.svg_cache.put(w.gpa, k, t, @as(usize, sz.w) * sz.h * 4, w.frame) catch {
+                if (t) |tt| c.SDL_DestroyTexture(tt);
+                return;
+            };
+            break :blk t;
+        };
+        const tex = tex_opt orelse return;
+        // Snap to whole device pixels so a stroke that is a whole number of pixels stays crisp.
+        const wf: f32 = @floatFromInt(sz.w);
+        const hf: f32 = @floatFromInt(sz.h);
+        const x0 = @round(r.x * d + (r.w * d - wf) / 2);
+        const y0 = @round(r.y * d + (r.h * d - hf) / 2);
+        const a = @as(f32, @floatFromInt(color.a)) / 255.0;
+        const tr = @as(f32, @floatFromInt(color.r)) / 255.0 * a;
+        const tg = @as(f32, @floatFromInt(color.g)) / 255.0 * a;
+        const tb = @as(f32, @floatFromInt(color.b)) / 255.0 * a;
+        const col: c.FColor = .{ .r = tr, .g = tg, .b = tb, .a = a };
+        const l = x0 / d;
+        const t = y0 / d;
+        const rr = (x0 + wf) / d;
+        const bb = (y0 + hf) / d;
+        const verts = [4]c.Vertex{
+            .{ .position = .{ .x = l, .y = t }, .color = col, .tex_coord = .{ .x = 0, .y = 0 } },
+            .{ .position = .{ .x = rr, .y = t }, .color = col, .tex_coord = .{ .x = 1, .y = 0 } },
+            .{ .position = .{ .x = rr, .y = bb }, .color = col, .tex_coord = .{ .x = 1, .y = 1 } },
+            .{ .position = .{ .x = l, .y = bb }, .color = col, .tex_coord = .{ .x = 0, .y = 1 } },
+        };
+        const idx = [6]c_int{ 0, 1, 2, 0, 2, 3 };
+        _ = c.SDL_RenderGeometry(w.ren, tex, &verts, 4, &idx, 6);
+    }
+
     /// Sets the window icon from straight-alpha RGBA8 pixels (used by platforms that have
     /// window icons; on macOS see `macos.setDockIcon`).
     pub fn setIcon(w: *Window, rgba: []const u8, width: u32, height: u32) !void {
@@ -902,6 +1060,10 @@ pub const Window = struct {
                 w.flush();
                 w.drawImage(im.rect, im.image, im.opts);
             },
+            .svg_icon => |sv| {
+                w.flush();
+                w.drawSvg(sv.rect, sv.icon, sv.color);
+            },
             .text => |t| {
                 w.flush();
                 w.drawText(t.x, t.y, t.str, t.size, t.color, t.alignment, t.weight);
@@ -920,6 +1082,7 @@ pub const Window = struct {
         }
         _ = c.SDL_RenderPresent(w.ren);
         w.evictTexts();
+        w.svg_cache.evict(w.gpa, w.frame, {}, destroySvgTexture);
     }
 
     // ---- clipping -----------------------------------------------------
@@ -1258,4 +1421,27 @@ test "a long path does not fit a DropPath" {
     const long: [2000]u8 = @splat('a');
     try std.testing.expect(DropPath.from(&long) == null);
     try std.testing.expect(DropPath.from("") == null);
+}
+
+test "svgPixelSize: contain-fits into whole device pixels" {
+    const sz = Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 16, .h = 16 }, 1, 2).?;
+    try std.testing.expectEqual(@as(u32, 32), sz.w);
+    try std.testing.expectEqual(@as(u32, 32), sz.h);
+    // Wide icon in a square: width limits.
+    const wide = Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 20, .h = 20 }, 2, 1).?;
+    try std.testing.expectEqual(@as(u32, 20), wide.w);
+    try std.testing.expectEqual(@as(u32, 10), wide.h);
+    // Tall icon in a wide rectangle: height limits.
+    const tall = Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 100, .h = 18 }, 0.5, 2).?;
+    try std.testing.expectEqual(@as(u32, 18), tall.w);
+    try std.testing.expectEqual(@as(u32, 36), tall.h);
+    // Different density, different size: one texture per pixel size.
+    const d3 = Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 16, .h = 16 }, 1, 3).?;
+    try std.testing.expectEqual(@as(u32, 48), d3.w);
+    // Degenerate rectangles and aspects draw nothing; huge ones are capped.
+    try std.testing.expect(Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 0, .h = 16 }, 1, 2) == null);
+    try std.testing.expect(Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 16, .h = 16 }, 0, 2) == null);
+    try std.testing.expect(Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 16, .h = 16 }, std.math.nan(f32), 2) == null);
+    const big = Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 5000, .h = 5000 }, 1, 2).?;
+    try std.testing.expectEqual(max_svg_side, big.w);
 }

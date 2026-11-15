@@ -27,6 +27,20 @@ pub const Image = struct {
     }
 };
 
+/// A loaded SVG icon (see `Window.loadSvg`): an id plus the aspect ratio (width / height) of
+/// its viewBox. Small and copyable. The id 0 is never issued (`none`) and ids are never
+/// reused, so drawing an unloaded, foreign or default handle draws nothing.
+pub const SvgIcon = struct {
+    id: u32 = 0,
+    aspect: f32 = 1,
+
+    pub const none: SvgIcon = .{};
+
+    pub fn isValid(i: SvgIcon) bool {
+        return i.id != 0 and i.aspect > 0;
+    }
+};
+
 pub const Fit = enum {
     /// Stretch to the whole rectangle (aspect ratio not kept).
     fill,

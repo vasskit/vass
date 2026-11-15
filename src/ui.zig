@@ -454,6 +454,11 @@ pub const Ui = struct {
         return ui.hit(r);
     }
 
+    /// Draws an icon (a built-in, an `SvgIcon` or an `icons.Source`) centred in `r` in `color`.
+    pub fn drawIcon(ui: *Ui, r: Rect, src: anytype, color: Color) void {
+        icons.drawSource(ui.list, icons.Source.from(src), r, color, 1);
+    }
+
     pub fn card(ui: *Ui, r: Rect) void {
         ui.list.rrect(r, ui.theme.card_radius, ui.theme.card);
     }
@@ -562,7 +567,8 @@ pub const Ui = struct {
     /// A square icon button: a subtle rounded background when hovered or
     /// `active`, the icon centred in `r`. Returns the interaction of `r`;
     /// a disabled button is never hovered or clicked.
-    pub fn iconButton(ui: *Ui, r: Rect, icon: icons.Icon, opts: IconButtonOpts) Interaction {
+    /// `icon` is a built-in (`.search`, an `icons.Icon`), a loaded `SvgIcon` or an `icons.Source`.
+    pub fn iconButton(ui: *Ui, r: Rect, icon: anytype, opts: IconButtonOpts) Interaction {
         const t = ui.theme;
         var hv = ui.hit(r);
         if (opts.disabled) hv = .{ .hovered = false, .clicked = false };
@@ -573,7 +579,7 @@ pub const Ui = struct {
         }
         const base = opts.color orelse t.dim;
         const color = if (opts.disabled) base.alpha(90) else if (hv.hovered or opts.active) t.text else base;
-        icons.draw(ui.list, icon, r.center(opts.icon_size, opts.icon_size), color, opts.weight);
+        icons.drawSource(ui.list, icons.Source.from(icon), r.center(opts.icon_size, opts.icon_size), color, opts.weight);
         return hv;
     }
 
@@ -2337,3 +2343,36 @@ test "Ui.image records a command and reports hover" {
     try std.testing.expectEqual(@as(usize, 1), list.cmds.items.len);
     in.endFrame();
 }
+
+test "icon widgets accept built-ins, Icon values, SvgIcon and Source" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    const r: Rect = .{ .x = 0, .y = 0, .w = 30, .h = 30 };
+    var ui = Ui.initHeadless(&list, .{ .mouse_x = 15, .mouse_y = 15, .pressed = true }, .{}, null);
+    const ic: icons.Icon = .plus;
+    const sv: gfx.SvgIcon = .{ .id = 5, .aspect = 1 };
+    try std.testing.expect(ui.iconButton(r, .search, .{}).clicked); // enum literal
+    try std.testing.expect(ui.iconButton(r, ic, .{}).clicked); // Icon value
+    list.reset();
+    try std.testing.expect(ui.iconButton(r, sv, .{ .icon_size = 16 }).clicked);
+    try std.testing.expect(ui.iconButton(r, icons.Source{ .svg = sv }, .{ .disabled = true, .icon_size = 16 }).clicked == false);
+    var found: usize = 0;
+    for (list.cmds.items) |cmd| switch (cmd) {
+        .svg_icon => |s| {
+            found += 1;
+            try std.testing.expectEqual(@as(u32, 5), s.icon.id);
+            try std.testing.expectEqual(@as(f32, 16), s.rect.w); // centred icon_size square
+            try std.testing.expectEqual(@as(f32, 7), s.rect.x);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), found);
+    // Segments take both kinds, written as before.
+    const segs = [_]Segment{ .{ .icon = .search }, .{ .icon = .{ .svg = sv }, .label = "x" } };
+    try std.testing.expect(segs[0].icon.?.builtin == .search);
+    list.reset();
+    ui.drawIcon(r, SvgIcon_none, Color.hex(0xffffff)); // an invalid handle is recorded; the backend draws nothing
+    try std.testing.expectEqual(@as(usize, 1), list.cmds.items.len);
+}
+
+const SvgIcon_none: gfx.SvgIcon = .none;

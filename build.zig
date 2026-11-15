@@ -118,6 +118,21 @@ pub fn build(b: *std.Build) void {
     run_images.addPassthruArgs();
     b.step("images", "Run the images showcase").dependOn(&run_images.step);
     test_step.dependOn(&images.step);
+
+    // Example: SVG icons. `zig build icons -- --snapshot DIR`.
+    const icons_ex = b.addExecutable(.{
+        .name = "icons",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/icons.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_icons = b.addRunArtifact(icons_ex);
+    run_icons.addPassthruArgs();
+    b.step("icons", "Run the SVG icons showcase").dependOn(&run_icons.step);
+    test_step.dependOn(&icons_ex.step);
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

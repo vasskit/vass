@@ -16,6 +16,10 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 - `src/image.zig` — `Image` handles, `ImageOpts`/`Fit` and the pure fit math. No platform.
 - `src/decode.zig` — PNG/JPEG/BMP/GIF decoding from memory (stb_image) to RGBA8, plus the pure
   pixel helpers (premultiply, box downscale). No platform.
+- `src/svg.zig` — SVG parser (shapes, full path grammar, styles, transforms, gradients). Pure Zig.
+- `src/raster.zig` — rasteriser for parsed SVGs: curve flattening, stroker, exact-area scanline
+  fill, A8 masks and RGBA. Pure Zig.
+- `src/svg_cache.zig` — the bounded per-(icon, pixel size) texture cache policy. Pure.
 - `src/backend_sdl.zig` — SDL3 windows, input, text measuring and the display-list
   renderer (text via SDL3_ttf + FreeType).
 - `src/macos.zig` — menu-bar item, overlay windows, Spaces behaviour and notch metrics,
@@ -24,7 +28,7 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 - `build/deps.zig` — build helpers compiling FreeType and SDL_ttf from source (SDL3 comes
   from the castholm/SDL package).
 
-Layering rule: `geom`, `gfx`, `image` and `png` know nothing about the platform; only the backend
+Layering rule: `geom`, `gfx`, `image`, `png`, `svg`, `raster` and `svg_cache` know nothing about the platform; only the backend
 and `macos` do.
 
 ## Using it
@@ -290,3 +294,77 @@ clip, an Open... button and a drop target) to `DIR/images.bmp`.
 
 Not verified by the author without a human: the native dialog and real drag-and-drop (decoding
 of the SDL events and of the dialog callback is unit-tested with synthetic data).
+
+
+## SVG icons
+
+    const gear = try win.loadSvg(svg_bytes);                 // monochrome icon, tinted when drawn
+    const logo = try win.loadSvgOpts(svg_bytes, .{ .color = true });   // keeps colours and gradients
+    // per frame:
+    ui.drawIcon(rect, gear, color);                          // or list.svgIcon(rect, gear, color)
+    _ = ui.iconButton(btn, gear, .{ .icon_size = 18 });      // built-ins still work: iconButton(btn, .search, .{})
+    const items = [_]vass.ui.Segment{ .{ .icon = .search }, .{ .icon = .{ .svg = gear }, .label = "Gear" } };
+
+Design: rasterise, do not tessellate. The SVG is parsed once into paths (`svg.Doc`); on first
+draw each (icon, pixel size) is rasterised to a coverage mask at exactly the device-pixel size,
+uploaded as a texture and drawn through the image path, tinted. The draw rectangle is
+contain-fitted, centred and snapped to whole device pixels, so a Lucide icon at 16 pt on a 2x
+display is a 32x32 texture drawn 1:1. The same icon at several sizes in one frame, and at
+different Retina scales, just gets one texture per size. Textures are cached (at most 192 and
+24 MB, least recently used first, evicted after presenting and never one used in the frame
+being presented; sizes are capped at 1024 px a side). Drawing an invalid, unloaded or foreign
+handle draws nothing. It works in `--snapshot` runs like images do (the real renderer is used).
+
+- **API.** `Window.loadSvg(bytes) !SvgIcon`, `loadSvgOpts(bytes, .{ .color = bool })`,
+  `unloadSvg(icon)` (call between frames), `hasSvg`, `svgTextureCount`. Errors: `InvalidSvg`,
+  `TooComplex`. `vass.SvgIcon = { id, aspect }` is a small value for app state (`none`,
+  `isValid()`); `DisplayList.svgIcon(rect, icon, color)`; `Ui.drawIcon(rect, src, color)` where
+  `src` is a built-in, an `SvgIcon` or an `icons.Source`.
+- **`icons.Source`** is `union(enum) { builtin: Icon, svg: SvgIcon }`. `Ui.iconButton` takes
+  `anytype` (an enum literal like `.search`, an `Icon` value, an `SvgIcon` or a `Source`), and
+  `Segment.icon` is `?icons.Source`: `.icon = .search` still works (each built-in is also a
+  declaration of `Source`, so declaration literals resolve); write `.icon = .{ .svg = x }` or
+  `.icon = .from(my_icon_value)` for the rest. The `weight` of an icon button only applies to
+  built-in icons; an SVG keeps its own stroke widths.
+- **Monochrome vs colour.** Monochrome (the default): every painted shape counts as ink (union of
+  coverage, scaled by the shape's opacity, so duotone layers with `opacity=".2"` come out
+  lighter); colours are ignored and the draw colour is used, including its alpha. Colour mode
+  keeps each shape's flat fill / stroke colour and gradients; the draw colour then multiplies the
+  result (white = as authored) and `currentColor` is white, so it takes the draw colour.
+- **Supported SVG.** `svg` (viewBox, else width/height), `g`, `path`, `line`, `polyline`,
+  `polygon`, `circle`, `ellipse`, `rect` (rx/ry). The whole path grammar (M L H V C S Q T A Z,
+  relative forms, implicit repeats, `1.5.5`, `-1-2`, exponents, arc flags glued to numbers, arcs
+  converted to cubics). Presentation attributes, inherited from ancestors and from the root
+  `svg`, also inside `style="..."` and simple `<style>` rules (`.class`, `#id`, `tag`):
+  fill, stroke, stroke-width, -linecap, -linejoin, -miterlimit, fill-rule, opacity, fill-opacity,
+  stroke-opacity, color, display. `transform` (matrix, translate, scale, rotate, skewX/Y) on any
+  element, applied before stroking, so non-uniform scales stretch strokes like a browser.
+  Colours: `none`, `currentColor`, `#rgb[a]`, `#rrggbb[aa]`, `rgb()/rgba()`, ~50 named colours.
+  `linearGradient` and `radialGradient` (objectBoundingBox or userSpaceOnUse, gradientTransform,
+  stops with opacity, stops inherited through `href`), in colour mode.
+- **Not supported (ignored without failing).** `use`, `symbol`, `clipPath`, `mask`, `pattern`,
+  `filter`, `marker`, `text`, `image`, nested `svg` viewBoxes, `stroke-dasharray`, `vector-effect`,
+  `hsl()` colours, radial focal points, `spreadMethod` (always pad), CSS combinators /
+  pseudo-classes / attribute selectors, `%` and `em` lengths on shapes, `preserveAspectRatio`
+  (always contain, centred; the aspect comes from the viewBox), group opacity as a composite (the
+  opacity is multiplied into each child, which differs where children overlap). Content inside
+  `defs` and the other non-rendered containers is never drawn. A gradient set on a group and
+  inherited by children works; one that references a missing id paints nothing.
+- **Robust.** Malformed XML, unbalanced tags, bad path data or transforms return `InvalidSvg`;
+  documents over the caps (input 4 MB, depth 48, 20 000 elements, 4 000 shapes, 200 000 points,
+  64 gradients) return `TooComplex`. A truncation / byte-flip test runs the parser over mangled
+  input; the rasteriser clamps coordinates and refuses over-large output instead of looping.
+- **Rasteriser.** Curves are flattened with a segment count from their second differences and the
+  device scale (0.08 px tolerance; round caps and joins 4x finer). Fills use exact horizontal
+  coverage with 16 sub-scanlines per row (non-zero or even-odd); strokes become polygons (round,
+  butt or square caps; miter with limit, round or bevel joins; closed subpaths join; zero-length
+  round-capped segments become dots) that are unioned by the same non-zero fill. Vertical
+  anti-aliasing has 16 levels, so a nearly horizontal edge can be off by up to ~3 %.
+
+`zig build icons -- --snapshot DIR` draws `examples/icons.zig` to `DIR/icons.bmp`: Lucide icons
+(`examples/assets/icons/lucide-*.svg`, ISC) in several colours and at 12 to 96 pt, Phosphor fill
+icons (MIT), the built-in icons next to them, icon buttons and segmented controls with SVG icons,
+a colour SVG, and icons at fractional positions. Licences: `LICENSE-lucide.txt`,
+`LICENSE-phosphor.txt` in that folder. The tests cover the path grammar, arcs, transforms,
+style inheritance, colours, malformed input, rasteriser areas (square, circle, round-capped line,
+joins, even-odd), gradients and the cache policy.
