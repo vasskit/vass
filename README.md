@@ -102,6 +102,16 @@ per-widget state. Keyboard focus lives in a caller-owned `vass.ui.State`:
 - **`wrapText` / `measureWrapped` / `labelWrapped`**: greedy word wrap using the Ui's
   measure function; honours `\n`, breaks over-long words between characters, never splits
   UTF-8. Lines outside the clip are not drawn.
+- **`textSelectable`** (`ui.textSelectable(rect, str, &sel, opts) -> height`): read-only wrapped
+  text drawn exactly like `labelWrapped`, that can be selected with the mouse (drag, also across
+  wrapped lines and newlines; double-click = word, triple-click = line, shift-click extends),
+  copied with Cmd+C through the clipboard hook, Cmd+A to select all of it, Escape or a click
+  elsewhere to clear. One selection per `Ui.state` (`State.select`, separate from `focus`, so it
+  does not block arrow-key scrolling); starting another, or focusing a text field, clears it. Keep
+  one `vass.ui.SelectState` per text at a stable address and call `sel.clear()` when the string
+  changes (offsets are clamped defensively anyway). A selection is cleared by a click elsewhere
+  only while its text is being drawn. `Ui.offsetAtPoint(str, size, max_w, x, y)` is the pure
+  point-to-byte-offset helper behind it. `Input.mouse_clicks` carries the OS click count.
 - **Backend**: events `mouse_up`, `mouse_wheel` (lines), `text_input`, `text_editing`,
   `key_down`/`key_up` (a `Key` with `code`, `mods`, `repeat`), plus
   `Window.startTextInput/stopTextInput/setTextInputArea` and `clipboardText`/`setClipboardText`.
@@ -114,7 +124,8 @@ adds a note; in memory only).
     zig build notes                                  # run it
     zig build notes -- --snapshot DIR                # save DIR/notes.bmp and exit
     zig build notes -- --snapshot DIR --script       # same after scripted input: click the
-                                                     # field, type, select all, scroll
+                                                     # field, type, select all, scroll,
+                                                     # drag-select across two lines of a card
 
 ## Not there yet
 
@@ -124,8 +135,10 @@ adds a note; in memory only).
   scrolling to the caret, and per-line selection rectangles.
 - IME composition display: the backend delivers `text_editing` and `Input.composition`, but
   `textField` does not draw the pre-edit text yet. Committed IME text does work.
-- Undo/redo, double/triple-click word and line selection, grapheme-cluster-aware caret
-  movement (combining marks and ZWJ emoji take several presses), context menus.
+- Undo/redo, double/triple-click word and line selection inside `textField` (only
+  `textSelectable` has them), word-wise drag extension after a double click,
+  grapheme-cluster-aware caret movement (combining marks and ZWJ emoji take several presses),
+  context menus. Selecting across several separate texts is not possible (one text at a time).
 - Scrollbar dragging and keyboard scrolling; horizontal scrolling.
 - Accessibility (no screen-reader tree), hover styling, Tab focus traversal, retained
   widgets, and any platform other than macOS.

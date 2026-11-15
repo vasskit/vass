@@ -148,7 +148,7 @@ pub const Event = union(enum) {
     close_requested: u32,
     /// `button` is 1 for left, 2 for middle, 3 for right. `mods` are the
     /// modifiers held at that moment (for shift-click).
-    mouse_down: struct { window: u32, x: f32, y: f32, button: u8, mods: keys.Mods = .{} },
+    mouse_down: struct { window: u32, x: f32, y: f32, button: u8, mods: keys.Mods = .{}, clicks: u8 = 1 },
     mouse_up: struct { window: u32, x: f32, y: f32, button: u8 },
     mouse_move: struct { window: u32, x: f32, y: f32 },
     /// Scroll amount in "lines" (SDL's unit; trackpads deliver fractions).
@@ -292,7 +292,7 @@ pub fn pollEvent() ?Event {
                 const y = readF32(&e.raw, 32);
                 if (e.type == c.EVENT_MOUSE_MOTION) return .{ .mouse_move = .{ .window = window, .x = x, .y = y } };
                 if (e.type == c.EVENT_MOUSE_BUTTON_UP) return .{ .mouse_up = .{ .window = window, .x = x, .y = y, .button = e.raw[24] } };
-                return .{ .mouse_down = .{ .window = window, .x = x, .y = y, .button = e.raw[24], .mods = modState() } };
+                return .{ .mouse_down = .{ .window = window, .x = x, .y = y, .button = e.raw[24], .mods = modState(), .clicks = e.raw[26] } };
             },
             else => {},
         }

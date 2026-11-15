@@ -48,6 +48,10 @@ pub const Input = struct {
     down: bool = false,
     /// Modifiers held when the last mouse button went down (shift-click).
     mouse_mods: keys.Mods = .{},
+    /// Click count of the last left press: 1 single, 2 double, 3 triple (from the OS).
+    /// Only meaningful on the frame `pressed` is true. Scripted input may leave it 0,
+    /// which is treated as a single click.
+    mouse_clicks: u8 = 0,
     /// Scroll since the last `endFrame`, in lines (see `backend.Event.mouse_wheel`).
     wheel_x: f32 = 0,
     wheel_y: f32 = 0,
@@ -101,6 +105,7 @@ pub const Input = struct {
                     in.pressed = true;
                     in.down = true;
                     in.mouse_mods = m.mods;
+                    in.mouse_clicks = m.clicks;
                 }
             },
             .mouse_up => |m| if (m.window == window_id) {
@@ -141,6 +146,10 @@ pub const Input = struct {
 pub const State = struct {
     focus: ?*const anyopaque = null,
     drag: ?*const anyopaque = null,
+    /// The `SelectState` (by address) that owns the one text selection, if any.
+    /// Separate from `focus`: a selection is not a text field, so it does not
+    /// stop arrow-key scrolling or an app's own shortcuts.
+    select: ?*const anyopaque = null,
 
     pub fn blur(s: *State) void {
         s.focus = null;
@@ -448,6 +457,166 @@ pub const Ui = struct {
         return y - r.y;
     }
 
+    // ---- selectable text ----------------------------------------------
+
+    /// Horizontal offset of `line` from the left of a `max_w` wide block.
+    fn lineOffset(ui: *const Ui, line: []const u8, size: f32, max_w: f32, al: gfx.Align) f32 {
+        return switch (al) {
+            .left => 0,
+            .center => (max_w - ui.measure(line, size)) / 2,
+            .right => max_w - ui.measure(line, size),
+        };
+    }
+
+    /// Byte offset into `str` of the caret position nearest to the point
+    /// (`x`,`y`), measured in points from the top-left of the text as drawn
+    /// by `labelWrapped` (left aligned) at width `max_w`. Pure: nothing is
+    /// drawn. Above the first line gives 0, below the last gives `str.len`;
+    /// left or right of a line clamps to that line's ends. Always on a UTF-8
+    /// boundary.
+    pub fn offsetAtPoint(ui: *const Ui, str: []const u8, size: f32, max_w: f32, x: f32, y: f32) usize {
+        return ui.offsetAtPointAligned(str, size, max_w, x, y, .left);
+    }
+
+    /// `offsetAtPoint` for text drawn with `align` (centre/right lines are
+    /// shifted inside the block).
+    pub fn offsetAtPointAligned(ui: *const Ui, str: []const u8, size: f32, max_w: f32, x: f32, y: f32, al: gfx.Align) usize {
+        if (str.len == 0 or y < 0) return 0;
+        const lh = ui.lineHeight(size);
+        var top: f32 = 0;
+        var it = ui.wrapText(str, size, max_w);
+        while (it.next()) |line| : (top += lh) {
+            if (y >= top + lh) continue;
+            const start = @intFromPtr(line.ptr) - @intFromPtr(str.ptr);
+            return start + ui.offsetAtX(line, size, x - ui.lineOffset(line, size, max_w, al));
+        }
+        return str.len;
+    }
+
+    /// Wrapped read-only text (drawn and measured exactly like `labelWrapped`,
+    /// same return value) that the user can select and copy.
+    ///
+    /// Press inside the text and drag to select (a double click selects the
+    /// word, a triple click the line between newlines; shift-click extends).
+    /// Cmd+C copies the selection through the clipboard hook, Cmd+A selects
+    /// all of this text, Escape or a click elsewhere clears it. Only one
+    /// selection exists per `Ui.state` (`State.select`): starting one
+    /// elsewhere, or focusing a text field, clears this one. The highlight
+    /// uses `theme.selection`, drawn behind the text per visual line. An
+    /// in-progress drag keeps tracking when the pointer leaves the text, so
+    /// pass the rectangle as laid out inside a scroll area (moved by the
+    /// scroll offset) and the selection follows the content.
+    ///
+    /// Without `ui.state` this is just `labelWrapped`. A selection is only
+    /// cleared by a click elsewhere while the text is being drawn; text that
+    /// is skipped (scrolled out and culled) keeps it until it is drawn again
+    /// with another selection active, when it clears itself.
+    /// See `SelectState` for what to do when `str` changes.
+    pub fn textSelectable(ui: *Ui, r: Rect, str: []const u8, st: *SelectState, opts: LabelOpts) f32 {
+        const size = opts.size orelse ui.theme.font_body;
+        const lh = ui.lineHeight(size);
+        const al = opts.@"align";
+        const height = ui.measureWrapped(str, size, r.w);
+        const id: *const anyopaque = st;
+        const in = &ui.input;
+        var selected = false;
+
+        if (ui.state) |s| {
+            selected = s.select == id;
+            if (!selected) st.clear(); // lost the selection to another text or a field
+            const hv = ui.hit(.{ .x = r.x, .y = r.y, .w = r.w, .h = height });
+            const off = ui.offsetAtPointAligned(str, size, r.w, in.mouse_x - r.x, in.mouse_y - r.y, al);
+            if (hv.clicked) {
+                const extend = selected and in.mouse_mods.shift and in.mouse_clicks <= 1;
+                s.select = id;
+                s.focus = null; // blur any text field
+                selected = true;
+                s.drag = null;
+                if (extend) {
+                    const rg = st.range(str);
+                    // keep the end of the old selection farther from the click as the anchor
+                    st.anchor = if (st.anchor <= st.cursor) rg.start else rg.end;
+                    st.cursor = off;
+                    s.drag = id;
+                } else switch (in.mouse_clicks) {
+                    0, 1 => {
+                        st.anchor = off;
+                        st.cursor = off;
+                        s.drag = id;
+                    },
+                    2 => {
+                        const w = wordRange(str, off);
+                        st.anchor = w.start;
+                        st.cursor = w.end;
+                    },
+                    else => {
+                        st.anchor = text_edit.lineStart(str, off);
+                        st.cursor = text_edit.lineEnd(str, off);
+                    },
+                }
+            } else if (in.pressed and selected) {
+                s.select = null;
+                selected = false;
+                st.clear();
+            } else if (s.drag == id) {
+                if (!selected) {
+                    s.drag = null;
+                } else {
+                    st.cursor = off;
+                    if (!in.down) s.drag = null;
+                }
+            }
+
+            if (selected) for (in.events()) |ev| switch (ev) {
+                .key => |k| {
+                    if (k.code == keys.escape) {
+                        s.select = null;
+                        if (s.drag == id) s.drag = null;
+                        selected = false;
+                        st.clear();
+                        break;
+                    } else if (k.mods.cmd and k.code == keys.c) {
+                        if (st.hasSelection(str)) ui.clipboardSet(st.selectedText(str));
+                    } else if (k.mods.cmd and k.code == keys.a) {
+                        st.anchor = 0;
+                        st.cursor = str.len;
+                    }
+                },
+                else => {},
+            };
+        }
+
+        const vis = ui.clip();
+        if (selected and st.hasSelection(str)) {
+            const sel = st.range(str);
+            const space_w = ui.measure(" ", size);
+            var y = r.y;
+            var it = ui.wrapText(str, size, r.w);
+            while (it.next()) |line| : (y += lh) {
+                if (vis) |v| if (y + lh < v.y or y > v.y + v.h) continue;
+                const ls = @intFromPtr(line.ptr) - @intFromPtr(str.ptr);
+                const le = ls + line.len;
+                const a = @max(sel.start, ls);
+                const b = @min(sel.end, le);
+                const lx = r.x + ui.lineOffset(line, size, r.w, al);
+                var x0 = lx;
+                var x1 = lx;
+                if (a < b) {
+                    x0 = lx + ui.measure(line[0 .. a - ls], size);
+                    x1 = lx + ui.measure(line[0 .. b - ls], size);
+                } else if (sel.start <= le and sel.end > le) {
+                    x0 = lx + ui.measure(line, size);
+                    x1 = x0;
+                } else continue;
+                // The selection runs on past a line break: show the break as a small stub.
+                if (sel.end > le and le < str.len and sel.start <= le and (str[le] == '\n' or str[le] == '\r' or str[le] == ' ')) x1 += space_w;
+                x1 = @min(x1, r.x + r.w);
+                if (x1 > x0) ui.list.rect(.{ .x = x0, .y = y, .w = x1 - x0, .h = lh }, ui.theme.selection);
+            }
+        }
+        return ui.labelWrapped(r, str, opts);
+    }
+
     // ---- text field ---------------------------------------------------
 
     /// Byte offset in `str` whose caret position is nearest to `x` points
@@ -491,6 +660,7 @@ pub const Ui = struct {
             if (hv.clicked) {
                 s.focus = id;
                 s.drag = id;
+                s.select = null; // one selection at a time
                 focused = true;
                 st.blink_origin = in.time;
                 st.edit.moveTo(ui.offsetAtX(st.edit.text(), size, in.mouse_x - box.x + st.scroll_x), in.mouse_mods.shift);
@@ -652,6 +822,65 @@ pub const ScrollState = struct {
     /// one under the pointer.
     key_scroll: bool = false,
 };
+
+/// Selection inside one `textSelectable` text: a byte range of the string it
+/// is drawn with, from `anchor` (where the press began) to `cursor` (where the
+/// pointer is now; may be before the anchor). Caller-owned and small: keep one
+/// per piece of text at a stable address, its address is the selection's
+/// identity in `State.select`.
+///
+/// When the string a `SelectState` goes with changes (edited, replaced, or the
+/// state reused for different text) call `clear()`. Offsets are never trusted:
+/// `range` clamps them to the string and snaps them to UTF-8 boundaries, so a
+/// stale state selects the wrong text at worst, and never indexes out of bounds.
+pub const SelectState = struct {
+    anchor: usize = 0,
+    cursor: usize = 0,
+
+    pub fn clear(s: *SelectState) void {
+        s.anchor = 0;
+        s.cursor = 0;
+    }
+
+    /// The selected bytes of `str` as start <= end, clamped and on boundaries.
+    pub fn range(s: SelectState, str: []const u8) text_edit.TextEdit.Range {
+        const a = text_edit.snap(str, s.anchor);
+        const c = text_edit.snap(str, s.cursor);
+        return .{ .start = @min(a, c), .end = @max(a, c) };
+    }
+
+    pub fn hasSelection(s: SelectState, str: []const u8) bool {
+        const r = s.range(str);
+        return r.end > r.start;
+    }
+
+    pub fn selectedText(s: SelectState, str: []const u8) []const u8 {
+        const r = s.range(str);
+        return str[r.start..r.end];
+    }
+};
+
+/// Start and end of the "word" at caret position `pos`: the run of same-class
+/// characters (word characters, blanks, other punctuation) around it. Newlines
+/// are never included.
+fn wordRange(str: []const u8, pos: usize) text_edit.TextEdit.Range {
+    if (str.len == 0) return .{ .start = 0, .end = 0 };
+    var p = text_edit.snap(str, pos);
+    if (p >= str.len) p = text_edit.prevBoundary(str, str.len);
+    const cls = byteClass(str[p]);
+    var s = p;
+    while (s > 0 and byteClass(str[s - 1]) == cls) s -= 1;
+    var e = p;
+    while (e < str.len and byteClass(str[e]) == cls) e += 1;
+    return .{ .start = s, .end = e };
+}
+
+fn byteClass(b: u8) u8 {
+    if (b == '\n' or b == '\r') return 3;
+    if (b == ' ' or b == '\t') return 1;
+    if (std.ascii.isAlphanumeric(b) or b == '_' or b >= 0x80) return 0;
+    return 2;
+}
 
 /// State of one `textField`. Keep it at a stable address while the field
 /// exists: the address is the field's focus identity.
@@ -1283,4 +1512,390 @@ test "scroll area: arrow and page keys" {
     _ = ui.beginScroll(r, &st, 1000);
     ui.endScroll();
     try std.testing.expectEqual(@as(f32, 810), st.offset);
+}
+
+// ---- tests: selectable text -----------------------------------------------
+
+/// One frame of a selectable text at (0,0), width 70 (7 chars of 10 points,
+/// line height 14), shifted down by `dy` to imitate scrolling.
+fn selFrame(list: *DisplayList, state: *State, in: Input, str: []const u8, st: *SelectState, dy: f32) f32 {
+    list.reset();
+    var ui = Ui.initHeadless(list, in, .{}, cpMeasure);
+    ui.state = state;
+    ui.clipboard = .{ .get = fakeClipGet, .set = fakeClipSet };
+    return ui.textSelectable(.{ .x = 0, .y = dy, .w = 70, .h = 0 }, str, st, .{ .size = 10 });
+}
+
+fn highlights(list: *const DisplayList, out: []Rect) usize {
+    const sel = (Theme{}).selection;
+    var n: usize = 0;
+    for (list.cmds.items) |cmd| switch (cmd) {
+        .rrect => |c| if (std.meta.eql(c.color, sel) and n < out.len) {
+            out[n] = c.rect;
+            n += 1;
+        },
+        else => {},
+    };
+    return n;
+}
+
+fn mouse(x: f32, y: f32) Input {
+    return .{ .mouse_x = x, .mouse_y = y };
+}
+
+fn press(x: f32, y: f32) Input {
+    return .{ .mouse_x = x, .mouse_y = y, .pressed = true, .down = true, .mouse_clicks = 1 };
+}
+
+fn dragTo(x: f32, y: f32) Input {
+    return .{ .mouse_x = x, .mouse_y = y, .down = true };
+}
+
+fn release(x: f32, y: f32) Input {
+    return .{ .mouse_x = x, .mouse_y = y, .released = true };
+}
+
+test "offsetAtPoint: lines, clamps, newlines, multi-byte" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    const ui = wrapUi(&list);
+    // "aaa bbb" / "ccc ddd": second line starts at byte 8.
+    const s = "aaa bbb ccc ddd";
+    try std.testing.expectEqual(@as(usize, 2), ui.offsetAtPoint(s, 10, 70, 24, 5));
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtPoint(s, 10, 70, 26, 5));
+    try std.testing.expectEqual(@as(usize, 8 + 2), ui.offsetAtPoint(s, 10, 70, 24, 14 + 5));
+    // Left of a line: its start; right of a line: its end (not the next line's start).
+    try std.testing.expectEqual(@as(usize, 0), ui.offsetAtPoint(s, 10, 70, -30, 5));
+    try std.testing.expectEqual(@as(usize, 8), ui.offsetAtPoint(s, 10, 70, -30, 20));
+    try std.testing.expectEqual(@as(usize, 7), ui.offsetAtPoint(s, 10, 70, 500, 5));
+    try std.testing.expectEqual(@as(usize, 15), ui.offsetAtPoint(s, 10, 70, 500, 20));
+    // Above everything: 0. Below everything: the end.
+    try std.testing.expectEqual(@as(usize, 0), ui.offsetAtPoint(s, 10, 70, 40, -50));
+    try std.testing.expectEqual(@as(usize, 15), ui.offsetAtPoint(s, 10, 70, 0, 28));
+    try std.testing.expectEqual(@as(usize, 15), ui.offsetAtPoint(s, 10, 70, 0, 900));
+    try std.testing.expectEqual(@as(usize, 0), ui.offsetAtPoint("", 10, 70, 5, 5));
+    // Explicit newlines and a blank line: "ab\n\ncd".
+    const n = "ab\n\ncd";
+    try std.testing.expectEqual(@as(usize, 2), ui.offsetAtPoint(n, 10, 70, 100, 5));
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtPoint(n, 10, 70, 100, 14 + 5));
+    try std.testing.expectEqual(@as(usize, 5), ui.offsetAtPoint(n, 10, 70, 11, 28 + 5));
+    // Multi-byte: "éé😀x" one cell per code point; offsets land on boundaries.
+    const m = "éé😀x";
+    try std.testing.expectEqual(@as(usize, 2), ui.offsetAtPoint(m, 10, 70, 11, 5));
+    try std.testing.expectEqual(@as(usize, 4), ui.offsetAtPoint(m, 10, 70, 21, 5));
+    try std.testing.expectEqual(@as(usize, 8), ui.offsetAtPoint(m, 10, 70, 31, 5));
+    try std.testing.expectEqual(@as(usize, 9), ui.offsetAtPoint(m, 10, 70, 99, 5));
+}
+
+test "textSelectable draws like labelWrapped" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{};
+    const h = selFrame(&list, &state, .{}, "aaa bbb ccc ddd", &st, 3);
+    try std.testing.expectEqual(@as(f32, 28), h);
+    var ui = wrapUi(&list);
+    const want = ui.measureWrapped("aaa bbb ccc ddd", 10, 70);
+    try std.testing.expectEqual(want, h);
+    var texts: usize = 0;
+    for (list.cmds.items) |cmd| switch (cmd) {
+        .text => texts += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), texts);
+    // No state: plain label, no interaction.
+    list.reset();
+    ui = Ui.initHeadless(&list, press(5, 5), .{}, cpMeasure);
+    _ = ui.textSelectable(.{ .x = 0, .y = 0, .w = 70, .h = 0 }, "aaa", &st, .{ .size = 10 });
+    try std.testing.expect(!st.hasSelection("aaa"));
+}
+
+test "textSelectable: drag selects across wrapped lines, release keeps it" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{};
+    const s = "aaa bbb ccc ddd";
+    _ = selFrame(&list, &state, press(15, 5), s, &st, 0);
+    try std.testing.expect(state.select == @as(*const anyopaque, &st));
+    try std.testing.expect(!st.hasSelection(s));
+    _ = selFrame(&list, &state, dragTo(35, 14 + 5), s, &st, 0);
+    // Tie points round to the later boundary: 15 -> 2, 35 -> 4 on the second line.
+    try std.testing.expectEqualStrings("a bbb ccc ", st.selectedText(s));
+    try std.testing.expect(state.drag == @as(*const anyopaque, &st));
+    var hl: [4]Rect = undefined;
+    // Highlight per visual line: line 1 from x=20 to its end (70), line 2 from 0 to 40.
+    try std.testing.expectEqual(@as(usize, 2), highlights(&list, &hl));
+    try std.testing.expectEqual(Rect{ .x = 20, .y = 0, .w = 50, .h = 14 }, hl[0]);
+    try std.testing.expectEqual(Rect{ .x = 0, .y = 14, .w = 40, .h = 14 }, hl[1]);
+    // Highlight comes before the text commands (drawn behind).
+    try std.testing.expect(list.cmds.items[0] == .rrect);
+    // Pointer leaves the text entirely: still tracking; far below selects to the end.
+    _ = selFrame(&list, &state, dragTo(900, 900), s, &st, 0);
+    try std.testing.expectEqual(@as(usize, 15), st.cursor);
+    // Far above selects to the start.
+    _ = selFrame(&list, &state, dragTo(-90, -90), s, &st, 0);
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+    try std.testing.expectEqual(@as(usize, 2), st.anchor);
+    // Release ends the drag (final position applied); later motion changes nothing.
+    _ = selFrame(&list, &state, release(15, 19), s, &st, 0);
+    try std.testing.expect(state.drag == null);
+    try std.testing.expectEqual(@as(usize, 10), st.cursor);
+    _ = selFrame(&list, &state, dragTo(60, 5), s, &st, 0);
+    try std.testing.expectEqual(@as(usize, 10), st.cursor);
+    try std.testing.expect(st.hasSelection(s));
+}
+
+test "textSelectable: plain click, click elsewhere and escape clear" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{};
+    const s = "aaa bbb ccc ddd";
+    _ = selFrame(&list, &state, press(15, 5), s, &st, 0);
+    _ = selFrame(&list, &state, dragTo(55, 5), s, &st, 0);
+    _ = selFrame(&list, &state, release(55, 5), s, &st, 0);
+    try std.testing.expect(st.hasSelection(s));
+    // A plain click (press and release in place) inside: no selection.
+    _ = selFrame(&list, &state, press(35, 5), s, &st, 0);
+    _ = selFrame(&list, &state, release(35, 5), s, &st, 0);
+    try std.testing.expect(!st.hasSelection(s));
+    var hl: [4]Rect = undefined;
+    try std.testing.expectEqual(@as(usize, 0), highlights(&list, &hl));
+    // Select again, then click outside the text.
+    _ = selFrame(&list, &state, press(15, 5), s, &st, 0);
+    _ = selFrame(&list, &state, dragTo(55, 5), s, &st, 0);
+    _ = selFrame(&list, &state, release(55, 5), s, &st, 0);
+    try std.testing.expect(st.hasSelection(s));
+    var in = press(300, 300);
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expect(!st.hasSelection(s) and state.select == null);
+    // Escape clears.
+    _ = selFrame(&list, &state, press(15, 5), s, &st, 0);
+    _ = selFrame(&list, &state, dragTo(55, 5), s, &st, 0);
+    _ = selFrame(&list, &state, release(55, 5), s, &st, 0);
+    in = .{};
+    in.pushKey(keys.escape, .{});
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expect(!st.hasSelection(s) and state.select == null);
+}
+
+test "textSelectable: double click selects the word, triple the line" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{};
+    const s = "aaa bbb\nccc ddd";
+    var in = press(45, 5);
+    in.mouse_clicks = 2;
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expectEqualStrings("bbb", st.selectedText(s));
+    try std.testing.expect(state.drag == null);
+    in.mouse_clicks = 3;
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expectEqualStrings("aaa bbb", st.selectedText(s));
+    in = press(5, 14 + 5);
+    in.mouse_clicks = 2;
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expectEqualStrings("ccc", st.selectedText(s));
+    // On the blank between words: the blank.
+    in = press(33, 14 + 5);
+    in.mouse_clicks = 2;
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expectEqualStrings(" ", st.selectedText(s));
+}
+
+test "textSelectable: shift-click extends" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{};
+    const s = "aaa bbb ccc ddd";
+    _ = selFrame(&list, &state, press(15, 5), s, &st, 0);
+    _ = selFrame(&list, &state, release(35, 5), s, &st, 0);
+    var in = press(65, 5);
+    in.mouse_mods = .{ .shift = true };
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expectEqual(@as(usize, 2), st.anchor);
+    try std.testing.expectEqual(@as(usize, 7), st.cursor);
+}
+
+test "textSelectable: exclusive with another text and with text fields" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var a: SelectState = .{};
+    var b: SelectState = .{};
+    var field = TextFieldState.init(std.testing.allocator);
+    defer field.deinit();
+    const s = "aaa bbb ccc ddd";
+    _ = selFrame(&list, &state, press(15, 5), s, &a, 0);
+    _ = selFrame(&list, &state, release(55, 5), s, &a, 0);
+    try std.testing.expect(a.hasSelection(s));
+    // Starting a selection in b (a lower text, y 100..) takes the selection.
+    list.reset();
+    {
+        var ui = Ui.initHeadless(&list, press(15, 105), .{}, cpMeasure);
+        ui.state = &state;
+        _ = ui.textSelectable(.{ .x = 0, .y = 0, .w = 70, .h = 0 }, s, &a, .{ .size = 10 });
+        _ = ui.textSelectable(.{ .x = 0, .y = 100, .w = 70, .h = 0 }, s, &b, .{ .size = 10 });
+    }
+    try std.testing.expect(state.select == @as(*const anyopaque, &b));
+    try std.testing.expect(!a.hasSelection(s));
+    // b selects something, then a text field is clicked: selection and focus swap.
+    {
+        var ui = Ui.initHeadless(&list, dragTo(55, 105), .{}, cpMeasure);
+        ui.state = &state;
+        _ = ui.textSelectable(.{ .x = 0, .y = 100, .w = 70, .h = 0 }, s, &b, .{ .size = 10 });
+    }
+    try std.testing.expect(b.hasSelection(s));
+    _ = fieldFrame(&list, &state, press(5, 205), &field, .{ .x = 0, .y = 200, .w = 100, .h = 30 });
+    try std.testing.expect(state.focus == @as(*const anyopaque, &field));
+    try std.testing.expect(state.select == null);
+    {
+        var ui = Ui.initHeadless(&list, .{}, .{}, cpMeasure);
+        ui.state = &state;
+        _ = ui.textSelectable(.{ .x = 0, .y = 100, .w = 70, .h = 0 }, s, &b, .{ .size = 10 });
+    }
+    try std.testing.expect(!b.hasSelection(s)); // cleared lazily
+    // Pressing in the text blurs the focused field.
+    _ = selFrame(&list, &state, press(15, 5), s, &a, 0);
+    try std.testing.expect(state.focus == null and state.select == @as(*const anyopaque, &a));
+}
+
+test "textSelectable: cmd+C copies, cmd+A selects all" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{};
+    const s = "aaa bbb ccc ddd";
+    fake_clip_len = 0;
+    // Nothing owns the selection yet: keys do nothing.
+    var in: Input = .{};
+    in.pushKey(keys.c, .{ .cmd = true });
+    in.pushKey(keys.a, .{ .cmd = true });
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expect(!st.hasSelection(s) and fake_clip_len == 0);
+    _ = selFrame(&list, &state, press(15, 5), s, &st, 0);
+    _ = selFrame(&list, &state, release(35, 5), s, &st, 0);
+    in = .{};
+    in.pushKey(keys.c, .{ .cmd = true });
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expectEqualStrings("a ", fake_clip[0..fake_clip_len]);
+    in = .{};
+    in.pushKey(keys.a, .{ .cmd = true });
+    in.pushKey(keys.c, .{ .cmd = true });
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expectEqualStrings(s, fake_clip[0..fake_clip_len]);
+    // Spans a line break: highlight on both lines, the break stub on the first.
+    var hl: [4]Rect = undefined;
+    try std.testing.expectEqual(@as(usize, 2), highlights(&list, &hl));
+    try std.testing.expectEqual(@as(f32, 70), hl[0].x + hl[0].w);
+}
+
+test "textSelectable: stale state never indexes out of bounds" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{ .anchor = 5, .cursor = 400 };
+    state.select = &st;
+    const s = "héllo"; // 6 bytes
+    var in: Input = .{};
+    in.pushKey(keys.c, .{ .cmd = true });
+    _ = selFrame(&list, &state, in, s, &st, 0);
+    try std.testing.expectEqualStrings("o", fake_clip[0..fake_clip_len]);
+    // Mid-character offsets snap back; shorter and empty text are fine.
+    st = .{ .anchor = 2, .cursor = 3 };
+    try std.testing.expectEqualStrings("é", st.selectedText(s));
+    try std.testing.expect(!(SelectState{ .anchor = 2, .cursor = 2 }).hasSelection(s));
+    st = .{ .anchor = 0, .cursor = 99 };
+    _ = selFrame(&list, &state, .{}, "", &st, 0);
+    try std.testing.expect(!st.hasSelection(""));
+    try std.testing.expectEqualStrings("", st.selectedText(""));
+    st = .{ .anchor = 1, .cursor = 4 };
+    state.select = &st;
+    _ = selFrame(&list, &state, .{}, "ab", &st, 0);
+    try std.testing.expectEqualStrings("b", st.selectedText("ab"));
+}
+
+test "textSelectable: inside a scroll area" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{};
+    var sc: ScrollState = .{};
+    const s = "aaa bbb ccc ddd";
+    const view: Rect = .{ .x = 0, .y = 0, .w = 70, .h = 20 };
+    const Frame = struct {
+        fn run(l: *DisplayList, stt: *State, in: Input, str: []const u8, sel: *SelectState, scroll: *ScrollState) void {
+            l.reset();
+            var ui = Ui.initHeadless(l, in, .{}, cpMeasure);
+            ui.state = stt;
+            const c = ui.beginScroll(.{ .x = 0, .y = 0, .w = 70, .h = 20 }, scroll, 100);
+            _ = ui.textSelectable(.{ .x = 0, .y = c.y + 10, .w = 70, .h = 0 }, str, sel, .{ .size = 10 });
+            ui.endScroll();
+        }
+    };
+    _ = view;
+    // Press in the visible part (y 15 is inside text at y 10..38 and the clip 0..20).
+    Frame.run(&list, &state, press(15, 15), s, &st, &sc);
+    try std.testing.expect(state.select == @as(*const anyopaque, &st));
+    // Content scrolls under the held mouse: pointer at y 15 now hits line 2 (scroll 14).
+    sc.offset = 14;
+    Frame.run(&list, &state, dragTo(35, 15), s, &st, &sc);
+    try std.testing.expectEqual(@as(usize, 2), st.anchor);
+    try std.testing.expectEqual(@as(usize, 8 + 4), st.cursor);
+    // Pointer far outside the clip: drag keeps tracking.
+    Frame.run(&list, &state, dragTo(35, 400), s, &st, &sc);
+    try std.testing.expectEqual(@as(usize, 15), st.cursor);
+    Frame.run(&list, &state, release(35, 400), s, &st, &sc);
+    // A press outside the clip (y 25, text is there but clipped away) starts nothing
+    // and clears.
+    Frame.run(&list, &state, press(15, 25), s, &st, &sc);
+    try std.testing.expect(!st.hasSelection(s) and state.select == null);
+    // Highlights are inside the pushed clip.
+    var hl: [4]Rect = undefined;
+    st = .{ .anchor = 0, .cursor = 15 };
+    state.select = &st;
+    Frame.run(&list, &state, .{}, s, &st, &sc);
+    try std.testing.expect(highlights(&list, &hl) >= 1);
+    try std.testing.expect(list.cmds.items[0] == .push_clip);
+}
+
+test "arrow keys scroll while a text selection holds the selection, not while a field has focus" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st: SelectState = .{};
+    var sc: ScrollState = .{ .key_scroll = true };
+    const s = "aaa bbb ccc ddd";
+    const r: Rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    _ = selFrame(&list, &state, press(15, 5), s, &st, 0);
+    _ = selFrame(&list, &state, release(55, 5), s, &st, 0);
+    try std.testing.expect(state.select != null);
+    var in: Input = .{};
+    in.pushKey(keys.down, .{});
+    var ui = Ui.initHeadless(&list, in, .{}, null);
+    ui.state = &state;
+    _ = ui.beginScroll(r, &sc, 1000);
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 48), sc.offset);
+    try std.testing.expect(st.hasSelection(s)); // arrows leave the selection alone
+    // With a text field focused, arrows are not free.
+    var field = TextFieldState.init(std.testing.allocator);
+    defer field.deinit();
+    state.focus = &field;
+    ui = Ui.initHeadless(&list, in, .{}, null);
+    ui.state = &state;
+    _ = ui.beginScroll(r, &sc, 1000);
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 48), sc.offset);
+}
+
+test "input: click count is plumbed from mouse_down" {
+    var in: Input = .{};
+    in.feed(.{ .mouse_down = .{ .window = 1, .x = 1, .y = 1, .button = 1, .clicks = 2 } }, 1);
+    try std.testing.expectEqual(@as(u8, 2), in.mouse_clicks);
+    in.feed(.{ .mouse_down = .{ .window = 1, .x = 1, .y = 1, .button = 1 } }, 1);
+    try std.testing.expectEqual(@as(u8, 1), in.mouse_clicks);
 }

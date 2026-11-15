@@ -6,7 +6,9 @@
 //!     zig build notes -- --snapshot DIR --script
 //!                                          same, after scripted input: click the
 //!                                          field, type "héllo wörld", select all,
-//!                                          scroll the list (deterministic clock)
+//!                                          scroll the list, drag-select text across two
+//!                                          lines of a card (deterministic clock)
+//! Note bodies are selectable: drag, double/triple click, cmd+C, cmd+A, Escape.
 const std = @import("std");
 const vass = @import("vass");
 
@@ -37,26 +39,42 @@ const seed_notes = [_][]const u8{
     "The very first note. Everything above this one is newer, because the list is newest first and this was written when the app was empty.",
 };
 
+/// One note. Heap allocated so the address of `sel` (its selection identity)
+/// stays put while the list grows and notes are inserted at the front.
+const Note = struct {
+    text: []u8,
+    sel: ui_mod.SelectState = .{},
+};
+
 const App = struct {
     gpa: std.mem.Allocator,
-    notes: std.ArrayList([]u8) = .empty,
+    notes: std.ArrayList(*Note) = .empty,
     field: ui_mod.TextFieldState,
     scroll: ui_mod.ScrollState = .{ .key_scroll = true },
     state: ui_mod.State = .{},
 
     fn deinit(app: *App) void {
-        for (app.notes.items) |n| app.gpa.free(n);
+        for (app.notes.items) |n| {
+            app.gpa.free(n.text);
+            app.gpa.destroy(n);
+        }
         app.notes.deinit(app.gpa);
         app.field.deinit();
+    }
+
+    fn append(app: *App, text: []const u8, at: usize) !void {
+        const note = try app.gpa.create(Note);
+        errdefer app.gpa.destroy(note);
+        note.* = .{ .text = try app.gpa.dupe(u8, text) };
+        errdefer app.gpa.free(note.text);
+        try app.notes.insert(app.gpa, at, note);
     }
 
     /// Adds `text` (trimmed) as the newest note; false if it was blank.
     fn add(app: *App, text: []const u8) !bool {
         const t = std.mem.trim(u8, text, " ");
         if (t.len == 0) return false;
-        const copy = try app.gpa.dupe(u8, t);
-        errdefer app.gpa.free(copy);
-        try app.notes.insert(app.gpa, 0, copy);
+        try app.append(t, 0);
         return true;
     }
 };
@@ -100,18 +118,18 @@ fn frame(app: *App, ui: *Ui, lay: Layout) !void {
     const card_w = lay.list.w - 2 * margin;
     const text_w = card_w - 2 * card_pad;
     var content_h: f32 = card_gap;
-    for (app.notes.items) |n| content_h += cardHeight(ui, n, text_w) + card_gap;
+    for (app.notes.items) |n| content_h += cardHeight(ui, n.text, text_w) + card_gap;
 
     const content = ui.beginScroll(lay.list, &app.scroll, content_h);
     var y = content.y + card_gap;
     for (app.notes.items, 0..) |n, i| {
-        const h = cardHeight(ui, n, text_w);
+        const h = cardHeight(ui, n.text, text_w);
         const card: Rect = .{ .x = margin, .y = y, .w = card_w, .h = h };
         y += h + card_gap;
         if (card.y + card.h < lay.list.y or card.y > lay.list.y + lay.list.h) continue;
         ui.card(card);
         ui.labelFmt(.{ .x = card.x + card_pad, .y = card.y + card_pad, .w = text_w, .h = 14 }, "Note {d}", .{total - i}, .{ .size = caption_size, .color = t.accent });
-        _ = ui.labelWrapped(.{ .x = card.x + card_pad, .y = card.y + card_pad + ui.lineHeight(caption_size) + 4, .w = text_w, .h = 0 }, n, .{ .size = body_size });
+        _ = ui.textSelectable(.{ .x = card.x + card_pad, .y = card.y + card_pad + ui.lineHeight(caption_size) + 4, .w = text_w, .h = 0 }, n.text, &n.sel, .{ .size = body_size });
     }
     ui.endScroll();
 
@@ -125,8 +143,32 @@ fn frame(app: *App, ui: *Ui, lay: Layout) !void {
     }
 }
 
+const Point = struct { x: f32, y: f32 };
+
+/// For `--script`: a press point near the start of the first line of the first
+/// fully visible card with a body of two or more lines, and a drag target in
+/// the middle of its second line.
+fn pickSelection(app: *const App, ui: *const Ui, lay: Layout) [2]Point {
+    const card_w = lay.list.w - 2 * margin;
+    const text_w = card_w - 2 * card_pad;
+    const lh = ui.lineHeight(body_size);
+    var y = lay.list.y - app.scroll.offset + card_gap;
+    for (app.notes.items) |n| {
+        const h = cardHeight(ui, n.text, text_w);
+        const body_y = y + card_pad + ui.lineHeight(caption_size) + 4;
+        if (y >= lay.list.y and y + h <= lay.list.y + lay.list.h and ui.measureWrapped(n.text, body_size, text_w) >= 2 * lh) {
+            return .{
+                .{ .x = margin + card_pad + 30, .y = body_y + lh / 2 },
+                .{ .x = margin + card_pad + 150, .y = body_y + lh * 1.5 },
+            };
+        }
+        y += h + card_gap;
+    }
+    return .{ .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 } };
+}
+
 /// Synthetic input for `--script`, by frame number.
-fn script(in: *ui_mod.Input, n: u32, lay: Layout) void {
+fn script(in: *ui_mod.Input, n: u32, lay: Layout, sel_from: Point, sel_to: Point) void {
     const field_c = lay.field.center(0, 0);
     const list_c = lay.list.center(0, 0);
     switch (n) {
@@ -144,6 +186,21 @@ fn script(in: *ui_mod.Input, n: u32, lay: Layout) void {
             in.mouse_y = list_c.y;
         },
         8 => in.wheel_y = -6, // six lines down
+        9 => { // press in the first visible card's body ...
+            in.mouse_x = sel_from.x;
+            in.mouse_y = sel_from.y;
+            in.pressed = true;
+            in.down = true;
+            in.mouse_clicks = 1;
+        },
+        10 => { // ... drag to the next wrapped line
+            in.mouse_x = sel_to.x;
+            in.mouse_y = sel_to.y;
+        },
+        11 => { // release
+            in.down = false;
+            in.released = true;
+        },
         else => {},
     }
 }
@@ -175,11 +232,7 @@ pub fn main(init: std.process.Init) !void {
     var app: App = .{ .gpa = gpa, .field = ui_mod.TextFieldState.init(gpa) };
     defer app.deinit();
     // The seeds are listed newest first.
-    for (seed_notes) |n| {
-        const copy = try gpa.dupe(u8, n);
-        errdefer gpa.free(copy);
-        try app.notes.append(gpa, copy);
-    }
+    for (seed_notes) |n| try app.append(n, app.notes.items.len);
 
     var win = try vass.platform.Window.init(gpa, .{ .title = "Notes", .width = win_w, .height = win_h });
     defer win.deinit();
@@ -208,10 +261,14 @@ pub fn main(init: std.process.Init) !void {
             },
         };
         input.time = if (scripted) @as(f64, @floatFromInt(n)) * 0.016 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-        if (scripted) script(&input, n, lay);
-
         list.reset();
         var ui = Ui.init(&list, &win, input, theme);
+        if (scripted) {
+            // The script needs the Ui's text measuring to aim at a card.
+            const pts = pickSelection(&app, &ui, lay);
+            script(&input, n, lay, pts[0], pts[1]);
+            ui.input = input;
+        }
         ui.state = &app.state;
         try frame(&app, &ui, lay);
         if (app.state.focus != null) win.setTextInputArea(lay.field, 0);
