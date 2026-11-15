@@ -4,6 +4,7 @@ const std = @import("std");
 const geom = @import("geom.zig");
 const gfx = @import("gfx.zig");
 const Color = geom.Color;
+const keys = @import("keys.zig");
 
 const c = struct {
     const SdlWindow = opaque {};
@@ -29,8 +30,17 @@ const c = struct {
     const EVENT_WINDOW_CLOSE_REQUESTED: u32 = 0x210;
     const EVENT_QUIT: u32 = 0x100;
     const EVENT_KEY_DOWN: u32 = 0x300;
+    const EVENT_KEY_UP: u32 = 0x301;
+    const EVENT_TEXT_EDITING: u32 = 0x302;
+    const EVENT_TEXT_INPUT: u32 = 0x303;
     const EVENT_MOUSE_MOTION: u32 = 0x400;
     const EVENT_MOUSE_BUTTON_DOWN: u32 = 0x401;
+    const EVENT_MOUSE_BUTTON_UP: u32 = 0x402;
+    const EVENT_MOUSE_WHEEL: u32 = 0x403;
+    const KMOD_SHIFT: u16 = 0x0003;
+    const KMOD_CTRL: u16 = 0x00C0;
+    const KMOD_ALT: u16 = 0x0300;
+    const KMOD_GUI: u16 = 0x0C00;
     const BLENDMODE_BLEND: u32 = 1;
 
     extern fn SDL_Init(flags: u32) bool;
@@ -71,6 +81,14 @@ const c = struct {
     extern fn SDL_HideWindow(w: *SdlWindow) bool;
     extern fn SDL_RaiseWindow(w: *SdlWindow) bool;
     extern fn SDL_PollEvent(e: *SdlEvent) bool;
+    extern fn SDL_StartTextInput(w: *SdlWindow) bool;
+    extern fn SDL_StopTextInput(w: *SdlWindow) bool;
+    extern fn SDL_SetTextInputArea(w: *SdlWindow, rect: ?*const SdlRect, cursor: c_int) bool;
+    extern fn SDL_GetModState() u16;
+    extern fn SDL_GetClipboardText() ?[*:0]u8;
+    extern fn SDL_SetClipboardText(text: [*:0]const u8) bool;
+    extern fn SDL_free(p: ?*anyopaque) void;
+    extern fn SDL_SetRenderClipRect(r: *Renderer, rect: ?*const SdlRect) bool;
     extern fn TTF_Init() bool;
     extern fn TTF_Quit() void;
     extern fn TTF_OpenFont(file: [*:0]const u8, ptsize: f32) ?*Font;
@@ -79,16 +97,71 @@ const c = struct {
     extern fn TTF_RenderText_Blended(f: *Font, text: [*]const u8, len: usize, fg: SdlColor) ?*Surface;
 };
 
+/// UTF-8 text from the keyboard or an input method, copied out of the SDL
+/// event. A long commit (e.g. a big IME string) arrives as several chunks, each
+/// ending on a character boundary.
+pub const TextChunk = struct {
+    buf: [32]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn slice(t: *const TextChunk) []const u8 {
+        return t.buf[0..t.len];
+    }
+
+    pub fn from(str: []const u8) TextChunk {
+        var t: TextChunk = .{};
+        const n = @min(str.len, t.buf.len);
+        @memcpy(t.buf[0..n], str[0..n]);
+        t.len = @intCast(n);
+        return t;
+    }
+};
+
+/// An in-progress input-method composition ("preedit" text).
+pub const Composition = struct {
+    buf: [96]u8 = undefined,
+    len: u8 = 0,
+    /// Cursor/selection inside the composition, in bytes; -1 if not set.
+    start: i32 = -1,
+    length: i32 = -1,
+
+    pub fn slice(t: *const Composition) []const u8 {
+        return t.buf[0..t.len];
+    }
+};
+
+pub const Key = struct {
+    /// SDL keycode; for printable keys this is the lowercase ASCII value
+    /// (see `keys` for named constants).
+    code: u32,
+    mods: keys.Mods = .{},
+    /// True for auto-repeat events while the key is held.
+    repeat: bool = false,
+    /// The window that had keyboard focus (0 if none).
+    window: u32 = 0,
+};
+
 pub const Event = union(enum) {
     /// The application was asked to quit (Cmd+Q, or the last window closed).
     quit,
     /// A window's close button was pressed; payload is the window id.
     close_requested: u32,
-    /// `button` is 1 for left, 2 for middle, 3 for right.
-    mouse_down: struct { window: u32, x: f32, y: f32, button: u8 },
+    /// `button` is 1 for left, 2 for middle, 3 for right. `mods` are the
+    /// modifiers held at that moment (for shift-click).
+    mouse_down: struct { window: u32, x: f32, y: f32, button: u8, mods: keys.Mods = .{} },
+    mouse_up: struct { window: u32, x: f32, y: f32, button: u8 },
     mouse_move: struct { window: u32, x: f32, y: f32 },
-    /// SDL keycode; for printable keys this is the lowercase ASCII value.
-    key_down: u32,
+    /// Scroll amount in "lines" (SDL's unit; trackpads deliver fractions).
+    /// `dy` > 0 means the content should move down, i.e. scroll towards the
+    /// start (wheel rolled away from the user). `dx` > 0 is towards the right.
+    mouse_wheel: struct { window: u32, dx: f32, dy: f32 },
+    key_down: Key,
+    key_up: Key,
+    /// Typed or committed text. Only sent while text input is started
+    /// (`Window.startTextInput`).
+    text_input: struct { window: u32, text: TextChunk },
+    /// Input-method composition changed; an empty string means it ended.
+    text_editing: struct { window: u32, comp: Composition },
 };
 
 pub const WindowOptions = struct {
@@ -133,25 +206,116 @@ pub fn globalMouse() Mouse {
     return .{ .x = x, .y = y, .left_down = buttons & 1 != 0 };
 }
 
+var pending_text: [256]u8 = undefined;
+var pending_len: usize = 0;
+var pending_pos: usize = 0;
+var pending_window: u32 = 0;
+
+fn modsFrom(m: u16) keys.Mods {
+    return .{ .shift = m & c.KMOD_SHIFT != 0, .ctrl = m & c.KMOD_CTRL != 0, .alt = m & c.KMOD_ALT != 0, .cmd = m & c.KMOD_GUI != 0 };
+}
+
+/// Modifier keys held right now.
+pub fn modState() keys.Mods {
+    return modsFrom(c.SDL_GetModState());
+}
+
+fn readF32(raw: []const u8, off: usize) f32 {
+    return @bitCast(std.mem.readInt(u32, raw[off..][0..4], .little));
+}
+
+fn keyFrom(raw: []const u8) Key {
+    return .{
+        .code = std.mem.readInt(u32, raw[28..32], .little),
+        .mods = modsFrom(std.mem.readInt(u16, raw[32..34], .little)),
+        .repeat = raw[37] != 0,
+        .window = std.mem.readInt(u32, raw[16..20], .little),
+    };
+}
+
+/// Reads the NUL-terminated string pointer stored at `off` in the event.
+fn eventString(raw: []const u8, off: usize) []const u8 {
+    const addr = std.mem.readInt(usize, raw[off..][0..@sizeOf(usize)], .little);
+    if (addr == 0) return "";
+    const p: [*:0]const u8 = @ptrFromInt(addr);
+    return std.mem.span(p);
+}
+
+/// Splits `pending_text` into chunks of at most 32 bytes on character boundaries.
+fn nextPendingChunk() ?Event {
+    if (pending_pos >= pending_len) return null;
+    var end = @min(pending_pos + 32, pending_len);
+    if (end < pending_len) {
+        while (end > pending_pos + 1 and pending_text[end] & 0xC0 == 0x80) end -= 1;
+    }
+    const chunk = TextChunk.from(pending_text[pending_pos..end]);
+    pending_pos = end;
+    return .{ .text_input = .{ .window = pending_window, .text = chunk } };
+}
+
 /// Returns the next pending event for any window, or null when the queue is empty.
 pub fn pollEvent() ?Event {
+    if (nextPendingChunk()) |ev| return ev;
     var e: c.SdlEvent = undefined;
     while (c.SDL_PollEvent(&e)) {
         const window = std.mem.readInt(u32, e.raw[16..20], .little);
         switch (e.type) {
             c.EVENT_QUIT => return .quit,
             c.EVENT_WINDOW_CLOSE_REQUESTED => return .{ .close_requested = window },
-            c.EVENT_KEY_DOWN => return .{ .key_down = std.mem.readInt(u32, e.raw[28..32], .little) },
-            c.EVENT_MOUSE_BUTTON_DOWN, c.EVENT_MOUSE_MOTION => {
-                const x: f32 = @bitCast(std.mem.readInt(u32, e.raw[28..32], .little));
-                const y: f32 = @bitCast(std.mem.readInt(u32, e.raw[32..36], .little));
+            c.EVENT_KEY_DOWN => return .{ .key_down = keyFrom(&e.raw) },
+            c.EVENT_KEY_UP => return .{ .key_up = keyFrom(&e.raw) },
+            c.EVENT_TEXT_INPUT => {
+                const str = eventString(&e.raw, 24);
+                // Anything beyond the buffer (256 bytes in one event) is dropped.
+                const n = @min(str.len, pending_text.len);
+                @memcpy(pending_text[0..n], str[0..n]);
+                pending_len = n;
+                pending_pos = 0;
+                pending_window = window;
+                if (nextPendingChunk()) |ev| return ev;
+            },
+            c.EVENT_TEXT_EDITING => {
+                const str = eventString(&e.raw, 24);
+                var comp: Composition = .{
+                    .start = std.mem.readInt(i32, e.raw[32..36], .little),
+                    .length = std.mem.readInt(i32, e.raw[36..40], .little),
+                };
+                var n = @min(str.len, comp.buf.len);
+                while (n > 0 and n < str.len and str[n] & 0xC0 == 0x80) n -= 1;
+                @memcpy(comp.buf[0..n], str[0..n]);
+                comp.len = @intCast(n);
+                return .{ .text_editing = .{ .window = window, .comp = comp } };
+            },
+            c.EVENT_MOUSE_WHEEL => return .{ .mouse_wheel = .{ .window = window, .dx = readF32(&e.raw, 24), .dy = readF32(&e.raw, 28) } },
+            c.EVENT_MOUSE_BUTTON_DOWN, c.EVENT_MOUSE_BUTTON_UP, c.EVENT_MOUSE_MOTION => {
+                const x = readF32(&e.raw, 28);
+                const y = readF32(&e.raw, 32);
                 if (e.type == c.EVENT_MOUSE_MOTION) return .{ .mouse_move = .{ .window = window, .x = x, .y = y } };
-                return .{ .mouse_down = .{ .window = window, .x = x, .y = y, .button = e.raw[24] } };
+                if (e.type == c.EVENT_MOUSE_BUTTON_UP) return .{ .mouse_up = .{ .window = window, .x = x, .y = y, .button = e.raw[24] } };
+                return .{ .mouse_down = .{ .window = window, .x = x, .y = y, .button = e.raw[24], .mods = modState() } };
             },
             else => {},
         }
     }
     return null;
+}
+
+/// The system clipboard's text, copied into memory from `gpa` (free it), or
+/// null if the clipboard holds no text.
+pub fn clipboardText(gpa: std.mem.Allocator) !?[]u8 {
+    const p = c.SDL_GetClipboardText() orelse return null;
+    defer c.SDL_free(p);
+    const str = std.mem.span(p);
+    if (str.len == 0) return null;
+    return try gpa.dupe(u8, str);
+}
+
+/// Puts `str` on the system clipboard.
+pub fn setClipboardText(gpa: std.mem.Allocator, str: []const u8) !void {
+    const z = try gpa.allocSentinel(u8, str.len, 0);
+    defer gpa.free(z);
+    @memcpy(z, str);
+    _ = c.SDL_SetClipboardText(z.ptr);
 }
 
 const font_paths = [_][*:0]const u8{
@@ -185,6 +349,9 @@ pub const Window = struct {
     idx: std.ArrayList(c_int) = .empty,
     /// If set, the next rendered frame is also saved to this path as a BMP.
     snapshot_path: ?[*:0]const u8 = null,
+    /// Active clip rectangles (window points), innermost last.
+    clips: [16]geom.Rect = undefined,
+    clip_n: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, opts: WindowOptions) !Window {
         if (live_windows == 0) {
@@ -255,6 +422,25 @@ pub const Window = struct {
         return c.SDL_GetPointerProperty(c.SDL_GetWindowProperties(w.win), "SDL.window.cocoa.window", null);
     }
 
+    /// Starts delivering `text_input` / `text_editing` events for this window
+    /// (and, on macOS, enables the input-method machinery). Call when a text
+    /// field gains focus, or once at startup.
+    pub fn startTextInput(w: *Window) void {
+        _ = c.SDL_StartTextInput(w.win);
+    }
+
+    pub fn stopTextInput(w: *Window) void {
+        _ = c.SDL_StopTextInput(w.win);
+    }
+
+    /// Tells the input method where the text being edited is (window points),
+    /// so its candidate popup can sit next to it. `cursor_x` is the caret's
+    /// x offset inside `r`.
+    pub fn setTextInputArea(w: *Window, r: geom.Rect, cursor_x: f32) void {
+        const ir: c.SdlRect = .{ .x = @intFromFloat(r.x), .y = @intFromFloat(r.y), .w = @intFromFloat(r.w), .h = @intFromFloat(r.h) };
+        _ = c.SDL_SetTextInputArea(w.win, &ir, @intFromFloat(cursor_x));
+    }
+
     pub fn setAlwaysOnTop(w: *Window, on: bool) void {
         _ = c.SDL_SetWindowAlwaysOnTop(w.win, on);
     }
@@ -264,6 +450,7 @@ pub const Window = struct {
         w.frame += 1;
         _ = c.SDL_SetRenderDrawColor(w.ren, clear.r, clear.g, clear.b, clear.a);
         _ = c.SDL_RenderClear(w.ren);
+        w.clip_n = 0;
         for (list.cmds.items) |cmd| switch (cmd) {
             .rrect => |r| w.addRRect(r.rect, r.radius, r.color),
             .ellipse => |e| w.addEllipse(e.cx, e.cy, e.rx, e.ry, e.color),
@@ -272,8 +459,11 @@ pub const Window = struct {
                 w.flush();
                 w.drawText(t.x, t.y, t.str, t.size, t.color, t.alignment);
             },
+            .push_clip => |r| w.pushClip(r),
+            .pop_clip => w.popClip(),
         };
         w.flush();
+        _ = c.SDL_SetRenderClipRect(w.ren, null);
         if (w.snapshot_path) |path| {
             w.snapshot_path = null;
             if (c.SDL_RenderReadPixels(w.ren, null)) |surf| {
@@ -283,6 +473,50 @@ pub const Window = struct {
         }
         _ = c.SDL_RenderPresent(w.ren);
         w.evictTexts();
+    }
+
+    // ---- clipping -----------------------------------------------------
+
+    fn pushClip(w: *Window, r: geom.Rect) void {
+        w.flush(); // geometry queued so far belongs to the old clip
+        var next = r;
+        if (w.clip_n > 0) {
+            const p = w.clips[w.clip_n - 1];
+            const x0 = @max(p.x, r.x);
+            const y0 = @max(p.y, r.y);
+            const x1 = @min(p.x + p.w, r.x + r.w);
+            const y1 = @min(p.y + p.h, r.y + r.h);
+            next = .{ .x = x0, .y = y0, .w = @max(0, x1 - x0), .h = @max(0, y1 - y0) };
+        }
+        if (w.clip_n < w.clips.len) {
+            w.clips[w.clip_n] = next;
+            w.clip_n += 1;
+        } else {
+            w.clips[w.clips.len - 1] = next; // too deep: keep the innermost intersected
+        }
+        w.applyClip();
+    }
+
+    fn popClip(w: *Window) void {
+        w.flush();
+        if (w.clip_n > 0) w.clip_n -= 1;
+        w.applyClip();
+    }
+
+    /// The clip rect is given to SDL in the renderer's scaled (point)
+    /// coordinates, like every other draw call. It is widened to whole units.
+    fn applyClip(w: *Window) void {
+        if (w.clip_n == 0) {
+            _ = c.SDL_SetRenderClipRect(w.ren, null);
+            return;
+        }
+        const r = w.clips[w.clip_n - 1];
+        const x0: c_int = @intFromFloat(@floor(r.x));
+        const y0: c_int = @intFromFloat(@floor(r.y));
+        const x1: c_int = @intFromFloat(@ceil(r.x + r.w));
+        const y1: c_int = @intFromFloat(@ceil(r.y + r.h));
+        const ir: c.SdlRect = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+        _ = c.SDL_SetRenderClipRect(w.ren, &ir);
     }
 
     // ---- shapes -------------------------------------------------------

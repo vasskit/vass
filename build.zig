@@ -19,5 +19,22 @@ pub fn build(b: *std.Build) void {
     vass.linkFramework("AppKit", .{});
 
     const tests = b.addTest(.{ .root_module = vass });
-    b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // Example: a notes app. `zig build notes -- --snapshot DIR [--script]`.
+    const notes = b.addExecutable(.{
+        .name = "notes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/notes.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_notes = b.addRunArtifact(notes);
+    run_notes.addPassthruArgs();
+    b.step("notes", "Run the notes example").dependOn(&run_notes.step);
+    // Keep the example compiling as part of `zig build test`.
+    test_step.dependOn(&notes.step);
 }

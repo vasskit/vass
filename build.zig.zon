@@ -4,5 +4,5 @@
     .fingerprint = 0xeb1b8bf843c6e6ca,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
-    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "examples", "README.md" },
 }

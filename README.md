@@ -9,6 +9,9 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 - `src/gfx.zig` — display list: drawing recorded as plain data. Depends only on `geom`.
 - `src/ui.zig` — immediate-mode widgets (`vass.Ui`) and the pointer `Input`. Depends on
   `gfx` and, for text measuring and event types, the backend.
+- `src/keys.zig` — modifier flags and keycode constants. Depends on nothing.
+- `src/text_edit.zig` — `TextEdit`: the pure text editing core (buffer, cursor, selection,
+  key handling). No rendering, no SDL.
 - `src/png.zig` — minimal PNG writer, for handing generated images to the OS.
 - `src/backend_sdl.zig` — SDL3 windows, input, text measuring and the display-list
   renderer (text via SDL3_ttf).
@@ -55,7 +58,74 @@ Widgets: `label`, `card`, `pill`, `tabs`, `button`, `meter`, `bar`, `hit`, `fitT
 `Input.pressed` is true only on the frame a left click arrived, and widgets do not
 occlude each other. `Ui.initHeadless` builds a Ui without a window, for tests.
 
+## Text input, scrolling, wrapping
+
+Widgets that need memory across frames take a caller-owned state struct; there is no hidden
+per-widget state. Keyboard focus lives in a caller-owned `vass.ui.State`:
+
+    var input: vass.ui.Input = .{};          // across frames
+    var ustate: vass.ui.State = .{};         // across frames: who has focus
+    var field = vass.ui.TextFieldState.init(gpa);   // keep its address stable
+    var scroll: vass.ui.ScrollState = .{};
+    window.startTextInput();                 // once; enables text_input events
+
+    // per event: input.feed(ev, window.id());   per frame, before drawing: input.time = seconds;
+    var ui = vass.Ui.init(&list, &window, input, .{});
+    ui.state = &ustate;
+
+    const res = ui.textField(rect, &field, .{ .placeholder = "Type here" });
+    if (res.submitted) { use(field.edit.text()); field.edit.clear(); }
+
+    const content = ui.beginScroll(list_rect, &scroll, content_height);
+    // lay children out inside `content` (it is moved up by the scroll offset)
+    ui.endScroll();
+
+    const h = ui.measureWrapped(text, size, width);        // height only
+    _ = ui.labelWrapped(.{ .x = x, .y = y, .w = width, .h = 0 }, text, .{ .size = size });
+
+- **`textField`**: single line. Click to focus (and place the caret), drag or shift-click to
+  select, Escape or a click elsewhere to blur, Return reports `submitted`. Arrows, home/end,
+  alt for words, cmd for line ends, shift to select, cmd+A/C/X/V, backspace/delete (with alt
+  or cmd for word/line). Scrolls horizontally to keep the caret visible, blinks off
+  `Input.time`, and is clipped to its rectangle. Typed text arrives through
+  `Input.events()` in order with key presses; apps with their own shortcuts should ignore
+  keys while `ustate.focus != null`.
+- **`TextEdit`** (`vass.TextEdit`) is the editor behind it and usable on its own:
+  `insert`, `backspace`, `delete`, `move`, `moveTo`, `selectAll`, `copy`/`cut`, and
+  `handleKey(code, mods) -> Action` (changed / copy / cut / paste / submit / cancel ...).
+  Offsets are bytes on UTF-8 code point boundaries; clipboard access stays with the caller.
+- **`beginScroll` / `endScroll`**: wheel scrolling while hovered (`Theme.scroll_step` points
+  per line), clamped, children clipped, and a thin scrollbar thumb drawn over the right edge
+  when the content overflows. `Ui.hit` ignores the pointer outside the current clip, so
+  clipped-away widgets cannot be clicked. `pushClip`/`popClip` do the same for any region;
+  the display list carries `push_clip`/`pop_clip` commands (nested clips intersect).
+- **`wrapText` / `measureWrapped` / `labelWrapped`**: greedy word wrap using the Ui's
+  measure function; honours `\n`, breaks over-long words between characters, never splits
+  UTF-8. Lines outside the clip are not drawn.
+- **Backend**: events `mouse_up`, `mouse_wheel` (lines), `text_input`, `text_editing`,
+  `key_down`/`key_up` (a `Key` with `code`, `mods`, `repeat`), plus
+  `Window.startTextInput/stopTextInput/setTextInputArea` and `clipboardText`/`setClipboardText`.
+
+## Example: notes
+
+`examples/notes.zig` is a small notes app (scrolling wrapped cards, a text field, Return
+adds a note; in memory only).
+
+    zig build notes                                  # run it
+    zig build notes -- --snapshot DIR                # save DIR/notes.bmp and exit
+    zig build notes -- --snapshot DIR --script       # same after scripted input: click the
+                                                     # field, type, select all, scroll
+
 ## Not there yet
 
-Hover styling, focus and keyboard navigation, retained widgets, text editing and IME, accessibility, and any platform other
-than macOS.
+- Multi-line text area. `TextEdit` already handles line breaks (`multiline`), home/end per
+  line and line deletion; what is missing is the widget: wrapping the buffer into visual
+  lines, mapping caret/selection to them, up/down movement with a remembered column, vertical
+  scrolling to the caret, and per-line selection rectangles.
+- IME composition display: the backend delivers `text_editing` and `Input.composition`, but
+  `textField` does not draw the pre-edit text yet. Committed IME text does work.
+- Undo/redo, double/triple-click word and line selection, grapheme-cluster-aware caret
+  movement (combining marks and ZWJ emoji take several presses), context menus.
+- Scrollbar dragging and keyboard scrolling; horizontal scrolling.
+- Accessibility (no screen-reader tree), hover styling, Tab focus traversal, retained
+  widgets, and any platform other than macOS.

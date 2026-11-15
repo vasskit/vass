@@ -6,6 +6,8 @@
 pub const geom = @import("geom.zig");
 pub const gfx = @import("gfx.zig");
 pub const ui = @import("ui.zig");
+pub const keys = @import("keys.zig");
+pub const text_edit = @import("text_edit.zig");
 pub const png = @import("png.zig");
 pub const platform = @import("backend_sdl.zig");
 /// macOS-only extras: menu-bar item, overlay window behaviour, notch metrics.
@@ -15,3 +17,10 @@ pub const Rect = geom.Rect;
 pub const Color = geom.Color;
 pub const DisplayList = gfx.DisplayList;
 pub const Ui = ui.Ui;
+pub const TextEdit = text_edit.TextEdit;
+
+test {
+    _ = text_edit;
+    _ = ui;
+    _ = geom;
+}

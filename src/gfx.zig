@@ -13,6 +13,10 @@ pub const Command = union(enum) {
     /// Stroked circular arc from angle `a0` to `a1` (radians, clockwise on screen).
     arc: struct { cx: f32, cy: f32, r: f32, a0: f32, a1: f32, width: f32, color: Color },
     text: struct { x: f32, y: f32, str: []const u8, size: f32, color: Color, alignment: Align },
+    /// Restricts drawing to `Rect` (intersected with any clip already active)
+    /// until the matching `pop_clip`.
+    push_clip: Rect,
+    pop_clip,
 };
 
 pub const DisplayList = struct {
@@ -35,6 +39,15 @@ pub const DisplayList = struct {
 
     fn push(l: *DisplayList, cmd: Command) void {
         l.cmds.append(l.arena.allocator(), cmd) catch @panic("out of memory");
+    }
+
+    /// Clips everything drawn until `popClip` to `r`. Clips nest and intersect.
+    pub fn pushClip(l: *DisplayList, r: Rect) void {
+        l.push(.{ .push_clip = r });
+    }
+
+    pub fn popClip(l: *DisplayList) void {
+        l.push(.pop_clip);
     }
 
     pub fn rect(l: *DisplayList, r: Rect, color: Color) void {
