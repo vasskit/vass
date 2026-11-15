@@ -79,6 +79,21 @@ pub fn build(b: *std.Build) void {
     b.step("notes", "Run the notes example").dependOn(&run_notes.step);
     // Keep the example compiling as part of `zig build test`.
     test_step.dependOn(&notes.step);
+
+    // Example: the form controls. `zig build controls -- --snapshot DIR`.
+    const controls = b.addExecutable(.{
+        .name = "controls",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/controls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_controls = b.addRunArtifact(controls);
+    run_controls.addPassthruArgs();
+    b.step("controls", "Run the controls showcase").dependOn(&run_controls.step);
+    test_step.dependOn(&controls.step);
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

@@ -24,6 +24,8 @@ const backend = @import("backend_sdl.zig");
 const keys = @import("keys.zig");
 const icons = @import("icons.zig");
 const text_edit = @import("text_edit.zig");
+const controls = @import("controls.zig");
+const text_area = @import("text_area.zig");
 pub const TextEdit = text_edit.TextEdit;
 const Rect = geom.Rect;
 const Color = geom.Color;
@@ -273,6 +275,14 @@ pub const IconButtonOpts = struct {
     /// Stroke weight multiplier.
     weight: f32 = 1,
 };
+
+pub const CheckOpts = controls.CheckOpts;
+pub const ToggleOpts = controls.ToggleOpts;
+pub const Segment = controls.Segment;
+pub const SegmentedOpts = controls.SegmentedOpts;
+pub const TextAreaState = text_area.TextAreaState;
+pub const TextAreaOpts = text_area.TextAreaOpts;
+pub const TextAreaResult = text_area.TextAreaResult;
 
 pub const RowOpts = struct {
     selected: bool = false,
@@ -931,8 +941,50 @@ pub const Ui = struct {
         return res;
     }
 
-    fn clipboardSet(ui: *const Ui, str: []const u8) void {
+    pub fn clipboardSet(ui: *const Ui, str: []const u8) void {
         if (ui.clipboard.set) |set| set(std.heap.page_allocator, str);
+    }
+
+    // ---- form controls ------------------------------------------------
+
+    /// A check box with a label to its right; the whole row `r` is clickable.
+    /// Flips `value` on click (`clicked` is then true). See `controls.zig`.
+    pub fn checkbox(ui: *Ui, r: Rect, value: *bool, label_str: []const u8, opts: CheckOpts) Interaction {
+        return controls.checkbox(ui, r, value, label_str, opts);
+    }
+
+    /// A pill-shaped switch centred in `r`, accent coloured when on. Flips `value` on click.
+    pub fn toggle(ui: *Ui, r: Rect, value: *bool, opts: ToggleOpts) Interaction {
+        return controls.toggle(ui, r, value, opts);
+    }
+
+    /// Draws a switch with the knob at `pos` (0..1) without reading input,
+    /// for animating `toggle` later.
+    pub fn toggleAt(ui: *Ui, r: Rect, pos: f32, hovered: bool, opts: ToggleOpts) void {
+        controls.toggleAt(ui, r, pos, hovered, opts);
+    }
+
+    /// A round radio button with a label; reports the click, the caller sets its value.
+    pub fn radio(ui: *Ui, r: Rect, selected: bool, label_str: []const u8, opts: CheckOpts) Interaction {
+        return controls.radio(ui, r, selected, label_str, opts);
+    }
+
+    /// A joined control of icon and/or text segments in one rounded container;
+    /// the selected one is raised. Returns true when a click changed `selected`.
+    pub fn segmented(ui: *Ui, r: Rect, items: []const Segment, selected: *usize, opts: SegmentedOpts) bool {
+        return controls.segmented(ui, r, items, selected, opts);
+    }
+
+    /// A multi-line text editor with soft wrapping and vertical scrolling. See
+    /// `text_area.zig` for the keys and mouse behaviour.
+    pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAreaResult {
+        return text_area.textArea(ui, r, st, opts);
+    }
+
+    /// Height of the rectangle `textArea` needs at `width` for the text in
+    /// `st`, between `opts.min_lines` and `opts.max_lines` lines.
+    pub fn measureTextArea(ui: *const Ui, st: *const TextAreaState, width: f32, opts: TextAreaOpts) f32 {
+        return text_area.measureTextArea(ui, st, width, opts);
     }
 
     // ---- scrolling ----------------------------------------------------
@@ -1068,7 +1120,7 @@ pub const SelectState = struct {
 /// Start and end of the "word" at caret position `pos`: the run of same-class
 /// characters (word characters, blanks, other punctuation) around it. Newlines
 /// are never included.
-fn wordRange(str: []const u8, pos: usize) text_edit.TextEdit.Range {
+pub fn wordRange(str: []const u8, pos: usize) text_edit.TextEdit.Range {
     if (str.len == 0) return .{ .start = 0, .end = 0 };
     var p = text_edit.snap(str, pos);
     if (p >= str.len) p = text_edit.prevBoundary(str, str.len);

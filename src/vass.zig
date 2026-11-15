@@ -23,6 +23,8 @@ pub const TextEdit = text_edit.TextEdit;
 test {
     _ = text_edit;
     _ = ui;
+    _ = @import("controls.zig");
+    _ = @import("text_area.zig");
     _ = icons;
     _ = gfx;
     _ = geom;

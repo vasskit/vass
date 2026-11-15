@@ -162,10 +162,6 @@ adds a note; in memory only).
 
 ## Not there yet
 
-- Multi-line text area. `TextEdit` already handles line breaks (`multiline`), home/end per
-  line and line deletion; what is missing is the widget: wrapping the buffer into visual
-  lines, mapping caret/selection to them, up/down movement with a remembered column, vertical
-  scrolling to the caret, and per-line selection rectangles.
 - IME composition display: the backend delivers `text_editing` and `Input.composition`, but
   `textField` does not draw the pre-edit text yet. Committed IME text does work.
 - Undo/redo, double/triple-click word and line selection inside `textField` (only
@@ -200,3 +196,37 @@ adds a note; in memory only).
 - macOS: `macos.unifiedTitleBar(handle)` (transparent title bar, content underneath),
   `macos.layoutTrafficLights(handle, bar_h, left)` (call each frame; returns where app controls
   can start) and `Window.setDragRegion(region, exclude)` so the app's header drags the window.
+
+## Form controls and the text area
+
+Immediate mode like the rest: the value lives in the app. Implementations are in
+`src/controls.zig` and `src/text_area.zig`, exposed as `Ui` methods.
+
+- `ui.checkbox(rect, &bool, "label", .{})`: box with a drawn check mark, label on the right,
+  the whole row clickable; flips the bool. `.disabled`, `.size`, `.box`.
+- `ui.toggle(rect, &bool, .{})`: pill switch with a knob, accent when on; flips the bool.
+  `ui.toggleAt(rect, pos, hovered, opts)` draws it with the knob at `pos` (0..1) without
+  reading input, so an app can animate it later.
+- `ui.radio(rect, selected, "label", .{})`: reports the click; the app sets its own value.
+- `ui.segmented(rect, &.{ .{ .icon = .search }, .{ .label = "Day" } }, &selected, .{})`: one
+  rounded container, the selected segment raised; each `Segment` has an optional icon and/or
+  label. Equal widths by default (`.equal_width = false` sizes to content). Returns true when
+  the selection changed.
+- `ui.textArea(rect, &area, opts) -> TextAreaResult` (`vass.ui.TextAreaState`, keep it at a
+  stable address): multi-line, soft-wrapped to the width, hard newlines kept. Return inserts a
+  newline, or with `opts.submit_on_enter` sets `submitted` (Shift+Return inserts one). Up/Down
+  move across visual lines keeping the column, Cmd+Up/Down go to the start/end, Home/End and
+  Cmd+Left/Right to the visual line edges, alt for words, shift extends. Mouse: click, drag,
+  double click (word), triple click (line), shift-click. Cmd+A/C/X/V, vertical scrolling that
+  follows the caret, the wheel when the content overflows, scrollbar thumb, placeholder,
+  `bare`. `ui.measureTextArea(&area, width, opts)` returns the height for an auto-growing box
+  (`min_lines`/`max_lines`). `TextAreaResult.input_area` and `caret_x` are for
+  `Window.setTextInputArea` while it is focused. A focused text area holds `State.focus`, so
+  enclosing scroll areas leave the arrow keys alone.
+
+`zig build controls -- --snapshot DIR` draws `examples/controls.zig` (all of the above in
+various states) to `DIR/controls.bmp`.
+
+Rough edges: when a word longer than the line is broken between characters, the caret at the
+break shows on the next line's start (no caret affinity), so End on such a line appears to
+stay put; IME pre-edit text is not drawn; no undo.
