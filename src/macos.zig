@@ -94,6 +94,55 @@ pub fn setTopLeft(ns_window: ?*anyopaque, x: f64, y: f64) void {
     send(void, w, "setFrameTopLeftPoint:", .{Point{ .x = x, .y = frame.h - y }});
 }
 
+/// Makes an ordinary window's title bar transparent and lets the content (and
+/// so the app's own header bar) extend underneath it: the traffic-light
+/// buttons stay, the title text and the bar's background go. Pair with
+/// `layoutTrafficLights` every frame and `Window.setDragRegion` so the header
+/// still drags the window.
+pub fn unifiedTitleBar(ns_window: ?*anyopaque) void {
+    const w = ns_window orelse return;
+    const style = send(c_ulong, w, "styleMask", .{});
+    send(void, w, "setStyleMask:", .{style | (1 << 15)}); // NSWindowStyleMaskFullSizeContentView
+    send(void, w, "setTitlebarAppearsTransparent:", .{true});
+    send(void, w, "setTitleVisibility:", .{@as(c_long, 1)}); // NSWindowTitleHidden
+}
+
+/// Positions the close/minimise/zoom buttons `left` points from the window's
+/// left edge, vertically centred in a header `bar_h` points tall, keeping
+/// their native spacing. Cheap and idempotent; call every frame because AppKit
+/// re-lays them out on resize and full screen. Returns the x of the right edge
+/// of the zoom button (where app controls can start), or null without buttons.
+pub fn layoutTrafficLights(ns_window: ?*anyopaque, bar_h: f64, left: f64) ?f64 {
+    const w = ns_window orelse return null;
+    const close = send(Id, w, "standardWindowButton:", .{@as(c_ulong, 0)});
+    const mini = send(Id, w, "standardWindowButton:", .{@as(c_ulong, 1)});
+    const zoom = send(Id, w, "standardWindowButton:", .{@as(c_ulong, 2)});
+    if (close == null or mini == null or zoom == null) return null;
+    const container = send(Id, close, "superview", .{}); // the title bar view
+    const holder = send(Id, container, "superview", .{}); // the title bar container, 32 pt tall by default
+    const root = send(Id, holder, "superview", .{}); // the window's frame view
+    if (container == null or holder == null or root == null) return null;
+    // Make the title bar views as tall as our header, pinned to the top edge.
+    const rf = send(Rect, root, "frame", .{});
+    const want_holder: Rect = .{ .x = 0, .y = rf.h - bar_h, .w = rf.w, .h = bar_h };
+    const hf = send(Rect, holder, "frame", .{});
+    if (@abs(hf.y - want_holder.y) > 0.5 or @abs(hf.h - bar_h) > 0.5 or @abs(hf.w - rf.w) > 0.5) send(void, holder, "setFrame:", .{want_holder});
+    const want: Rect = .{ .x = 0, .y = 0, .w = rf.w, .h = bar_h };
+    const cf = send(Rect, container, "frame", .{});
+    if (@abs(cf.y) > 0.5 or @abs(cf.h - bar_h) > 0.5 or @abs(cf.w - rf.w) > 0.5) send(void, container, "setFrame:", .{want});
+    const cb = send(Rect, close, "frame", .{});
+    const step = send(Rect, mini, "frame", .{}).x - cb.x; // native pitch between buttons
+    var right: f64 = left;
+    for ([_]Id{ close, mini, zoom }, 0..) |btn, i| {
+        const f = send(Rect, btn, "frame", .{});
+        const x = left + @as(f64, @floatFromInt(i)) * step;
+        const y = (bar_h - f.h) / 2;
+        if (@abs(f.x - x) > 0.5 or @abs(f.y - y) > 0.5) send(void, btn, "setFrameOrigin:", .{Point{ .x = x, .y = y }});
+        right = x + f.w;
+    }
+    return right;
+}
+
 pub const Notch = struct {
     /// Height of the menu bar / notch area in points.
     height: f64,

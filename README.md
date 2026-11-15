@@ -188,3 +188,15 @@ adds a note; in memory only).
   `Ui.listRow` (selected/hover highlight for a row), `Ui.labelLines` (wrap to N lines, ending
   in "..."), `Ui.flattenText` (collapse whitespace for previews), `ScrollState.reveal`
   (scroll a span into view) and `ScrollState.arrow_keys` (leave arrows to the app).
+
+## Icons, strokes, title bar
+
+- `DisplayList.line` / `polyline`: anti-aliased strokes with round caps (`gfx.Command.line`).
+- `vass.icons`: `Icon` (sidebar, panel_right, chevrons, arrows, search, more, sliders, plus,
+  arrow_up) and `icons.draw(list, icon, rect, color, weight)`, drawn from strokes at any size.
+- `Ui.iconButton(rect, icon, .{ .active, .disabled })` with hover tint; `TextFieldOpts.bare`
+  for a field that sits inside the app's own box.
+- `Event.mouse_leave` (fed to `Input`, which then hovers nothing).
+- macOS: `macos.unifiedTitleBar(handle)` (transparent title bar, content underneath),
+  `macos.layoutTrafficLights(handle, bar_h, left)` (call each frame; returns where app controls
+  can start) and `Window.setDragRegion(region, exclude)` so the app's header drags the window.

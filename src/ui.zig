@@ -22,6 +22,7 @@ const geom = @import("geom.zig");
 const gfx = @import("gfx.zig");
 const backend = @import("backend_sdl.zig");
 const keys = @import("keys.zig");
+const icons = @import("icons.zig");
 const text_edit = @import("text_edit.zig");
 pub const TextEdit = text_edit.TextEdit;
 const Rect = geom.Rect;
@@ -122,6 +123,11 @@ pub const Input = struct {
             },
             .key_down => |k| if (k.window == window_id) in.push(.{ .key = k }),
             .text_input => |t| if (t.window == window_id) in.push(.{ .text = t.text }),
+            .mouse_leave => |wid| if (wid == window_id) {
+                // Nothing is hovered once the pointer has left the window.
+                in.mouse_x = -1e9;
+                in.mouse_y = -1e9;
+            },
             .text_editing => |t| if (t.window == window_id) {
                 in.composition = t.comp;
             },
@@ -253,6 +259,19 @@ pub const ChipOpts = struct {
     weight: gfx.Weight = .medium,
     /// Corner radius; null is fully rounded.
     radius: ?f32 = null,
+};
+
+pub const IconButtonOpts = struct {
+    /// Drawn pressed-in / switched on (a toggled panel).
+    active: bool = false,
+    /// Dimmed, no hover, and never reports a click.
+    disabled: bool = false,
+    /// Icon size in points (the button rectangle is the hit area).
+    icon_size: f32 = 18,
+    /// Icon colour when idle; defaults to the theme's `dim`.
+    color: ?Color = null,
+    /// Stroke weight multiplier.
+    weight: f32 = 1,
 };
 
 pub const RowOpts = struct {
@@ -486,6 +505,24 @@ pub const Ui = struct {
     /// Width of a chip showing `str`: the text plus `pad` on both sides.
     pub fn chipWidth(ui: *const Ui, str: []const u8, opts: ChipOpts, pad: f32) f32 {
         return ui.measureWeighted(str, opts.size, opts.weight) + 2 * pad;
+    }
+
+    /// A square icon button: a subtle rounded background when hovered or
+    /// `active`, the icon centred in `r`. Returns the interaction of `r`;
+    /// a disabled button is never hovered or clicked.
+    pub fn iconButton(ui: *Ui, r: Rect, icon: icons.Icon, opts: IconButtonOpts) Interaction {
+        const t = ui.theme;
+        var hv = ui.hit(r);
+        if (opts.disabled) hv = .{ .hovered = false, .clicked = false };
+        if (opts.active) {
+            ui.list.rrect(r, 7, t.text.alpha(26));
+        } else if (hv.hovered) {
+            ui.list.rrect(r, 7, t.text.alpha(16));
+        }
+        const base = opts.color orelse t.dim;
+        const color = if (opts.disabled) base.alpha(90) else if (hv.hovered or opts.active) t.text else base;
+        icons.draw(ui.list, icon, r.center(opts.icon_size, opts.icon_size), color, opts.weight);
+        return hv;
     }
 
     /// A selectable list row: draws a highlight when `opts.selected` or hovered
@@ -799,7 +836,7 @@ pub const Ui = struct {
         const t = ui.theme;
         const size = opts.size orelse t.font_body;
         const line_h = @round(size * 1.3);
-        const pad: f32 = 10;
+        const pad: f32 = if (opts.bare) 0 else 10;
         const box: Rect = .{ .x = r.x + pad, .y = r.y + 2, .w = @max(0, r.w - 2 * pad), .h = @max(0, r.h - 4) };
         const id: *const anyopaque = st;
         var res: TextFieldResult = .{};
@@ -869,8 +906,10 @@ pub const Ui = struct {
         st.scroll_x = std.math.clamp(st.scroll_x, 0, @max(0, ui.measure(text, size) + 2 - box.w));
 
         // Draw.
-        ui.list.rrect(r, 10, if (focused) t.accent else t.track);
-        ui.list.rrect(r.inset(1.5), 8.5, t.card);
+        if (!opts.bare) {
+            ui.list.rrect(r, 10, if (focused) t.accent else t.track);
+            ui.list.rrect(r.inset(1.5), 8.5, t.card);
+        }
         ui.pushClip(box);
         defer ui.popClip();
         const ty = r.y + @round((r.h - line_h) / 2);
@@ -1070,6 +1109,9 @@ pub const TextFieldOpts = struct {
     placeholder: []const u8 = "",
     /// Font size; defaults to the theme's body size.
     size: ?f32 = null,
+    /// Draw only the text and caret: no border or fill, no inner padding. The
+    /// caller draws whatever box it sits in (and can show focus itself).
+    bare: bool = false,
 };
 
 pub const TextFieldResult = struct {
@@ -2150,4 +2192,25 @@ test "chip and listRow report the pointer; weight reaches the display list" {
     try std.testing.expectEqual(@as(usize, 0), list.cmds.items.len); // no highlight
     _ = miss.listRow(r, .{ .selected = true });
     try std.testing.expectEqual(@as(usize, 1), list.cmds.items.len);
+}
+
+test "iconButton: hover tints, disabled never clicks, mouse_leave clears hover" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    const r: Rect = .{ .x = 0, .y = 0, .w = 28, .h = 28 };
+    var ui = testUi(&list, 10, 10, true);
+    try std.testing.expect(ui.iconButton(r, .search, .{}).clicked);
+    try std.testing.expect(list.cmds.items[0] == .rrect); // hover background
+    list.reset();
+    var off = testUi(&list, 10, 10, true);
+    const res = off.iconButton(r, .search, .{ .disabled = true });
+    try std.testing.expect(!res.clicked and !res.hovered);
+    try std.testing.expect(list.cmds.items[0] == .arc); // no background, just the icon
+    var in: Input = .{ .mouse_x = 10, .mouse_y = 10 };
+    in.feed(.{ .mouse_leave = 7 }, 3); // another window: no change
+    try std.testing.expectEqual(@as(f32, 10), in.mouse_x);
+    in.feed(.{ .mouse_leave = 3 }, 3);
+    list.reset();
+    var gone = Ui.initHeadless(&list, in, .{}, null);
+    try std.testing.expect(!gone.iconButton(r, .search, .{}).hovered);
 }

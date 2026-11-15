@@ -39,6 +39,9 @@ const c = struct {
     const EVENT_MOUSE_BUTTON_DOWN: u32 = 0x401;
     const EVENT_MOUSE_BUTTON_UP: u32 = 0x402;
     const EVENT_MOUSE_WHEEL: u32 = 0x403;
+    const EVENT_WINDOW_MOUSE_LEAVE: u32 = 0x20D;
+    const SdlPoint = extern struct { x: c_int, y: c_int };
+    const HitTest = *const fn (w: *SdlWindow, area: *const SdlPoint, data: ?*anyopaque) callconv(.c) c_int;
     const KMOD_SHIFT: u16 = 0x0003;
     const KMOD_CTRL: u16 = 0x00C0;
     const KMOD_ALT: u16 = 0x0300;
@@ -78,6 +81,7 @@ const c = struct {
     extern fn SDL_GetWindowID(w: *SdlWindow) u32;
     extern fn SDL_GetWindowProperties(w: *SdlWindow) u32;
     extern fn SDL_GetPointerProperty(props: u32, name: [*:0]const u8, default: ?*anyopaque) ?*anyopaque;
+    extern fn SDL_SetWindowHitTest(w: *SdlWindow, cb: ?HitTest, data: ?*anyopaque) bool;
     extern fn SDL_GetWindowSize(w: *SdlWindow, width: *c_int, height: *c_int) bool;
     extern fn SDL_SetWindowMinimumSize(w: *SdlWindow, min_w: c_int, min_h: c_int) bool;
     extern fn SDL_IOFromConstMem(mem: *const anyopaque, size: usize) ?*IOStream;
@@ -161,6 +165,8 @@ pub const Event = union(enum) {
     /// `dy` > 0 means the content should move down, i.e. scroll towards the
     /// start (wheel rolled away from the user). `dx` > 0 is towards the right.
     mouse_wheel: struct { window: u32, dx: f32, dy: f32 },
+    /// The pointer left the window (hover states should end); payload is the window id.
+    mouse_leave: u32,
     key_down: Key,
     key_up: Key,
     /// Typed or committed text. Only sent while text input is started
@@ -234,6 +240,19 @@ pub fn globalMouse() Mouse {
     var y: f32 = 0;
     const buttons = c.SDL_GetGlobalMouseState(&x, &y);
     return .{ .x = x, .y = y, .left_down = buttons & 1 != 0 };
+}
+
+var drag_region: ?geom.Rect = null;
+var drag_exclude: [16]geom.Rect = undefined;
+var drag_exclude_n: usize = 0;
+
+fn hitTest(_: *c.SdlWindow, area: *const c.SdlPoint, _: ?*anyopaque) callconv(.c) c_int {
+    const x: f32 = @floatFromInt(area.x);
+    const y: f32 = @floatFromInt(area.y);
+    const r = drag_region orelse return 0;
+    if (!r.contains(x, y)) return 0;
+    for (drag_exclude[0..drag_exclude_n]) |e| if (e.contains(x, y)) return 0;
+    return 1; // SDL_HITTEST_DRAGGABLE
 }
 
 var pending_text: [256]u8 = undefined;
@@ -316,6 +335,7 @@ pub fn pollEvent() ?Event {
                 comp.len = @intCast(n);
                 return .{ .text_editing = .{ .window = window, .comp = comp } };
             },
+            c.EVENT_WINDOW_MOUSE_LEAVE => return .{ .mouse_leave = window },
             c.EVENT_MOUSE_WHEEL => return .{ .mouse_wheel = .{ .window = window, .dx = readF32(&e.raw, 24), .dy = readF32(&e.raw, 28) } },
             c.EVENT_MOUSE_BUTTON_DOWN, c.EVENT_MOUSE_BUTTON_UP, c.EVENT_MOUSE_MOTION => {
                 const x = readF32(&e.raw, 28);
@@ -442,6 +462,18 @@ pub const Window = struct {
         return .{ .w = @floatFromInt(iw), .h = @floatFromInt(ih) };
     }
 
+    /// Makes the strip `region` (window points) drag the window, except where
+    /// it overlaps one of `exclude` (buttons). For windows whose title bar is
+    /// drawn by the app (see `macos.unifiedTitleBar`). The rectangles are
+    /// copied (at most 16 exclusions); call again whenever they move. Pass a
+    /// null region to turn dragging off. Only one window can have a region.
+    pub fn setDragRegion(w: *Window, region: ?geom.Rect, exclude: []const geom.Rect) void {
+        drag_region = region;
+        drag_exclude_n = @min(exclude.len, drag_exclude.len);
+        @memcpy(drag_exclude[0..drag_exclude_n], exclude[0..drag_exclude_n]);
+        _ = c.SDL_SetWindowHitTest(w.win, if (region != null) hitTest else null, null);
+    }
+
     pub fn show(w: *Window) void {
         _ = c.SDL_ShowWindow(w.win);
     }
@@ -497,6 +529,7 @@ pub const Window = struct {
             .rrect => |r| w.addRRect(r.rect, r.radius, r.color),
             .ellipse => |e| w.addEllipse(e.cx, e.cy, e.rx, e.ry, e.color),
             .arc => |a| w.addArc(a.cx, a.cy, a.r, a.a0, a.a1, a.width, a.color),
+            .line => |l| w.addLine(l.x0, l.y0, l.x1, l.y1, l.width, l.color),
             .text => |t| {
                 w.flush();
                 w.drawText(t.x, t.y, t.str, t.size, t.color, t.alignment, t.weight);
@@ -660,6 +693,31 @@ pub const Window = struct {
             nrm[i] = .{ gx / len, gy / len };
         }
         w.addConvex(&pts, &nrm, col);
+    }
+
+    fn addLine(w: *Window, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, col: Color) void {
+        const dx = x1 - x0;
+        const dy = y1 - y0;
+        const len = @sqrt(dx * dx + dy * dy);
+        const hw = width / 2;
+        if (len < 0.01) {
+            w.addEllipse(x0, y0, hw, hw, col);
+            return;
+        }
+        const tx = dx / len;
+        const ty = dy / len;
+        const nx = -ty;
+        const ny = tx;
+        const pts = [4][2]f32{
+            .{ x0 + nx * hw, y0 + ny * hw },
+            .{ x1 + nx * hw, y1 + ny * hw },
+            .{ x1 - nx * hw, y1 - ny * hw },
+            .{ x0 - nx * hw, y0 - ny * hw },
+        };
+        const nrm = [4][2]f32{ .{ nx, ny }, .{ nx, ny }, .{ -nx, -ny }, .{ -nx, -ny } };
+        w.addConvex(&pts, &nrm, col);
+        w.addEllipse(x0, y0, hw, hw, col);
+        w.addEllipse(x1, y1, hw, hw, col);
     }
 
     fn addArc(w: *Window, cx: f32, cy: f32, r: f32, a0: f32, a1: f32, width: f32, col: Color) void {
