@@ -14,16 +14,39 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
   key handling). No rendering, no SDL.
 - `src/png.zig` — minimal PNG writer, for handing generated images to the OS.
 - `src/backend_sdl.zig` — SDL3 windows, input, text measuring and the display-list
-  renderer (text via SDL3_ttf).
+  renderer (text via SDL3_ttf + FreeType).
 - `src/macos.zig` — menu-bar item, overlay windows, Spaces behaviour and notch metrics,
   through the Objective-C runtime.
+
+- `build/deps.zig` — build helpers compiling FreeType and SDL_ttf from source (SDL3 comes
+  from the castholm/SDL package).
 
 Layering rule: `geom`, `gfx` and `png` know nothing about the platform; only the backend
 and `macos` do.
 
 ## Using it
 
-Requires Zig 0.17 and `brew install sdl3 sdl3_ttf`. macOS only for now.
+Requires Zig 0.17 and Xcode (or the Command Line Tools) for the macOS SDK. macOS only for
+now. Nothing else needs installing: SDL3 3.4.20, SDL_ttf 3.2.2, FreeType 2.14.3 and
+HarfBuzz 15.1.0 are fetched as pinned dependencies (`build.zig.zon`), compiled from source by
+the Zig build and linked statically, so an app is a single binary that links only system
+frameworks and libSystem/libobjc. HarfBuzz is C++ (single-file amalgamation); Zig builds it
+with its bundled libc++, so no C++ toolchain is needed either. The first build compiles
+SDL3 and HarfBuzz (about 40 s); later builds reuse the cache.
+
+SDL_ttf uses HarfBuzz for shaping (including AAT `trak` tracking), so text measures and
+renders identically to Homebrew's build. It is built without PlutoSVG (no colour SVG
+emoji); FreeType is built without zlib/bzip2/png/brotli (no WOFF2/PNG-bitmap fonts) and
+HarfBuzz without CoreText/ICU/GLib.
+
+`-Dsystem-sdl=true` skips all that and links the Homebrew dylibs (`brew install sdl3
+sdl3_ttf`, looked up in /opt/homebrew/lib) as before. The source dependencies are lazy, so
+that mode downloads nothing.
+
+**Deployment target.** Vass exports `default_target` from its `build.zig`: the host with a
+macOS 13.0 deployment target (`minos 13.0`), instead of the build machine's OS version.
+Pass `-Dtarget=aarch64-macos.14.0` (any version) to override. An app should use the same
+default for its own code and hand the resolved target to the dependency:
 
 In your `build.zig.zon`:
 
@@ -31,7 +54,17 @@ In your `build.zig.zon`:
 
 In your `build.zig`:
 
-    const vass = b.dependency("vass", .{ .target = target, .optimize = optimize }).module("vass");
+    const vass_build = @import("vass");   // Vass's build.zig, for default_target
+    const target = b.standardTargetOptions(.{ .default_target = vass_build.default_target });
+    const optimize = b.standardOptimizeOption(.{});
+    const system_sdl = b.option(bool, "system-sdl", "Use Homebrew SDL3/SDL_ttf") orelse false;
+    const vass = b.dependency("vass", .{
+        .target = target,
+        .optimize = optimize,
+        .@"system-sdl" = system_sdl, // optional escape hatch
+    }).module("vass");
+
+Add `zig-pkg/` to the app's `.gitignore` (Zig 0.17 unpacks dependencies there).
 
 Then `@import("vass")`: create a `vass.platform.Window`, fill a `vass.DisplayList` each
 frame, and call `window.render(&list, clear_color)`.
