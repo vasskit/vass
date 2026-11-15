@@ -37,6 +37,9 @@ pub const InEvent = union(enum) {
     text: backend.TextChunk,
 };
 
+/// Most dropped files `Input` remembers per frame.
+pub const max_drops = 16;
+
 /// Everything the app learned from the platform this frame. Lives across
 /// frames in the app: `feed` it every event, `endFrame` it once per frame.
 pub const Input = struct {
@@ -64,6 +67,18 @@ pub const Input = struct {
     composition: backend.Composition = .{},
     queue: [32]InEvent = undefined,
     queue_len: usize = 0,
+    /// True while a drag from another app is over the window (for a "drop here" highlight).
+    drop_active: bool = false,
+    /// Where the drag is, in window points (valid while `drop_active`, and at the drop).
+    drop_x: f32 = -1e9,
+    drop_y: f32 = -1e9,
+    drops: [max_drops]backend.DropPath = undefined,
+    drops_len: usize = 0,
+
+    /// Files dropped on the window this frame, in arrival order. Valid until `endFrame`.
+    pub fn droppedFiles(in: *const Input) []const backend.DropPath {
+        return in.drops[0..in.drops_len];
+    }
 
     /// Key presses and typed text of this frame, in the order they happened.
     pub fn events(in: *const Input) []const InEvent {
@@ -133,6 +148,25 @@ pub const Input = struct {
             .text_editing => |t| if (t.window == window_id) {
                 in.composition = t.comp;
             },
+            .drop_begin => |wid| if (wid == window_id) {
+                in.drop_active = true;
+            },
+            .drop_position => |d| if (d.window == window_id) {
+                in.drop_active = true;
+                in.drop_x = d.x;
+                in.drop_y = d.y;
+            },
+            .file_drop => |d| if (d.window == window_id) {
+                in.drop_x = d.x;
+                in.drop_y = d.y;
+                if (in.drops_len < in.drops.len) {
+                    in.drops[in.drops_len] = d.path;
+                    in.drops_len += 1;
+                }
+            },
+            .drop_complete => |wid| if (wid == window_id) {
+                in.drop_active = false;
+            },
             else => {},
         }
     }
@@ -144,6 +178,7 @@ pub const Input = struct {
         in.wheel_x = 0;
         in.wheel_y = 0;
         in.queue_len = 0;
+        in.drops_len = 0;
     }
 };
 
@@ -412,6 +447,13 @@ pub const Ui = struct {
     }
 
     /// A rounded panel.
+    /// Draws `img` into `r` (fit, rounded corners, opacity: see `ImageOpts`) and returns the
+    /// hover/click state of `r`. An invalid or unloaded image draws nothing.
+    pub fn image(ui: *Ui, r: Rect, img: gfx.Image, opts: gfx.ImageOpts) Interaction {
+        ui.list.image(r, img, opts);
+        return ui.hit(r);
+    }
+
     pub fn card(ui: *Ui, r: Rect) void {
         ui.list.rrect(r, ui.theme.card_radius, ui.theme.card);
     }
@@ -2265,4 +2307,33 @@ test "iconButton: hover tints, disabled never clicks, mouse_leave clears hover" 
     list.reset();
     var gone = Ui.initHeadless(&list, in, .{}, null);
     try std.testing.expect(!gone.iconButton(r, .search, .{}).hovered);
+}
+
+test "input collects dropped files per frame and tracks the drag" {
+    var in: Input = .{};
+    in.feed(.{ .drop_begin = 1 }, 1);
+    try std.testing.expect(in.drop_active);
+    in.feed(.{ .drop_position = .{ .window = 1, .x = 12, .y = 34 } }, 1);
+    try std.testing.expectEqual(@as(f32, 12), in.drop_x);
+    in.feed(.{ .file_drop = .{ .window = 2, .x = 0, .y = 0, .path = backend.DropPath.from("/other.png").? } }, 1); // other window
+    in.feed(.{ .file_drop = .{ .window = 1, .x = 12, .y = 34, .path = backend.DropPath.from("/tmp/a.png").? } }, 1);
+    in.feed(.{ .file_drop = .{ .window = 1, .x = 12, .y = 34, .path = backend.DropPath.from("/tmp/b.jpg").? } }, 1);
+    in.feed(.{ .drop_complete = 1 }, 1);
+    try std.testing.expect(!in.drop_active);
+    try std.testing.expectEqual(@as(usize, 2), in.droppedFiles().len);
+    try std.testing.expectEqualStrings("/tmp/b.jpg", in.droppedFiles()[1].slice());
+    in.endFrame();
+    try std.testing.expectEqual(@as(usize, 0), in.droppedFiles().len);
+}
+
+test "Ui.image records a command and reports hover" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var in: Input = .{ .mouse_x = 5, .mouse_y = 5 };
+    var ui = Ui.initHeadless(&list, in, .{}, null);
+    const img: gfx.Image = .{ .id = 7, .width = 2, .height = 2 };
+    const r = ui.image(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, img, .{ .fit = .cover });
+    try std.testing.expect(r.hovered);
+    try std.testing.expectEqual(@as(usize, 1), list.cmds.items.len);
+    in.endFrame();
 }

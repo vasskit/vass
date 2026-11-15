@@ -56,6 +56,15 @@ pub fn build(b: *std.Build) void {
             vass.linkLibrary(sdl);
         }
     }
+    // stb_image, compiled as one C file (decoding PNG/JPEG/BMP/GIF). Independent of SDL,
+    // so it is needed with -Dsystem-sdl=true as well.
+    if (b.lazyDependency("stb", .{})) |stb_dep| {
+        vass.addIncludePath(stb_dep.path("."));
+        vass.addCSourceFile(.{
+            .file = b.path("src/stb_impl.c"),
+            .flags = &.{ "-fno-sanitize=undefined", "-fno-strict-aliasing" },
+        });
+    }
     addMacosSdkPaths(b, vass, target);
     vass.linkSystemLibrary("objc", .{});
     vass.linkFramework("AppKit", .{});
@@ -94,6 +103,21 @@ pub fn build(b: *std.Build) void {
     run_controls.addPassthruArgs();
     b.step("controls", "Run the controls showcase").dependOn(&run_controls.step);
     test_step.dependOn(&controls.step);
+
+    // Example: images. `zig build images -- --snapshot DIR`.
+    const images = b.addExecutable(.{
+        .name = "images",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/images.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_images = b.addRunArtifact(images);
+    run_images.addPassthruArgs();
+    b.step("images", "Run the images showcase").dependOn(&run_images.step);
+    test_step.dependOn(&images.step);
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

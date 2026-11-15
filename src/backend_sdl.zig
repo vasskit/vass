@@ -5,6 +5,10 @@ const geom = @import("geom.zig");
 const gfx = @import("gfx.zig");
 const Color = geom.Color;
 const keys = @import("keys.zig");
+const image_mod = @import("image.zig");
+const decode_mod = @import("decode.zig");
+pub const Image = image_mod.Image;
+pub const ImageOpts = image_mod.ImageOpts;
 
 const c = struct {
     const SdlWindow = opaque {};
@@ -47,6 +51,17 @@ const c = struct {
     const KMOD_ALT: u16 = 0x0300;
     const KMOD_GUI: u16 = 0x0C00;
     const BLENDMODE_BLEND: u32 = 1;
+    const BLENDMODE_BLEND_PREMULTIPLIED: u32 = 0x10;
+    const PIXELFORMAT_RGBA32: u32 = 0x16762004; // ABGR8888: bytes R,G,B,A in memory on little-endian
+    const TEXTUREACCESS_STATIC: c_int = 0;
+    const SCALEMODE_LINEAR: c_int = 1;
+    const EVENT_DROP_FILE: u32 = 0x1000;
+    const EVENT_DROP_TEXT: u32 = 0x1001;
+    const EVENT_DROP_BEGIN: u32 = 0x1002;
+    const EVENT_DROP_COMPLETE: u32 = 0x1003;
+    const EVENT_DROP_POSITION: u32 = 0x1004;
+    const DialogFilter = extern struct { name: [*:0]const u8, pattern: [*:0]const u8 };
+    const DialogCallback = *const fn (userdata: ?*anyopaque, filelist: ?[*:null]const ?[*:0]const u8, filter: c_int) callconv(.c) void;
 
     extern fn SDL_Init(flags: u32) bool;
     extern fn SDL_Quit() void;
@@ -98,6 +113,14 @@ const c = struct {
     extern fn SDL_GetClipboardText() ?[*:0]u8;
     extern fn SDL_SetClipboardText(text: [*:0]const u8) bool;
     extern fn SDL_free(p: ?*anyopaque) void;
+    extern fn SDL_CreateTexture(r: *Renderer, format: u32, access: c_int, w: c_int, h: c_int) ?*Texture;
+    extern fn SDL_UpdateTexture(t: *Texture, rect: ?*const SdlRect, pixels: *const anyopaque, pitch: c_int) bool;
+    extern fn SDL_SetTextureBlendMode(t: *Texture, mode: u32) bool;
+    extern fn SDL_SetTextureScaleMode(t: *Texture, mode: c_int) bool;
+    extern fn SDL_LoadFile(file: [*:0]const u8, datasize: *usize) ?*anyopaque;
+    extern fn SDL_CreateSurfaceFrom(w: c_int, h: c_int, format: u32, pixels: *anyopaque, pitch: c_int) ?*Surface;
+    extern fn SDL_SetWindowIcon(w: *SdlWindow, icon: *Surface) bool;
+    extern fn SDL_ShowOpenFileDialog(cb: DialogCallback, userdata: ?*anyopaque, w: ?*SdlWindow, filters: ?[*]const DialogFilter, n: c_int, default_location: ?[*:0]const u8, allow_many: bool) void;
     extern fn SDL_SetRenderClipRect(r: *Renderer, rect: ?*const SdlRect) bool;
     extern fn TTF_Init() bool;
     extern fn TTF_Quit() void;
@@ -174,7 +197,164 @@ pub const Event = union(enum) {
     text_input: struct { window: u32, text: TextChunk },
     /// Input-method composition changed; an empty string means it ended.
     text_editing: struct { window: u32, comp: Composition },
+    /// A drag from another app entered the window (a new set of drops begins).
+    drop_begin: u32,
+    /// The dragged items moved over the window (window points).
+    drop_position: struct { window: u32, x: f32, y: f32 },
+    /// A file was dropped. The path is copied into the event, so it stays valid
+    /// as long as the event does. Several files arrive as several events,
+    /// followed by `drop_complete`.
+    file_drop: struct { window: u32, x: f32, y: f32, path: DropPath },
+    /// The drag ended (after the last file, or because it left the window).
+    drop_complete: u32,
 };
+
+/// A file path from a drop event, copied out of SDL's event memory.
+pub const DropPath = struct {
+    buf: [1024]u8 = undefined,
+    len: u16 = 0,
+
+    pub fn slice(p: *const DropPath) []const u8 {
+        return p.buf[0..p.len];
+    }
+
+    /// Null if `str` does not fit.
+    pub fn from(str: []const u8) ?DropPath {
+        var p: DropPath = .{};
+        if (str.len == 0 or str.len > p.buf.len) return null;
+        @memcpy(p.buf[0..str.len], str);
+        p.len = @intCast(str.len);
+        return p;
+    }
+};
+
+/// Decodes a raw SDL drop event (`SDL_DropEvent` layout: window id at 16, x/y at
+/// 20/24, the data string pointer at 40). Null for other event types, for text
+/// drops, and for paths longer than `DropPath` holds.
+pub fn decodeDropEvent(ev_type: u32, raw: []const u8) ?Event {
+    const window = std.mem.readInt(u32, raw[16..20], .little);
+    switch (ev_type) {
+        c.EVENT_DROP_BEGIN => return .{ .drop_begin = window },
+        c.EVENT_DROP_COMPLETE => return .{ .drop_complete = window },
+        c.EVENT_DROP_POSITION => return .{ .drop_position = .{ .window = window, .x = readF32(raw, 20), .y = readF32(raw, 24) } },
+        c.EVENT_DROP_FILE => {
+            const path = DropPath.from(eventString(raw, 40)) orelse return null;
+            return .{ .file_drop = .{ .window = window, .x = readF32(raw, 20), .y = readF32(raw, 24), .path = path } };
+        },
+        else => return null,
+    }
+}
+
+// ---- open-file dialog -----------------------------------------------------
+
+/// One entry of the dialog's file-type menu. `pattern` lists extensions
+/// separated by `;` without dots, e.g. `"png;jpg;jpeg"` (or `"*"` for all).
+/// Both strings must outlive the dialog: use literals.
+pub const FileFilter = struct { name: [*:0]const u8, pattern: [*:0]const u8 };
+
+pub const FileDialogOptions = struct {
+    filters: []const FileFilter = &.{},
+    allow_many: bool = false,
+    default_location: ?[*:0]const u8 = null,
+};
+
+/// The files the user picked. Free with `deinit` using the allocator given to
+/// `takeDialogResult`.
+pub const ChosenFiles = struct {
+    paths: [][]u8,
+
+    pub fn deinit(f: ChosenFiles, gpa: std.mem.Allocator) void {
+        for (f.paths) |p| gpa.free(p);
+        gpa.free(f.paths);
+    }
+};
+
+/// How a dialog ended. `cancelled` (the user closed it) is not `failed` (the
+/// platform could not show it, or reported an error).
+pub const DialogResult = union(enum) {
+    files: ChosenFiles,
+    cancelled,
+    failed,
+};
+
+/// What the SDL callback leaves behind, possibly from another thread. Paths are
+/// stored NUL-separated in memory from the C allocator, so the callback needs no
+/// Zig allocator; `takeDialogResult` moves them into the caller's allocator.
+const RawDialog = struct { kind: enum { files, cancelled, failed }, data: []u8, count: usize };
+var dialog_lock: std.atomic.Value(bool) = .init(false);
+var dialog_pending: bool = false; // a dialog is open (guarded by the lock)
+var dialog_done: ?RawDialog = null; // its result, until taken (guarded by the lock)
+var dialog_filters: [8]c.DialogFilter = undefined;
+
+fn lockDialog() void {
+    while (dialog_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+
+fn unlockDialog() void {
+    dialog_lock.store(false, .release);
+}
+
+fn dialogCallback(_: ?*anyopaque, list: ?[*:null]const ?[*:0]const u8, _: c_int) callconv(.c) void {
+    var raw: RawDialog = .{ .kind = .failed, .data = &.{}, .count = 0 };
+    if (list) |l| {
+        if (l[0] == null) {
+            raw.kind = .cancelled;
+        } else {
+            var total: usize = 0;
+            var n: usize = 0;
+            while (l[n]) |p| : (n += 1) total += std.mem.span(p).len + 1;
+            if (std.heap.c_allocator.alloc(u8, total)) |buf| {
+                var off: usize = 0;
+                for (0..n) |i| {
+                    const s = std.mem.span(l[i].?);
+                    @memcpy(buf[off..][0..s.len], s);
+                    buf[off + s.len] = 0;
+                    off += s.len + 1;
+                }
+                raw = .{ .kind = .files, .data = buf, .count = n };
+            } else |_| {}
+        }
+    }
+    lockDialog();
+    dialog_pending = false;
+    dialog_done = raw;
+    unlockDialog();
+}
+
+/// Moves a finished dialog's result out of the shared slot (without touching SDL).
+fn takeRawDialog(gpa: std.mem.Allocator) error{OutOfMemory}!?DialogResult {
+    lockDialog();
+    const raw = dialog_done orelse {
+        unlockDialog();
+        return null;
+    };
+    dialog_done = null;
+    unlockDialog();
+    defer if (raw.data.len > 0) std.heap.c_allocator.free(raw.data);
+    switch (raw.kind) {
+        .cancelled => return .cancelled,
+        .failed => return .failed,
+        .files => {
+            const paths = try gpa.alloc([]u8, raw.count);
+            var made: usize = 0;
+            errdefer {
+                for (paths[0..made]) |p| gpa.free(p);
+                gpa.free(paths);
+            }
+            var it = std.mem.splitScalar(u8, raw.data, 0);
+            while (made < raw.count) : (made += 1) paths[made] = try gpa.dupe(u8, it.next().?);
+            return .{ .files = .{ .paths = paths } };
+        },
+    }
+}
+
+/// Test hook: leaves `list` as the SDL callback would.
+fn deliverDialogForTest(list: ?[*:null]const ?[*:0]const u8) void {
+    lockDialog();
+    dialog_pending = true;
+    unlockDialog();
+    dialogCallback(null, list, 0);
+}
 
 /// TrueType font data to draw text with instead of the system fonts. The
 /// bytes must stay valid for the life of the window (embed them with
@@ -336,6 +516,10 @@ pub fn pollEvent() ?Event {
                 return .{ .text_editing = .{ .window = window, .comp = comp } };
             },
             c.EVENT_WINDOW_MOUSE_LEAVE => return .{ .mouse_leave = window },
+            c.EVENT_DROP_FILE, c.EVENT_DROP_BEGIN, c.EVENT_DROP_COMPLETE, c.EVENT_DROP_POSITION => {
+                // The path lives in SDL's event memory until the next poll; decodeDropEvent copies it.
+                if (decodeDropEvent(e.type, &e.raw)) |ev| return ev;
+            },
             c.EVENT_MOUSE_WHEEL => return .{ .mouse_wheel = .{ .window = window, .dx = readF32(&e.raw, 24), .dy = readF32(&e.raw, 28) } },
             c.EVENT_MOUSE_BUTTON_DOWN, c.EVENT_MOUSE_BUTTON_UP, c.EVENT_MOUSE_MOTION => {
                 const x = readF32(&e.raw, 28);
@@ -375,6 +559,15 @@ const font_paths = [_][*:0]const u8{
 };
 
 const CachedFont = struct { px: u32, weight: gfx.Weight, font: *c.Font };
+const ImageTex = struct { tex: *c.Texture, w: u32, h: u32 };
+/// Image ids are unique across windows and never reused, so a stale or foreign
+/// handle can only miss.
+var next_image_id: u32 = 1;
+/// Textures are downscaled (box filter) to at most this many pixels per side.
+const max_texture_side: u32 = 2048;
+
+pub const ImageError = decode_mod.Error || error{ FileReadFailed, TextureFailed };
+
 const CachedText = struct { tex: *c.Texture, w: f32, h: f32, last_frame: u64 };
 
 pub fn sleepMs(ms: u32) void {
@@ -403,6 +596,7 @@ pub const Window = struct {
     clips: [16]geom.Rect = undefined,
     clip_n: usize = 0,
     font_set: ?FontSet = null,
+    images: std.AutoHashMapUnmanaged(u32, ImageTex) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, opts: WindowOptions) !Window {
         if (live_windows == 0) {
@@ -436,6 +630,9 @@ pub const Window = struct {
         var it = w.texts.valueIterator();
         while (it.next()) |t| c.SDL_DestroyTexture(t.tex);
         w.texts.deinit(w.gpa);
+        var imgs = w.images.valueIterator();
+        while (imgs.next()) |t| c.SDL_DestroyTexture(t.tex);
+        w.images.deinit(w.gpa);
         for (w.fonts.items) |f| c.TTF_CloseFont(f.font);
         w.fonts.deinit(w.gpa);
         w.verts.deinit(w.gpa);
@@ -515,6 +712,177 @@ pub const Window = struct {
         _ = c.SDL_SetTextInputArea(w.win, &ir, @intFromFloat(cursor_x));
     }
 
+    // ---- images -------------------------------------------------------
+
+    /// Decodes PNG, JPEG, BMP or GIF (first frame) from memory and uploads it as a texture.
+    /// Fails with `InvalidImage` (not an image / corrupt) or `ImageTooLarge`.
+    pub fn loadImage(w: *Window, bytes: []const u8) ImageError!Image {
+        const d = try decode_mod.decode(w.gpa, bytes);
+        defer d.deinit(w.gpa);
+        return w.loadImagePixels(d.pixels, d.width, d.height);
+    }
+
+    /// Reads and decodes a file (see `loadImage`). `FileReadFailed` if it cannot be read.
+    pub fn loadImageFile(w: *Window, path: []const u8) ImageError!Image {
+        const z = try w.gpa.allocSentinel(u8, path.len, 0);
+        @memcpy(z, path);
+        defer w.gpa.free(z);
+        var size: usize = 0;
+        const data = c.SDL_LoadFile(z.ptr, &size) orelse return error.FileReadFailed;
+        defer c.SDL_free(data);
+        if (size > decode_mod.max_file_bytes) return error.ImageTooLarge;
+        return w.loadImage(@as([*]const u8, @ptrCast(data))[0..size]);
+    }
+
+    /// Uploads straight-alpha RGBA8 pixels (`width * height * 4` bytes, rows top to bottom)
+    /// as an image. The pixels are copied. Very large images are reduced to a 2048 px texture
+    /// (the handle still reports the original size).
+    pub fn loadImagePixels(w: *Window, rgba: []const u8, width: u32, height: u32) ImageError!Image {
+        if (!decode_mod.sizeOk(width, height)) return error.ImageTooLarge;
+        if (rgba.len != @as(usize, width) * height * 4) return error.InvalidImage;
+        const prep = try decode_mod.prepareTexture(w.gpa, rgba, width, height, max_texture_side);
+        defer w.gpa.free(prep.pixels);
+        const tex = c.SDL_CreateTexture(w.ren, c.PIXELFORMAT_RGBA32, c.TEXTUREACCESS_STATIC, @intCast(prep.width), @intCast(prep.height)) orelse return error.TextureFailed;
+        errdefer c.SDL_DestroyTexture(tex);
+        if (!c.SDL_UpdateTexture(tex, null, prep.pixels.ptr, @intCast(prep.width * 4))) return error.TextureFailed;
+        // Premultiplied alpha: linear filtering then never bleeds the colour of fully
+        // transparent pixels into the edges (no dark/bright halos).
+        _ = c.SDL_SetTextureBlendMode(tex, c.BLENDMODE_BLEND_PREMULTIPLIED);
+        _ = c.SDL_SetTextureScaleMode(tex, c.SCALEMODE_LINEAR);
+        const new_id = next_image_id;
+        next_image_id += 1;
+        try w.images.put(w.gpa, new_id, .{ .tex = tex, .w = width, .h = height });
+        return .{ .id = new_id, .width = width, .height = height };
+    }
+
+    /// Frees the texture. The handle (and copies of it) become invalid and draw nothing.
+    /// Unloading an unknown or already unloaded handle is a no-op.
+    pub fn unloadImage(w: *Window, img: Image) void {
+        if (w.images.fetchRemove(img.id)) |kv| c.SDL_DestroyTexture(kv.value.tex);
+    }
+
+    /// True if `img` is currently loaded in this window.
+    pub fn hasImage(w: *const Window, img: Image) bool {
+        return img.isValid() and w.images.contains(img.id);
+    }
+
+    /// Pixel size of a loaded image, or null if the handle is not loaded here.
+    pub fn imageSize(w: *const Window, img: Image) ?struct { w: u32, h: u32 } {
+        const t = w.images.get(img.id) orelse return null;
+        return .{ .w = t.w, .h = t.h };
+    }
+
+    /// Sets the window icon from straight-alpha RGBA8 pixels (used by platforms that have
+    /// window icons; on macOS see `macos.setDockIcon`).
+    pub fn setIcon(w: *Window, rgba: []const u8, width: u32, height: u32) !void {
+        if (!decode_mod.sizeOk(width, height) or rgba.len != @as(usize, width) * height * 4) return error.InvalidImage;
+        const copy = try w.gpa.dupe(u8, rgba);
+        defer w.gpa.free(copy);
+        const surf = c.SDL_CreateSurfaceFrom(@intCast(width), @intCast(height), c.PIXELFORMAT_RGBA32, copy.ptr, @intCast(width * 4)) orelse return error.IconFailed;
+        defer c.SDL_DestroySurface(surf);
+        // SDL copies the surface into the window's icon images.
+        if (!c.SDL_SetWindowIcon(w.win, surf)) return error.IconFailed;
+    }
+
+    /// `setIcon` from an encoded image (PNG, ...).
+    pub fn setIconEncoded(w: *Window, bytes: []const u8) !void {
+        const d = try decode_mod.decode(w.gpa, bytes);
+        defer d.deinit(w.gpa);
+        try w.setIcon(d.pixels, d.width, d.height);
+    }
+
+    fn drawImage(w: *Window, r: geom.Rect, img: Image, opts: ImageOpts) void {
+        const t = w.images.get(img.id) orelse return;
+        const opacity = std.math.clamp(opts.opacity, 0, 1);
+        const a = opacity * @as(f32, @floatFromInt(opts.tint.a)) / 255.0;
+        if (a <= 0) return;
+        const pl = image_mod.place(r, @floatFromInt(img.width), @floatFromInt(img.height), opts.fit);
+        const d = pl.dest;
+        if (d.w <= 0 or d.h <= 0) return;
+        // Premultiplied vertex colour: rgb scaled by the alpha, as the texture is.
+        const tint = [3]f32{
+            @as(f32, @floatFromInt(opts.tint.r)) / 255.0 * a,
+            @as(f32, @floatFromInt(opts.tint.g)) / 255.0 * a,
+            @as(f32, @floatFromInt(opts.tint.b)) / 255.0 * a,
+        };
+        const iw: f32 = @floatFromInt(img.width);
+        const ih: f32 = @floatFromInt(img.height);
+
+        var pts: [4 * (rrect_seg + 1)][2]f32 = undefined;
+        var nrm: [4 * (rrect_seg + 1)][2]f32 = undefined;
+        const n = rrectOutline(d, opts.radius, &pts, &nrm);
+        const f = 0.5 / w.density;
+        var cx: f32 = 0;
+        var cy: f32 = 0;
+        for (pts[0..n]) |p| {
+            cx += p[0];
+            cy += p[1];
+        }
+        const nf: f32 = @floatFromInt(n);
+        const Map = struct {
+            d: geom.Rect,
+            s: geom.Rect,
+            iw: f32,
+            ih: f32,
+            fn uv(m: @This(), x: f32, y: f32) c.FPoint {
+                const u = (m.s.x + (x - m.d.x) / m.d.w * m.s.w) / m.iw;
+                const v = (m.s.y + (y - m.d.y) / m.d.h * m.s.h) / m.ih;
+                return .{ .x = std.math.clamp(u, 0, 1), .y = std.math.clamp(v, 0, 1) };
+            }
+        };
+        const map: Map = .{ .d = d, .s = pl.src, .iw = iw, .ih = ih };
+        const center = w.tvert(cx / nf, cy / nf, map, tint, a, 1);
+        const inner = center + 1;
+        for (pts[0..n], nrm[0..n]) |p, m| _ = w.tvert(p[0] - m[0] * f, p[1] - m[1] * f, map, tint, a, 1);
+        const outer = inner + @as(c_int, @intCast(n));
+        for (pts[0..n], nrm[0..n]) |p, m| _ = w.tvert(p[0] + m[0] * f, p[1] + m[1] * f, map, tint, a, 0);
+        for (0..n) |i| {
+            const p: c_int = @intCast(i);
+            const q: c_int = @intCast((i + 1) % n);
+            w.tri(center, inner + p, inner + q);
+            w.tri(inner + p, outer + p, outer + q);
+            w.tri(inner + p, outer + q, inner + q);
+        }
+        _ = c.SDL_RenderGeometry(w.ren, t.tex, w.verts.items.ptr, @intCast(w.verts.items.len), w.idx.items.ptr, @intCast(w.idx.items.len));
+        w.verts.clearRetainingCapacity();
+        w.idx.clearRetainingCapacity();
+    }
+
+    fn tvert(w: *Window, x: f32, y: f32, map: anytype, tint: [3]f32, a: f32, edge: f32) c_int {
+        const i: c_int = @intCast(w.verts.items.len);
+        w.verts.append(w.gpa, .{
+            .position = .{ .x = x, .y = y },
+            .color = .{ .r = tint[0] * edge, .g = tint[1] * edge, .b = tint[2] * edge, .a = a * edge },
+            .tex_coord = map.uv(x, y),
+        }) catch @panic("out of memory");
+        return i;
+    }
+
+    // ---- files --------------------------------------------------------
+
+    /// Shows the system open-file dialog (asynchronous; it may finish on another thread).
+    /// Poll `takeDialogResult` each frame for the outcome. Only one dialog at a time:
+    /// `error.DialogBusy` while one is open or its result has not been taken.
+    pub fn openFileDialog(w: *Window, opts: FileDialogOptions) error{DialogBusy}!void {
+        lockDialog();
+        if (dialog_pending or dialog_done != null) {
+            unlockDialog();
+            return error.DialogBusy;
+        }
+        dialog_pending = true;
+        unlockDialog();
+        const n = @min(opts.filters.len, dialog_filters.len);
+        for (opts.filters[0..n], 0..) |flt, i| dialog_filters[i] = .{ .name = flt.name, .pattern = flt.pattern };
+        c.SDL_ShowOpenFileDialog(dialogCallback, null, w.win, if (n > 0) &dialog_filters else null, @intCast(n), opts.default_location, opts.allow_many);
+    }
+
+    /// The finished dialog's outcome, once, or null while it is still open (or none was
+    /// shown). Paths are copied into `gpa`; free with `ChosenFiles.deinit(gpa)`.
+    pub fn takeDialogResult(w: *Window, gpa: std.mem.Allocator) error{OutOfMemory}!?DialogResult {
+        _ = w;
+        return takeRawDialog(gpa);
+    }
+
     pub fn setAlwaysOnTop(w: *Window, on: bool) void {
         _ = c.SDL_SetWindowAlwaysOnTop(w.win, on);
     }
@@ -530,6 +898,10 @@ pub const Window = struct {
             .ellipse => |e| w.addEllipse(e.cx, e.cy, e.rx, e.ry, e.color),
             .arc => |a| w.addArc(a.cx, a.cy, a.r, a.a0, a.a1, a.width, a.color),
             .line => |l| w.addLine(l.x0, l.y0, l.x1, l.y1, l.width, l.color),
+            .image => |im| {
+                w.flush();
+                w.drawImage(im.rect, im.image, im.opts);
+            },
             .text => |t| {
                 w.flush();
                 w.drawText(t.x, t.y, t.str, t.size, t.color, t.alignment, t.weight);
@@ -649,35 +1021,10 @@ pub const Window = struct {
     }
 
     fn addRRect(w: *Window, r: geom.Rect, radius: f32, col: Color) void {
-        const seg = 10;
-        var pts: [4 * (seg + 1)][2]f32 = undefined;
-        var nrm: [4 * (seg + 1)][2]f32 = undefined;
-        const rad = @max(0, @min(radius, @min(r.w, r.h) / 2));
-        if (rad < 0.05) {
-            // Plain rectangle: one point per corner. (Collapsed corner arcs
-            // would add sliver triangles that show up under alpha blending.)
-            const sq = [4][2]f32{ .{ r.x + r.w, r.y }, .{ r.x + r.w, r.y + r.h }, .{ r.x, r.y + r.h }, .{ r.x, r.y } };
-            const diag = [4][2]f32{ .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 }, .{ -1, -1 } };
-            w.addConvex(&sq, &diag, col);
-            return;
-        }
-        const centers = [4][2]f32{
-            .{ r.x + r.w - rad, r.y + rad }, // top-right
-            .{ r.x + r.w - rad, r.y + r.h - rad }, // bottom-right
-            .{ r.x + rad, r.y + r.h - rad }, // bottom-left
-            .{ r.x + rad, r.y + rad }, // top-left
-        };
-        var k: usize = 0;
-        for (centers, 0..) |cc, corner| {
-            const start = -std.math.pi / 2.0 + @as(f32, @floatFromInt(corner)) * std.math.pi / 2.0;
-            for (0..seg + 1) |s| {
-                const ang = start + @as(f32, @floatFromInt(s)) / seg * std.math.pi / 2.0;
-                nrm[k] = .{ @cos(ang), @sin(ang) };
-                pts[k] = .{ cc[0] + nrm[k][0] * rad, cc[1] + nrm[k][1] * rad };
-                k += 1;
-            }
-        }
-        w.addConvex(&pts, &nrm, col);
+        var pts: [4 * (rrect_seg + 1)][2]f32 = undefined;
+        var nrm: [4 * (rrect_seg + 1)][2]f32 = undefined;
+        const n = rrectOutline(r, radius, &pts, &nrm);
+        w.addConvex(pts[0..n], nrm[0..n], col);
     }
 
     fn addEllipse(w: *Window, cx: f32, cy: f32, rx: f32, ry: f32, col: Color) void {
@@ -823,7 +1170,92 @@ pub const Window = struct {
     }
 };
 
+const rrect_seg = 10;
+
+/// Outline of a rounded rectangle, clockwise from the top-right corner, with
+/// outward unit normals. Returns the point count (4 for a plain rectangle).
+fn rrectOutline(r: geom.Rect, radius: f32, pts: *[4 * (rrect_seg + 1)][2]f32, nrm: *[4 * (rrect_seg + 1)][2]f32) usize {
+    const seg = rrect_seg;
+    const rad = @max(0, @min(radius, @min(r.w, r.h) / 2));
+    if (rad < 0.05) {
+        // Plain rectangle: one point per corner. (Collapsed corner arcs
+        // would add sliver triangles that show up under alpha blending.)
+        pts[0..4].* = .{ .{ r.x + r.w, r.y }, .{ r.x + r.w, r.y + r.h }, .{ r.x, r.y + r.h }, .{ r.x, r.y } };
+        nrm[0..4].* = .{ .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 }, .{ -1, -1 } };
+        return 4;
+    }
+    const centers = [4][2]f32{
+        .{ r.x + r.w - rad, r.y + rad }, // top-right
+        .{ r.x + r.w - rad, r.y + r.h - rad }, // bottom-right
+        .{ r.x + rad, r.y + r.h - rad }, // bottom-left
+        .{ r.x + rad, r.y + rad }, // top-left
+    };
+    var k: usize = 0;
+    for (centers, 0..) |cc, corner| {
+        const start = -std.math.pi / 2.0 + @as(f32, @floatFromInt(corner)) * std.math.pi / 2.0;
+        for (0..seg + 1) |s| {
+            const ang = start + @as(f32, @floatFromInt(s)) / seg * std.math.pi / 2.0;
+            nrm[k] = .{ @cos(ang), @sin(ang) };
+            pts[k] = .{ cc[0] + nrm[k][0] * rad, cc[1] + nrm[k][1] * rad };
+            k += 1;
+        }
+    }
+    return k;
+}
+
 fn fail(what: []const u8) error{PlatformInitFailed} {
     std.log.err("{s} failed: {s}", .{ what, c.SDL_GetError() });
     return error.PlatformInitFailed;
+}
+
+fn testRaw(ev_type: u32, window: u32, x: f32, y: f32, data: ?[*:0]const u8) [128]u8 {
+    var raw: [128]u8 = @splat(0);
+    std.mem.writeInt(u32, raw[0..4], ev_type, .little);
+    std.mem.writeInt(u32, raw[16..20], window, .little);
+    std.mem.writeInt(u32, raw[20..24], @bitCast(x), .little);
+    std.mem.writeInt(u32, raw[24..28], @bitCast(y), .little);
+    if (data) |d| std.mem.writeInt(usize, raw[40..][0..@sizeOf(usize)], @intFromPtr(d), .little);
+    return raw;
+}
+
+test "drop events decode, copying the path" {
+    const raw = testRaw(c.EVENT_DROP_FILE, 3, 10.5, 20, "/Users/me/pic.png");
+    const ev = decodeDropEvent(c.EVENT_DROP_FILE, &raw).?;
+    try std.testing.expectEqual(@as(u32, 3), ev.file_drop.window);
+    try std.testing.expectEqual(@as(f32, 10.5), ev.file_drop.x);
+    try std.testing.expectEqualStrings("/Users/me/pic.png", ev.file_drop.path.slice());
+    const pos = decodeDropEvent(c.EVENT_DROP_POSITION, &testRaw(c.EVENT_DROP_POSITION, 3, 1, 2, null)).?;
+    try std.testing.expectEqual(@as(f32, 2), pos.drop_position.y);
+    try std.testing.expectEqual(@as(u32, 3), decodeDropEvent(c.EVENT_DROP_BEGIN, &testRaw(c.EVENT_DROP_BEGIN, 3, 0, 0, null)).?.drop_begin);
+    try std.testing.expectEqual(@as(u32, 3), decodeDropEvent(c.EVENT_DROP_COMPLETE, &testRaw(c.EVENT_DROP_COMPLETE, 3, 0, 0, null)).?.drop_complete);
+    // A text drop, a NULL path and other event types are not file drops.
+    try std.testing.expect(decodeDropEvent(c.EVENT_DROP_TEXT, &testRaw(c.EVENT_DROP_TEXT, 3, 0, 0, "hello")) == null);
+    try std.testing.expect(decodeDropEvent(c.EVENT_DROP_FILE, &testRaw(c.EVENT_DROP_FILE, 3, 0, 0, null)) == null);
+    try std.testing.expect(decodeDropEvent(c.EVENT_KEY_DOWN, &testRaw(c.EVENT_KEY_DOWN, 3, 0, 0, null)) == null);
+}
+
+test "dialog results: files, cancel and error are distinct and owned by the caller" {
+    const gpa = std.testing.allocator;
+    try std.testing.expect((try takeRawDialog(gpa)) == null);
+
+    const picked = [_:null]?[*:0]const u8{ "/a/one.png", "/b/two.jpg" };
+    deliverDialogForTest(&picked);
+    const r = (try takeRawDialog(gpa)).?;
+    defer r.files.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), r.files.paths.len);
+    try std.testing.expectEqualStrings("/b/two.jpg", r.files.paths[1]);
+    try std.testing.expect((try takeRawDialog(gpa)) == null); // taken once
+
+    const none = [_:null]?[*:0]const u8{};
+    deliverDialogForTest(&none);
+    try std.testing.expect((try takeRawDialog(gpa)).? == .cancelled);
+
+    deliverDialogForTest(null);
+    try std.testing.expect((try takeRawDialog(gpa)).? == .failed);
+}
+
+test "a long path does not fit a DropPath" {
+    const long: [2000]u8 = @splat('a');
+    try std.testing.expect(DropPath.from(&long) == null);
+    try std.testing.expect(DropPath.from("") == null);
 }

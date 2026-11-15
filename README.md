@@ -13,6 +13,9 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 - `src/text_edit.zig` — `TextEdit`: the pure text editing core (buffer, cursor, selection,
   key handling). No rendering, no SDL.
 - `src/png.zig` — minimal PNG writer, for handing generated images to the OS.
+- `src/image.zig` — `Image` handles, `ImageOpts`/`Fit` and the pure fit math. No platform.
+- `src/decode.zig` — PNG/JPEG/BMP/GIF decoding from memory (stb_image) to RGBA8, plus the pure
+  pixel helpers (premultiply, box downscale). No platform.
 - `src/backend_sdl.zig` — SDL3 windows, input, text measuring and the display-list
   renderer (text via SDL3_ttf + FreeType).
 - `src/macos.zig` — menu-bar item, overlay windows, Spaces behaviour and notch metrics,
@@ -21,7 +24,7 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 - `build/deps.zig` — build helpers compiling FreeType and SDL_ttf from source (SDL3 comes
   from the castholm/SDL package).
 
-Layering rule: `geom`, `gfx` and `png` know nothing about the platform; only the backend
+Layering rule: `geom`, `gfx`, `image` and `png` know nothing about the platform; only the backend
 and `macos` do.
 
 ## Using it
@@ -38,6 +41,12 @@ SDL_ttf uses HarfBuzz for shaping (including AAT `trak` tracking), so text measu
 renders identically to Homebrew's build. It is built without PlutoSVG (no colour SVG
 emoji); FreeType is built without zlib/bzip2/png/brotli (no WOFF2/PNG-bitmap fonts) and
 HarfBuzz without CoreText/ICU/GLib.
+
+Images are decoded by [stb_image](https://github.com/nothings/stb) (public domain / MIT),
+a pinned, hashed lazy dependency in `build.zig.zon` (commit 9600522) compiled as one C file,
+`src/stb_impl.c`, with only PNG, JPEG, BMP and GIF enabled. It is independent of SDL, so it is
+built with `-Dsystem-sdl=true` too. It adds roughly 75 KB of code to a binary that uses images
+(the linker drops it from apps that do not).
 
 `-Dsystem-sdl=true` skips all that and links the Homebrew dylibs (`brew install sdl3
 sdl3_ttf`, looked up in /opt/homebrew/lib) as before. The source dependencies are lazy, so
@@ -230,3 +239,54 @@ various states) to `DIR/controls.bmp`.
 Rough edges: when a word longer than the line is broken between characters, the caret at the
 break shows on the next line's start (no caret affinity), so End on such a line appears to
 stay put; IME pre-edit text is not drawn; no undo.
+
+## Images, file drops and the open-file dialog
+
+    var win = try vass.platform.Window.init(gpa, .{ ... });
+    const img = try win.loadImage(png_or_jpeg_bytes);       // or loadImageFile(path) / loadImagePixels(rgba, w, h)
+    // per frame:
+    _ = ui.image(rect, img, .{ .fit = .cover, .radius = 12, .opacity = 0.8 });
+    // or list.image(rect, img, opts) without a Ui
+
+- **Handles.** `vass.Image = { id, width, height }` is a small value for app state;
+  `img.isValid()`, `img.aspect()`, `Image.none`. `Window.loadImage(bytes)` decodes PNG, JPEG, BMP
+  or GIF (first frame) and uploads a texture; `loadImageFile(path)` reads then decodes;
+  `loadImagePixels(rgba, w, h)` takes straight-alpha RGBA8 (copied). Errors: `InvalidImage`
+  (not an image, or corrupt), `ImageTooLarge` (over 16384 px a side or 64 Mpx, rejected from
+  the header before anything is allocated), `FileReadFailed`, `TextureFailed`.
+  `unloadImage(img)` frees the texture; ids are never reused, so drawing an unloaded handle (or
+  one from another window, or `Image.none`) draws nothing. `hasImage`, `imageSize` query it.
+- **Drawing.** `ImageOpts{ fit, radius, opacity, tint }`: `.fill` stretches, `.contain` (default)
+  letterboxes, `.cover` crops, centred. `radius` rounds the drawn image (for `.contain` its own
+  rectangle) as real textured geometry with an anti-aliased edge, not a mask. Opacity and tint
+  multiply the image. Images obey the clip stack (`pushClip`, `beginScroll`) and show up in
+  `--snapshot` output. `vass.image.place(rect, w, h, fit)` is the pure fit math (dest and source
+  rectangles). `Ui.image` returns the `Interaction` of the rectangle.
+- **Quality.** Textures use linear filtering and premultiplied alpha, so scaling transparent PNGs
+  leaves no dark or bright halos; drawing happens in points, so Retina is sharp. Images larger
+  than 2048 px are box-filtered down on upload (the handle keeps the original size). There is no
+  mipmapping: a big photo drawn at thumbnail size can still look slightly aliased. JPEG EXIF
+  orientation is ignored (stb does not apply it).
+- **Dropped files.** The backend emits `Event.drop_begin`, `drop_position`, `file_drop`
+  (`{ window, x, y, path }`) and `drop_complete`. `DropPath` holds the path inline (up to 1024 bytes;
+  longer ones are ignored), so it lives as long as the event. `Input` folds them in: `drop_active`
+  and `drop_x/drop_y` for a "drop here" highlight, `droppedFiles()` for this frame's files
+  (up to 16 per frame). Text drops are ignored.
+- **Open-file dialog.** `win.openFileDialog(.{ .filters = &.{.{ .name = "Images", .pattern = "png;jpg;jpeg" }},
+  .allow_many = true })` shows the system dialog (`error.DialogBusy` if one is open or its
+  result is untaken; filter strings must be literals). It finishes asynchronously, possibly on
+  another thread, so poll `win.takeDialogResult(gpa)` once per frame: `null` while open, then
+  `.files` (owned paths, free with `ChosenFiles.deinit(gpa)`), `.cancelled` (the user closed it) or
+  `.failed` (the platform could not show it). The callback only writes into a lock-guarded slot.
+- **Window / Dock icon.** `win.setIcon(rgba, w, h)` and `win.setIconEncoded(png_bytes)` use
+  `SDL_SetWindowIcon`. On macOS an unbundled app (`zig build run`) has no Info.plist icon:
+  `vass.macos.setDockIcon(png_bytes)` sets `NSApplication.applicationIconImage` at runtime. The
+  Dock draws the image as is, so supply rounded-square artwork with its padding (about 824 px of
+  art centred in a 1024 px transparent canvas).
+
+`zig build images -- --snapshot DIR` draws `examples/images.zig` (fit modes, rounded corners,
+opacity, tint, an embedded PNG with transparency and JPEG, an 8x8 and a 2400x1600 image, a scroll
+clip, an Open... button and a drop target) to `DIR/images.bmp`.
+
+Not verified by the author without a human: the native dialog and real drag-and-drop (decoding
+of the SDL events and of the dialog callback is unit-tested with synthetic data).

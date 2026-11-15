@@ -24,6 +24,12 @@
             .hash = "N-V-__8AABCJSwZ_b-_pzs_bdrf6CKkC58JNxsp0b1FfvNqV",
             .lazy = true,
         },
+        // Single-header image decoder (PNG, JPEG, BMP, GIF), built from src/stb_impl.c.
+        .stb = .{
+            .url = "https://github.com/nothings/stb/archive/9600522de53973336fa033a289858a4354cbb04c.tar.gz",
+            .hash = "N-V-__8AAKFQVQC4NjbzesYbaBSKdGJUM7BCrXWCSbndWXMK",
+            .lazy = true,
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "build", "src", "examples", "README.md" },
 }

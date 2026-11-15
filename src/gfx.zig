@@ -4,6 +4,10 @@ const std = @import("std");
 const geom = @import("geom.zig");
 const Rect = geom.Rect;
 const Color = geom.Color;
+const image_mod = @import("image.zig");
+pub const Image = image_mod.Image;
+pub const ImageOpts = image_mod.ImageOpts;
+pub const Fit = image_mod.Fit;
 
 pub const Align = enum { left, center, right };
 
@@ -19,6 +23,9 @@ pub const Command = union(enum) {
     /// Stroked straight segment with round caps.
     line: struct { x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Color },
     text: struct { x: f32, y: f32, str: []const u8, size: f32, color: Color, alignment: Align, weight: Weight = .regular },
+    /// A loaded image (see `Window.loadImage`) fitted into `rect`. Drawn as nothing if the
+    /// handle is not (or no longer) valid for the window.
+    image: struct { rect: Rect, image: Image, opts: ImageOpts },
     /// Restricts drawing to `Rect` (intersected with any clip already active)
     /// until the matching `pop_clip`.
     push_clip: Rect,
@@ -89,6 +96,11 @@ pub const DisplayList = struct {
         if (closed and pts.len > 2) l.line(pts[pts.len - 1][0], pts[pts.len - 1][1], pts[0][0], pts[0][1], width, color);
     }
 
+    /// Draws `img` into `r` as `opts` says (fit, rounded corners, opacity, tint).
+    pub fn image(l: *DisplayList, r: Rect, img: Image, opts: ImageOpts) void {
+        l.push(.{ .image = .{ .rect = r, .image = img, .opts = opts } });
+    }
+
     pub fn text(l: *DisplayList, x: f32, y: f32, size: f32, color: Color, alignment: Align, str: []const u8) void {
         const copy = l.arena.allocator().dupe(u8, str) catch @panic("out of memory");
         l.push(.{ .text = .{ .x = x, .y = y, .str = copy, .size = size, .color = color, .alignment = alignment } });
@@ -117,4 +129,14 @@ test "polyline records one line per segment, plus the closing one" {
     try std.testing.expectEqual(@as(f32, 10), l.cmds.items[4].line.x0);
     l.polyline(pts[0..1], 2, .{ .r = 0, .g = 0, .b = 0 }, true); // too short: nothing
     try std.testing.expectEqual(@as(usize, 5), l.cmds.items.len);
+}
+
+test "image records one command with its options" {
+    var l = DisplayList.init(std.testing.allocator);
+    defer l.deinit();
+    const img: Image = .{ .id = 1, .width = 4, .height = 4 };
+    l.image(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, img, .{ .fit = .cover, .radius = 4, .opacity = 0.5 });
+    try std.testing.expectEqual(@as(usize, 1), l.cmds.items.len);
+    try std.testing.expectEqual(Fit.cover, l.cmds.items[0].image.opts.fit);
+    try std.testing.expectEqual(@as(u32, 1), l.cmds.items[0].image.image.id);
 }

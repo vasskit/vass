@@ -39,6 +39,23 @@ fn app() Id {
     return send(Id, objc_getClass("NSApplication"), "sharedApplication", .{});
 }
 
+/// Sets the app's Dock icon (`NSApplication.applicationIconImage`) from encoded image
+/// bytes (PNG, ...). For apps run unbundled, e.g. `zig build run`, which have no
+/// Info.plist icon. The system draws the image as is: give it the rounded-square
+/// artwork with its padding. Call after the window exists, from the main thread.
+/// Returns false if macOS could not decode the data.
+pub fn setDockIcon(png_bytes: []const u8) bool {
+    const NSData = objc_getClass("NSData");
+    const data = send(Id, NSData, "dataWithBytes:length:", .{ @as(*const anyopaque, png_bytes.ptr), png_bytes.len });
+    if (data == null) return false;
+    const alloc = send(Id, objc_getClass("NSImage"), "alloc", .{});
+    const image = send(Id, alloc, "initWithData:", .{data});
+    if (image == null) return false;
+    send(void, app(), "setApplicationIconImage:", .{image});
+    send(void, image, "release", .{}); // the application retains it
+    return true;
+}
+
 /// Run as a menu-bar style app: no Dock icon, no app menu.
 pub fn setAccessory() void {
     _ = send(bool, app(), "setActivationPolicy:", .{@as(c_long, 1)});
