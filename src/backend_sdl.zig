@@ -22,6 +22,8 @@ const c = struct {
     const INIT_VIDEO: u32 = 0x20;
     const SdlRect = extern struct { x: c_int, y: c_int, w: c_int, h: c_int };
     const WINDOW_HIDDEN: u64 = 0x8;
+    const WINDOW_RESIZABLE: u64 = 0x20;
+    const IOStream = opaque {};
     const WINDOW_BORDERLESS: u64 = 0x10;
     const WINDOW_HIGH_PIXEL_DENSITY: u64 = 0x2000;
     const WINDOW_ALWAYS_ON_TOP: u64 = 0x10000;
@@ -76,6 +78,10 @@ const c = struct {
     extern fn SDL_GetWindowID(w: *SdlWindow) u32;
     extern fn SDL_GetWindowProperties(w: *SdlWindow) u32;
     extern fn SDL_GetPointerProperty(props: u32, name: [*:0]const u8, default: ?*anyopaque) ?*anyopaque;
+    extern fn SDL_GetWindowSize(w: *SdlWindow, width: *c_int, height: *c_int) bool;
+    extern fn SDL_SetWindowMinimumSize(w: *SdlWindow, min_w: c_int, min_h: c_int) bool;
+    extern fn SDL_IOFromConstMem(mem: *const anyopaque, size: usize) ?*IOStream;
+    extern fn TTF_OpenFontIO(src: *IOStream, closeio: bool, ptsize: f32) ?*Font;
     extern fn SDL_SetWindowPosition(w: *SdlWindow, x: c_int, y: c_int) bool;
     extern fn SDL_ShowWindow(w: *SdlWindow) bool;
     extern fn SDL_HideWindow(w: *SdlWindow) bool;
@@ -164,6 +170,23 @@ pub const Event = union(enum) {
     text_editing: struct { window: u32, comp: Composition },
 };
 
+/// TrueType font data to draw text with instead of the system fonts. The
+/// bytes must stay valid for the life of the window (embed them with
+/// `@embedFile`). A weight left null is drawn with `regular`.
+pub const FontSet = struct {
+    regular: []const u8,
+    medium: ?[]const u8 = null,
+    semibold: ?[]const u8 = null,
+
+    pub fn forWeight(f: FontSet, weight: gfx.Weight) []const u8 {
+        return switch (weight) {
+            .regular => f.regular,
+            .medium => f.medium orelse f.regular,
+            .semibold => f.semibold orelse f.medium orelse f.regular,
+        };
+    }
+};
+
 pub const WindowOptions = struct {
     title: [*:0]const u8,
     width: u32,
@@ -177,6 +200,13 @@ pub const WindowOptions = struct {
     hidden: bool = false,
     /// If false the window never takes keyboard focus (for overlays).
     focusable: bool = true,
+    /// Custom fonts; null uses the system font.
+    fonts: ?FontSet = null,
+    /// The user can resize the window. Read the size each frame with `Window.logicalSize`.
+    resizable: bool = false,
+    /// Smallest size a resizable window can be dragged to (points; 0 = none).
+    min_width: u32 = 0,
+    min_height: u32 = 0,
 };
 
 var live_windows: usize = 0;
@@ -324,7 +354,7 @@ const font_paths = [_][*:0]const u8{
     "/System/Library/Fonts/Helvetica.ttc",
 };
 
-const CachedFont = struct { px: u32, font: *c.Font };
+const CachedFont = struct { px: u32, weight: gfx.Weight, font: *c.Font };
 const CachedText = struct { tex: *c.Texture, w: f32, h: f32, last_frame: u64 };
 
 pub fn sleepMs(ms: u32) void {
@@ -352,6 +382,7 @@ pub const Window = struct {
     /// Active clip rectangles (window points), innermost last.
     clips: [16]geom.Rect = undefined,
     clip_n: usize = 0,
+    font_set: ?FontSet = null,
 
     pub fn init(gpa: std.mem.Allocator, opts: WindowOptions) !Window {
         if (live_windows == 0) {
@@ -365,6 +396,7 @@ pub const Window = struct {
         if (opts.borderless) flags |= c.WINDOW_BORDERLESS;
         if (opts.transparent) flags |= c.WINDOW_TRANSPARENT;
         if (opts.hidden) flags |= c.WINDOW_HIDDEN;
+        if (opts.resizable) flags |= c.WINDOW_RESIZABLE;
         if (!opts.focusable) flags |= c.WINDOW_NOT_FOCUSABLE;
         const win = c.SDL_CreateWindow(opts.title, @intCast(opts.width), @intCast(opts.height), flags) orelse
             return fail("SDL_CreateWindow");
@@ -373,10 +405,11 @@ pub const Window = struct {
         // The app paces its own frames.
         _ = c.SDL_SetRenderVSync(ren, 0);
         live_windows += 1;
+        if (opts.min_width > 0 and opts.min_height > 0) _ = c.SDL_SetWindowMinimumSize(win, @intCast(opts.min_width), @intCast(opts.min_height));
         _ = c.SDL_SetRenderDrawBlendMode(ren, c.BLENDMODE_BLEND);
         const density = @max(1.0, c.SDL_GetWindowPixelDensity(win));
         _ = c.SDL_SetRenderScale(ren, density, density);
-        return .{ .gpa = gpa, .win = win, .ren = ren, .density = density };
+        return .{ .gpa = gpa, .win = win, .ren = ren, .density = density, .font_set = opts.fonts };
     }
 
     pub fn deinit(w: *Window) void {
@@ -398,6 +431,15 @@ pub const Window = struct {
 
     pub fn id(w: *const Window) u32 {
         return c.SDL_GetWindowID(w.win);
+    }
+
+    /// Current size of the window's drawable area in points. Call it every
+    /// frame to lay out a resizable window.
+    pub fn logicalSize(w: *const Window) struct { w: f32, h: f32 } {
+        var iw: c_int = 0;
+        var ih: c_int = 0;
+        _ = c.SDL_GetWindowSize(w.win, &iw, &ih);
+        return .{ .w = @floatFromInt(iw), .h = @floatFromInt(ih) };
     }
 
     pub fn show(w: *Window) void {
@@ -457,7 +499,7 @@ pub const Window = struct {
             .arc => |a| w.addArc(a.cx, a.cy, a.r, a.a0, a.a1, a.width, a.color),
             .text => |t| {
                 w.flush();
-                w.drawText(t.x, t.y, t.str, t.size, t.color, t.alignment);
+                w.drawText(t.x, t.y, t.str, t.size, t.color, t.alignment, t.weight);
             },
             .push_clip => |r| w.pushClip(r),
             .pop_clip => w.popClip(),
@@ -646,37 +688,50 @@ pub const Window = struct {
 
     // ---- text ---------------------------------------------------------
 
-    fn fontFor(w: *Window, px: u32) ?*c.Font {
-        for (w.fonts.items) |f| if (f.px == px) return f.font;
+    fn fontFor(w: *Window, px: u32, weight: gfx.Weight) ?*c.Font {
+        for (w.fonts.items) |f| if (f.px == px and f.weight == weight) return f.font;
+        if (w.font_set) |set| {
+            const bytes = set.forWeight(weight);
+            const io = c.SDL_IOFromConstMem(bytes.ptr, bytes.len) orelse return null;
+            // closeio = true: the font owns the stream (the bytes stay with the caller).
+            const font = c.TTF_OpenFontIO(io, true, @floatFromInt(px)) orelse return null;
+            w.fonts.append(w.gpa, .{ .px = px, .weight = weight, .font = font }) catch @panic("out of memory");
+            return font;
+        }
         for (font_paths) |path| {
             if (c.TTF_OpenFont(path, @floatFromInt(px))) |font| {
-                w.fonts.append(w.gpa, .{ .px = px, .font = font }) catch @panic("out of memory");
+                w.fonts.append(w.gpa, .{ .px = px, .weight = weight, .font = font }) catch @panic("out of memory");
                 return font;
             }
         }
         return null;
     }
 
-    /// Width in points that `str` takes when drawn at `size`.
+    /// Width in points that `str` takes when drawn at `size` (regular weight).
     pub fn measureText(w: *Window, str: []const u8, size: f32) f32 {
+        return w.measureTextWeighted(str, size, .regular);
+    }
+
+    /// Width in points that `str` takes when drawn at `size` in `weight`.
+    pub fn measureTextWeighted(w: *Window, str: []const u8, size: f32, weight: gfx.Weight) f32 {
         if (str.len == 0) return 0;
-        const font = w.fontFor(@intFromFloat(@round(size * w.density))) orelse return 0;
+        const font = w.fontFor(@intFromFloat(@round(size * w.density)), weight) orelse return 0;
         var tw: c_int = 0;
         var th: c_int = 0;
         if (!c.TTF_GetStringSize(font, str.ptr, str.len, &tw, &th)) return 0;
         return @as(f32, @floatFromInt(tw)) / w.density;
     }
 
-    fn drawText(w: *Window, x: f32, y: f32, str: []const u8, size: f32, col: Color, alignment: gfx.Align) void {
+    fn drawText(w: *Window, x: f32, y: f32, str: []const u8, size: f32, col: Color, alignment: gfx.Align, weight: gfx.Weight) void {
         if (str.len == 0) return;
         const px: u32 = @intFromFloat(@round(size * w.density));
-        var h = std.hash.Wyhash.init(px);
+        var h = std.hash.Wyhash.init(@as(u64, px) << 8 | @intFromEnum(weight));
         h.update(str);
         h.update(std.mem.asBytes(&col));
         const key = h.final();
 
         const entry = w.texts.getPtr(key) orelse blk: {
-            const font = w.fontFor(px) orelse return;
+            const font = w.fontFor(px, weight) orelse return;
             const surf = c.TTF_RenderText_Blended(font, str.ptr, str.len, .{ .r = col.r, .g = col.g, .b = col.b, .a = col.a }) orelse return;
             defer c.SDL_DestroySurface(surf);
             const tex = c.SDL_CreateTextureFromSurface(w.ren, surf) orelse return;

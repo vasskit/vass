@@ -216,6 +216,8 @@ pub const LabelOpts = struct {
     color: ?Color = null,
     /// Which edge of the rectangle the text is anchored to.
     @"align": gfx.Align = .left,
+    /// Font weight (needs a window with fonts for it; see `backend.FontSet`).
+    weight: gfx.Weight = .regular,
 };
 
 pub const ButtonOpts = struct { on: bool = false };
@@ -235,6 +237,32 @@ pub const MeterOpts = struct {
 
 /// Text-width function, so the Ui can be used (and tested) without a window.
 pub const MeasureFn = *const fn (ctx: ?*anyopaque, str: []const u8, size: f32) f32;
+/// Like `MeasureFn`, for a given font weight.
+pub const MeasureWeightFn = *const fn (ctx: ?*anyopaque, str: []const u8, size: f32, weight: gfx.Weight) f32;
+
+pub const ChipOpts = struct {
+    /// Fill; defaults to the theme's card colour.
+    fill: ?Color = null,
+    /// Text colour; defaults to the theme's text colour.
+    color: ?Color = null,
+    /// Outline drawn inside the fill, if any.
+    border: ?Color = null,
+    /// Fill used while the pointer is over the chip (only if `clickable`).
+    hover_fill: ?Color = null,
+    size: f32 = 11,
+    weight: gfx.Weight = .medium,
+    /// Corner radius; null is fully rounded.
+    radius: ?f32 = null,
+};
+
+pub const RowOpts = struct {
+    selected: bool = false,
+    /// Defaults to a faint tint of the theme text colour.
+    hover: ?Color = null,
+    /// Defaults to the theme's `button_on`.
+    selected_fill: ?Color = null,
+    radius: f32 = 8,
+};
 
 pub const Ui = struct {
     list: *DisplayList,
@@ -242,6 +270,7 @@ pub const Ui = struct {
     theme: Theme,
     measure_ctx: ?*anyopaque = null,
     measure_fn: ?MeasureFn = null,
+    measure_w_fn: ?MeasureWeightFn = null,
     /// Focus and drag state that persists between frames; see `State`.
     state: ?*State = null,
     clipboard: Clipboard = .{},
@@ -258,6 +287,7 @@ pub const Ui = struct {
             .theme = theme,
             .measure_ctx = win,
             .measure_fn = measureWindow,
+            .measure_w_fn = measureWindowWeighted,
             .clipboard = .{ .get = systemClipGet, .set = systemClipSet },
         };
     }
@@ -272,10 +302,23 @@ pub const Ui = struct {
         return win.measureText(str, size);
     }
 
+    fn measureWindowWeighted(ctx: ?*anyopaque, str: []const u8, size: f32, weight: gfx.Weight) f32 {
+        const win: *backend.Window = @ptrCast(@alignCast(ctx.?));
+        return win.measureTextWeighted(str, size, weight);
+    }
+
     /// Width in points of `str` at `size`.
     pub fn measure(ui: *const Ui, str: []const u8, size: f32) f32 {
         const f = ui.measure_fn orelse return 0;
         return f(ui.measure_ctx, str, size);
+    }
+
+    /// Width in points of `str` at `size` in `weight`. Without a weight-aware
+    /// measurer (headless Uis) this is `measure`.
+    pub fn measureWeighted(ui: *const Ui, str: []const u8, size: f32, weight: gfx.Weight) f32 {
+        if (weight == .regular) return ui.measure(str, size);
+        const f = ui.measure_w_fn orelse return ui.measure(str, size);
+        return f(ui.measure_ctx, str, size, weight);
     }
 
     /// Hover and click state of `r` for this frame. Draws nothing. A pointer
@@ -320,7 +363,7 @@ pub const Ui = struct {
 
     /// Text anchored at `x`,`y` (top of the line); `opts.align` picks which side `x` is.
     pub fn labelAt(ui: *Ui, x: f32, y: f32, str: []const u8, opts: LabelOpts) void {
-        ui.list.text(x, y, opts.size orelse ui.theme.font_body, opts.color orelse ui.theme.text, opts.@"align", str);
+        ui.list.textWeighted(x, y, opts.size orelse ui.theme.font_body, opts.color orelse ui.theme.text, opts.@"align", opts.weight, str);
     }
 
     /// Text placed against the left, middle or right edge of `r`, at its top.
@@ -404,15 +447,123 @@ pub const Ui = struct {
     /// Shortens `str` with "..." until it fits `max_w` points at `size`. The
     /// result is `str` itself or a slice of `buf`.
     pub fn fitText(ui: *const Ui, buf: []u8, str: []const u8, size: f32, max_w: f32) []const u8 {
-        if (str.len == 0 or ui.measure(str, size) <= max_w) return str;
+        return ui.fitTextWeighted(buf, str, size, .regular, max_w);
+    }
+
+    /// `fitText` measuring in `weight`.
+    pub fn fitTextWeighted(ui: *const Ui, buf: []u8, str: []const u8, size: f32, weight: gfx.Weight, max_w: f32) []const u8 {
+        if (str.len == 0 or ui.measureWeighted(str, size, weight) <= max_w) return str;
         var n = @min(str.len - 1, buf.len -| 3);
         while (n > 0) : (n -= 1) {
             if (str[n] & 0xC0 == 0x80) continue; // not in the middle of a character
             @memcpy(buf[0..n], str[0..n]);
             @memcpy(buf[n..][0..3], "...");
-            if (ui.measure(buf[0 .. n + 3], size) <= max_w) return buf[0 .. n + 3];
+            if (ui.measureWeighted(buf[0 .. n + 3], size, weight) <= max_w) return buf[0 .. n + 3];
         }
         return "";
+    }
+
+    /// A small label pill: a rounded rectangle with centred text. Chips are
+    /// laid out by the caller (see `chipWidth`). Returns the interaction of
+    /// its rectangle, so a chip that should be clickable just checks `.clicked`.
+    pub fn chip(ui: *Ui, r: Rect, str: []const u8, opts: ChipOpts) Interaction {
+        const t = ui.theme;
+        const hv = ui.hit(r);
+        var fill = opts.fill orelse t.card;
+        if (hv.hovered) if (opts.hover_fill) |h| {
+            fill = h;
+        };
+        const rad = opts.radius orelse r.h / 2;
+        if (opts.border) |b| {
+            ui.list.rrect(r, rad, b);
+            ui.list.rrect(r.inset(1), @max(0, rad - 1), fill);
+        } else ui.list.rrect(r, rad, fill);
+        // A font's line box is about 1.2 times its size; centre that in the chip.
+        ui.list.textWeighted(r.x + r.w / 2, r.y + (r.h - opts.size * 1.22) / 2, opts.size, opts.color orelse t.text, .center, opts.weight, str);
+        return hv;
+    }
+
+    /// Width of a chip showing `str`: the text plus `pad` on both sides.
+    pub fn chipWidth(ui: *const Ui, str: []const u8, opts: ChipOpts, pad: f32) f32 {
+        return ui.measureWeighted(str, opts.size, opts.weight) + 2 * pad;
+    }
+
+    /// A selectable list row: draws a highlight when `opts.selected` or hovered
+    /// and returns the interaction of `r`. Draw the row's content on top.
+    pub fn listRow(ui: *Ui, r: Rect, opts: RowOpts) Interaction {
+        const t = ui.theme;
+        const hv = ui.hit(r);
+        if (opts.selected) {
+            ui.list.rrect(r, opts.radius, opts.selected_fill orelse t.button_on);
+        } else if (hv.hovered) {
+            ui.list.rrect(r, opts.radius, opts.hover orelse t.text.alpha(14));
+        }
+        return hv;
+    }
+
+    /// `str` with line breaks and runs of blanks collapsed to single spaces,
+    /// copied into `buf` (cut at `buf.len` on a character boundary). For
+    /// one-line and two-line previews of multi-paragraph text.
+    pub fn flattenText(buf: []u8, str: []const u8) []const u8 {
+        var n: usize = 0;
+        var pending_space = false;
+        for (str) |b| {
+            if (b == '\n' or b == '\r' or b == '\t' or b == ' ') {
+                pending_space = n > 0;
+                continue;
+            }
+            const need: usize = if (pending_space) 2 else 1;
+            if (n + need > buf.len) break;
+            if (pending_space) {
+                buf[n] = ' ';
+                n += 1;
+                pending_space = false;
+            }
+            buf[n] = b;
+            n += 1;
+        }
+        // A cut can leave half a character at the end: drop it.
+        var i = n;
+        while (i > 0 and buf[i - 1] & 0xC0 == 0x80) i -= 1;
+        if (i > 0) {
+            const lead = buf[i - 1];
+            const want: usize = if (lead >= 0xF0) 4 else if (lead >= 0xE0) 3 else if (lead >= 0xC0) 2 else 1;
+            if (n - (i - 1) < want) n = i - 1;
+        }
+        return buf[0..n];
+    }
+
+    /// Draws `str` wrapped to `r.w` in at most `max_lines` lines; if the text
+    /// is longer, the last line is shortened and ends in "...". Returns the
+    /// height used (lines drawn times line height). Newlines in `str` break
+    /// lines like `labelWrapped`; use `flattenText` first for a compact preview.
+    pub fn labelLines(ui: *Ui, r: Rect, str: []const u8, max_lines: usize, opts: LabelOpts) f32 {
+        const size = opts.size orelse ui.theme.font_body;
+        const lh = ui.lineHeight(size);
+        const x = switch (opts.@"align") {
+            .left => r.x,
+            .center => r.x + r.w / 2,
+            .right => r.x + r.w,
+        };
+        var it = ui.wrapText(str, size, r.w);
+        var y = r.y;
+        var n: usize = 0;
+        var cur = it.next();
+        while (cur) |line| : (cur = it.next()) {
+            if (n >= max_lines) break;
+            n += 1;
+            const more = n == max_lines and it.next() != null;
+            if (more) {
+                var tmp: [384]u8 = undefined;
+                var out: [384]u8 = undefined;
+                const keep = @min(line.len, tmp.len - 3);
+                @memcpy(tmp[0..keep], line[0..keep]);
+                @memcpy(tmp[keep..][0..3], "...");
+                ui.labelAt(x, y, ui.fitTextWeighted(&out, tmp[0 .. keep + 3], size, opts.weight, r.w), opts);
+            } else if (line.len > 0) ui.labelAt(x, y, line, opts);
+            y += lh;
+        }
+        return y - r.y;
     }
 
     // ---- wrapped text -------------------------------------------------
@@ -762,7 +913,7 @@ pub const Ui = struct {
         // Keys: Page Up/Down always; arrows and Home/End only while no text
         // field has focus, since a field uses those itself.
         if (st.key_scroll or ui.hit(r).hovered) {
-            const free = if (ui.state) |s| s.focus == null else true;
+            const free = st.arrow_keys and (if (ui.state) |s| s.focus == null else true);
             for (ui.input.events()) |ev| switch (ev) {
                 .key => |k| switch (k.code) {
                     keys.page_up => st.offset -= r.h * 0.9,
@@ -821,6 +972,21 @@ pub const ScrollState = struct {
     /// false when a window has several scroll areas: keys then go to the
     /// one under the pointer.
     key_scroll: bool = false,
+    /// Whether the arrow keys, Home and End scroll (Page Up/Down always do).
+    /// Turn off when the app uses the arrows itself, e.g. to move a selection.
+    arrow_keys: bool = true,
+
+    /// Scrolls the least amount that brings the content span `top`..`bottom`
+    /// (content coordinates, from the top of the content) fully into a
+    /// viewport `view_h` tall. A span taller than the viewport shows its top.
+    /// The offset is clamped to the content on the next `beginScroll`.
+    pub fn reveal(st: *ScrollState, view_h: f32, top: f32, bottom: f32) void {
+        if (top < st.offset) {
+            st.offset = top;
+        } else if (bottom > st.offset + view_h) {
+            st.offset = @min(top, bottom - view_h);
+        }
+    }
 };
 
 /// Selection inside one `textSelectable` text: a byte range of the string it
@@ -1898,4 +2064,90 @@ test "input: click count is plumbed from mouse_down" {
     try std.testing.expectEqual(@as(u8, 2), in.mouse_clicks);
     in.feed(.{ .mouse_down = .{ .window = 1, .x = 1, .y = 1, .button = 1 } }, 1);
     try std.testing.expectEqual(@as(u8, 1), in.mouse_clicks);
+}
+
+// ---- tests: list helpers --------------------------------------------------
+
+test "ScrollState.reveal scrolls the least amount" {
+    var st: ScrollState = .{ .offset = 100 };
+    st.reveal(200, 150, 190); // already visible
+    try std.testing.expectEqual(@as(f32, 100), st.offset);
+    st.reveal(200, 40, 80); // above: align its top
+    try std.testing.expectEqual(@as(f32, 40), st.offset);
+    st.reveal(200, 300, 360); // below: align its bottom
+    try std.testing.expectEqual(@as(f32, 160), st.offset);
+    st.reveal(50, 400, 500); // taller than the view: top wins
+    try std.testing.expectEqual(@as(f32, 400), st.offset);
+}
+
+test "arrow_keys = false leaves the arrows to the app but Page Down still scrolls" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var in: Input = .{ .mouse_x = 5, .mouse_y = 5 };
+    in.pushKey(keys.down, .{});
+    var ui = Ui.initHeadless(&list, in, .{}, cpMeasure);
+    var st: ScrollState = .{ .arrow_keys = false };
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 50, .h = 50 }, &st, 500);
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 0), st.offset);
+    var in2: Input = .{ .mouse_x = 5, .mouse_y = 5 };
+    in2.pushKey(keys.page_down, .{});
+    var ui2 = Ui.initHeadless(&list, in2, .{}, cpMeasure);
+    _ = ui2.beginScroll(.{ .x = 0, .y = 0, .w = 50, .h = 50 }, &st, 500);
+    ui2.endScroll();
+    try std.testing.expectEqual(@as(f32, 45), st.offset);
+}
+
+test "flattenText collapses whitespace and keeps utf8 whole" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("a b c d", Ui.flattenText(&buf, "  a\n\nb \t c\r\nd  "));
+    try std.testing.expectEqualStrings("", Ui.flattenText(&buf, " \n "));
+    var small: [4]u8 = undefined;
+    // "aéé": 'a' (1) + 'é' (2) fit in 4 bytes; the second 'é' would be cut in half.
+    try std.testing.expectEqualStrings("aé", Ui.flattenText(&small, "aééé"));
+}
+
+test "labelLines wraps to a line limit and ends the last line with an ellipsis" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    ui.theme.line_spacing = 1;
+    // One unit per character at size 1; width 10.
+    const h = ui.labelLines(.{ .x = 0, .y = 0, .w = 10, .h = 0 }, "aaaa bbbb cccc dddd eeee", 2, .{ .size = 1 });
+    try std.testing.expectEqual(@as(f32, 2), h);
+    var lines: [4][]const u8 = undefined;
+    var n: usize = 0;
+    for (list.cmds.items) |cmd| switch (cmd) {
+        .text => |tx| {
+            lines[n] = tx.str;
+            n += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("aaaa bbbb", lines[0]);
+    try std.testing.expectEqualStrings("cccc dd...", lines[1]);
+
+    // Fits entirely: no ellipsis.
+    list.reset();
+    _ = ui.labelLines(.{ .x = 0, .y = 0, .w = 10, .h = 0 }, "aaaa bbbb cccc", 2, .{ .size = 1 });
+    try std.testing.expectEqualStrings("cccc", list.cmds.items[1].text.str);
+}
+
+test "chip and listRow report the pointer; weight reaches the display list" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    const r: Rect = .{ .x = 0, .y = 0, .w = 60, .h = 20 };
+    var ui = testUi(&list, 10, 10, true);
+    const hit = ui.chip(r, "tag", .{ .weight = .semibold });
+    try std.testing.expect(hit.clicked);
+    try std.testing.expectEqual(gfx.Weight.semibold, list.cmds.items[list.cmds.items.len - 1].text.weight);
+    try std.testing.expectEqual(@as(f32, 17), ui.chipWidth("tag", .{ .size = 2 }, 7));
+
+    list.reset();
+    var miss = testUi(&list, 100, 10, true);
+    try std.testing.expect(!miss.listRow(r, .{}).clicked);
+    try std.testing.expectEqual(@as(usize, 0), list.cmds.items.len); // no highlight
+    _ = miss.listRow(r, .{ .selected = true });
+    try std.testing.expectEqual(@as(usize, 1), list.cmds.items.len);
 }

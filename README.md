@@ -175,3 +175,16 @@ adds a note; in memory only).
 - Scrollbar dragging and keyboard scrolling; horizontal scrolling.
 - Accessibility (no screen-reader tree), hover styling, Tab focus traversal, retained
   widgets, and any platform other than macOS.
+
+## Custom fonts, weights, resizing, list helpers
+
+- `WindowOptions.fonts = .{ .regular = @embedFile(...), .medium = ..., .semibold = ... }` draws
+  text with your own TTFs (opened from memory) instead of the system font. A missing weight
+  falls back to the next lighter one. Text commands carry a `gfx.Weight`; `LabelOpts.weight`
+  and `Ui.measureWeighted` / `Window.measureTextWeighted` honour it.
+- `WindowOptions.resizable` / `min_width` / `min_height`, and `Window.logicalSize()` to lay out
+  each frame (no resize event is needed).
+- `Ui.chip` / `chipWidth` (small label pills, clickable via the returned `Interaction`),
+  `Ui.listRow` (selected/hover highlight for a row), `Ui.labelLines` (wrap to N lines, ending
+  in "..."), `Ui.flattenText` (collapse whitespace for previews), `ScrollState.reveal`
+  (scroll a span into view) and `ScrollState.arrow_keys` (leave arrows to the app).
