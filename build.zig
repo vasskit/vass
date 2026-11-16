@@ -108,6 +108,10 @@ fn addExamples(
         else => std.debug.panic("cannot open the examples directory: {t}", .{err}),
     };
     defer dir.close(io);
+    // The configure result is cached; without this a file added to or removed from `examples/`
+    // is not seen until the cache is cleared. Only declared once the directory exists, since
+    // tracking a missing one fails the configure phase.
+    b.dependOnDirectoryContents(b.path("examples"));
 
     var names: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
