@@ -159,6 +159,21 @@ pub fn build(b: *std.Build) void {
     run_audio.addPassthruArgs();
     b.step("audio", "Run the audio showcase").dependOn(&run_audio.step);
     test_step.dependOn(&audio_ex.step);
+
+    // Example: popups, menus, dropdowns, tooltips. `zig build popups -- --snapshot DIR`.
+    const popups_ex = b.addExecutable(.{
+        .name = "popups",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/popups.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_popups = b.addRunArtifact(popups_ex);
+    run_popups.addPassthruArgs();
+    b.step("popups", "Run the popups showcase").dependOn(&run_popups.step);
+    test_step.dependOn(&popups_ex.step);
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

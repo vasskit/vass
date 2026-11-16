@@ -26,7 +26,9 @@ const icons = @import("icons.zig");
 const text_edit = @import("text_edit.zig");
 const controls = @import("controls.zig");
 const text_area = @import("text_area.zig");
+const popup = @import("popup.zig");
 pub const TextEdit = text_edit.TextEdit;
+pub const mixColor = controls.mix;
 const Rect = geom.Rect;
 const Color = geom.Color;
 const DisplayList = gfx.DisplayList;
@@ -48,6 +50,8 @@ pub const Input = struct {
     mouse_y: f32 = -1e9,
     /// True only for the frame in which a left click arrived.
     pressed: bool = false,
+    /// True only for the frame in which the right button went down.
+    right_pressed: bool = false,
     /// True only for the frame in which the left button was released.
     released: bool = false,
     /// True while the left button is held.
@@ -102,6 +106,13 @@ pub const Input = struct {
         }
     }
 
+    /// Drops event `i` of this frame's queue (a widget that consumed a key).
+    pub fn removeEvent(in: *Input, i: usize) void {
+        if (i >= in.queue_len) return;
+        std.mem.copyForwards(InEvent, in.queue[i .. in.queue_len - 1], in.queue[i + 1 .. in.queue_len]);
+        in.queue_len -= 1;
+    }
+
     fn push(in: *Input, ev: InEvent) void {
         if (in.queue_len < in.queue.len) {
             in.queue[in.queue_len] = ev;
@@ -119,6 +130,7 @@ pub const Input = struct {
             .mouse_down => |m| if (m.window == window_id) {
                 in.mouse_x = m.x;
                 in.mouse_y = m.y;
+                if (m.button == 3) in.right_pressed = true;
                 if (m.button == 1) {
                     in.pressed = true;
                     in.down = true;
@@ -174,6 +186,7 @@ pub const Input = struct {
     /// Call once per frame after drawing, so a click, a key or a scroll is seen exactly once.
     pub fn endFrame(in: *Input) void {
         in.pressed = false;
+        in.right_pressed = false;
         in.released = false;
         in.wheel_x = 0;
         in.wheel_y = 0;
@@ -193,6 +206,16 @@ pub const State = struct {
     /// Separate from `focus`: a selection is not a text field, so it does not
     /// stop arrow-key scrolling or an app's own shortcuts.
     select: ?*const anyopaque = null,
+    /// Where last frame's popups were (for input routing); see `popup.zig`.
+    popups: popup.Tracker = .{},
+    /// Tooltip timer; see `Ui.tooltip`.
+    tip: popup.TipState = .{},
+
+    /// True while something animates on its own and the app should keep drawing frames even
+    /// without input: a tooltip waiting for its delay.
+    pub fn needsRedraw(s: *const State) bool {
+        return s.tip.waiting;
+    }
 
     pub fn blur(s: *State) void {
         s.focus = null;
@@ -322,6 +345,15 @@ pub const SegmentedOpts = controls.SegmentedOpts;
 pub const TextAreaState = text_area.TextAreaState;
 pub const TextAreaOpts = text_area.TextAreaOpts;
 pub const TextAreaResult = text_area.TextAreaResult;
+pub const PopupState = popup.PopupState;
+pub const PopupOpts = popup.PopupOpts;
+pub const Placement = popup.Placement;
+pub const Alignment = popup.Alignment;
+pub const MenuItem = popup.MenuItem;
+pub const MenuOpts = popup.MenuOpts;
+pub const DropdownState = popup.DropdownState;
+pub const DropdownOpts = popup.DropdownOpts;
+pub const TooltipOpts = popup.TooltipOpts;
 
 pub const RowOpts = struct {
     selected: bool = false,
@@ -346,13 +378,24 @@ pub const Ui = struct {
     clip_n: usize = 0,
     scrolls: [4]ScrollFrame = undefined,
     scroll_n: usize = 0,
+    /// The window's area in points, for placing popups. `init` reads it from the window;
+    /// headless Uis set it (the default is huge, so nothing ever flips or shifts).
+    bounds: Rect = .{ .x = 0, .y = 0, .w = 10000, .h = 10000 },
+    /// Layer being drawn: 0 for the main stream, n inside the n-th nested popup.
+    layer: u8 = 0,
+    /// Clips below this index belong to the layer below (popups are not clipped by it).
+    clip_base: usize = 0,
+    popup_stack: [popup.max_depth]popup.Frame = undefined,
+    popup_n: usize = 0,
 
     /// A Ui that draws into `list` and measures text with `win`.
     pub fn init(list: *DisplayList, win: *backend.Window, input: Input, theme: Theme) Ui {
+        const sz = win.logicalSize();
         return .{
             .list = list,
             .input = input,
             .theme = theme,
+            .bounds = .{ .x = 0, .y = 0, .w = sz.w, .h = sz.h },
             .measure_ctx = win,
             .measure_fn = measureWindow,
             .measure_w_fn = measureWindowWeighted,
@@ -392,18 +435,32 @@ pub const Ui = struct {
     /// Hover and click state of `r` for this frame. Draws nothing. A pointer
     /// outside the current clip (`pushClip`, `beginScroll`) hits nothing.
     pub fn hit(ui: *const Ui, r: Rect) Interaction {
-        const over = r.contains(ui.input.mouse_x, ui.input.mouse_y) and ui.clipContains(ui.input.mouse_x, ui.input.mouse_y);
-        return .{ .hovered = over, .clicked = over and ui.input.pressed };
+        const over = r.contains(ui.input.mouse_x, ui.input.mouse_y) and ui.clipContains(ui.input.mouse_x, ui.input.mouse_y) and
+            !popup.pointerBlocked(ui);
+        return .{ .hovered = over, .clicked = over and ui.pressedNow() };
+    }
+
+    /// True on the frame a left click arrived, unless a popup that was open last frame above
+    /// the layer being drawn takes it (an outside click that closes it, or a click inside it).
+    /// Widgets use this instead of `input.pressed`.
+    pub fn pressedNow(ui: *const Ui) bool {
+        return ui.input.pressed and !popup.pressSwallowed(ui);
+    }
+
+    /// This frame's key presses and typed text for the layer being drawn: empty while a popup
+    /// above it was open last frame. Widgets use this instead of `input.events()`.
+    pub fn events(ui: *const Ui) []const InEvent {
+        return popup.eventsFor(ui, ui.layer);
     }
 
     // ---- clipping ------------------------------------------------------
 
     /// The visible area widgets are currently confined to, or null if unclipped.
     pub fn clip(ui: *const Ui) ?Rect {
-        return if (ui.clip_n > 0) ui.clips[ui.clip_n - 1] else null;
+        return if (ui.clip_n > ui.clip_base) ui.clips[ui.clip_n - 1] else null;
     }
 
-    fn clipContains(ui: *const Ui, x: f32, y: f32) bool {
+    pub fn clipContains(ui: *const Ui, x: f32, y: f32) bool {
         return if (ui.clip()) |r| r.contains(x, y) else true;
     }
 
@@ -425,7 +482,7 @@ pub const Ui = struct {
     }
 
     pub fn popClip(ui: *Ui) void {
-        if (ui.clip_n > 0) ui.clip_n -= 1;
+        if (ui.clip_n > ui.clip_base) ui.clip_n -= 1;
         ui.list.popClip();
     }
 
@@ -804,7 +861,7 @@ pub const Ui = struct {
                         st.cursor = text_edit.lineEnd(str, off);
                     },
                 }
-            } else if (in.pressed and selected) {
+            } else if (ui.pressedNow() and selected) {
                 s.select = null;
                 selected = false;
                 st.clear();
@@ -817,7 +874,7 @@ pub const Ui = struct {
                 }
             }
 
-            if (selected) for (in.events()) |ev| switch (ev) {
+            if (selected) for (ui.events()) |ev| switch (ev) {
                 .key => |k| {
                     if (k.code == keys.escape) {
                         s.select = null;
@@ -914,7 +971,7 @@ pub const Ui = struct {
                 focused = true;
                 st.blink_origin = in.time;
                 st.edit.moveTo(ui.offsetAtX(st.edit.text(), size, in.mouse_x - box.x + st.scroll_x), in.mouse_mods.shift);
-            } else if (in.pressed and focused) {
+            } else if (ui.pressedNow() and focused) {
                 s.focus = null;
                 focused = false;
             } else if (s.drag == id) {
@@ -926,7 +983,7 @@ pub const Ui = struct {
 
         if (focused) {
             const s = ui.state.?;
-            for (in.events()) |ev| {
+            for (ui.events()) |ev| {
                 st.blink_origin = in.time;
                 switch (ev) {
                     .text => |chunk| {
@@ -1051,6 +1108,69 @@ pub const Ui = struct {
         return text_area.measureTextArea(ui, st, width, opts);
     }
 
+    // ---- popups, menus, tooltips (see popup.zig) -----------------------
+
+    /// True while any popup is open (was open last frame, or is being drawn). An app's own
+    /// shortcuts should ignore keys then, since Escape and the arrows belong to the popup.
+    pub fn popupOpen(ui: *const Ui) bool {
+        return popup.anyOpen(ui);
+    }
+
+    /// Ends the frame: appends the overlay layers (popups, tooltips) to the main display list and
+    /// remembers this frame's popup rectangles for next frame's input routing. Call after the
+    /// last widget, before `Window.render`. Without it popups are not drawn.
+    pub fn finish(ui: *Ui) void {
+        popup.finish(ui);
+    }
+
+    /// Opens `st` (no-op if open). Opening from the click of a button is safe: the click that
+    /// opens a popup never closes it.
+    pub fn openPopup(ui: *Ui, st: *PopupState) void {
+        popup.openPopup(ui, st);
+    }
+
+    pub fn closePopup(ui: *Ui, st: *PopupState) void {
+        popup.closePopup(ui, st);
+    }
+
+    /// A floating panel next to `anchor`, of outer size `size`, drawn above everything. Returns
+    /// the content rectangle (the panel inset by `opts.padding`) while open, else null; call
+    /// `endPopup` only when it returned a rectangle. See `popup.zig`.
+    pub fn beginPopup(ui: *Ui, st: *PopupState, anchor: Rect, size: [2]f32, opts: PopupOpts) ?Rect {
+        return popup.beginPopup(ui, st, anchor, size, opts);
+    }
+
+    pub fn endPopup(ui: *Ui) void {
+        popup.endPopup(ui);
+    }
+
+    /// A menu of `items` anchored to `anchor`. Returns the index activated this frame.
+    pub fn menu(ui: *Ui, st: *PopupState, anchor: Rect, items: []const MenuItem, opts: MenuOpts) ?usize {
+        return popup.menu(ui, st, anchor, items, opts);
+    }
+
+    /// Opens `st` at the pointer on a right click inside `area`; returns true on that frame.
+    pub fn contextOpen(ui: *Ui, st: *PopupState, area: Rect) bool {
+        return popup.contextOpen(ui, st, area);
+    }
+
+    /// `contextOpen` plus `menu` at the pointer: a context menu for `area`.
+    pub fn contextMenu(ui: *Ui, st: *PopupState, area: Rect, items: []const MenuItem, opts: MenuOpts) ?usize {
+        return popup.contextMenu(ui, st, area, items, opts);
+    }
+
+    /// A select control: shows `items[selected.*]`, opens a menu of all items. True when the
+    /// selection changed.
+    pub fn dropdown(ui: *Ui, r: Rect, st: *DropdownState, items: []const []const u8, selected: *usize, opts: DropdownOpts) bool {
+        return popup.dropdown(ui, r, st, items, selected, opts);
+    }
+
+    /// Call after the widget occupying `r`: after the pointer rests in `r` for `opts.delay` a
+    /// small label appears below (or above) it, on the top layer. Needs `ui.state`.
+    pub fn tooltip(ui: *Ui, r: Rect, text: []const u8, opts: TooltipOpts) void {
+        popup.tooltip(ui, r, text, opts);
+    }
+
     // ---- scrolling ----------------------------------------------------
 
     /// Starts a scrolling viewport at `r` over content `content_h` tall.
@@ -1069,7 +1189,7 @@ pub const Ui = struct {
         // field has focus, since a field uses those itself.
         if (st.key_scroll or ui.hit(r).hovered) {
             const free = st.arrow_keys and (if (ui.state) |s| s.focus == null else true);
-            for (ui.input.events()) |ev| switch (ev) {
+            for (ui.events()) |ev| switch (ev) {
                 .key => |k| switch (k.code) {
                     keys.page_up => st.offset -= r.h * 0.9,
                     keys.page_down => st.offset += r.h * 0.9,

@@ -251,7 +251,7 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
                     st.edit.cursor = text_edit.lineEnd(cur, off);
                 },
             }
-        } else if (in.pressed and focused) {
+        } else if (ui.pressedNow() and focused) {
             s.focus = null;
             focused = false;
         } else if (s.drag == id) {
@@ -264,7 +264,7 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
 
     if (focused) {
         const s = ui.state.?;
-        for (in.events()) |ev| {
+        for (ui.events()) |ev| {
             if (!focused) break;
             st.blink_origin = in.time;
             switch (ev) {

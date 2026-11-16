@@ -36,9 +36,19 @@ pub const Command = union(enum) {
     pop_clip,
 };
 
+/// Number of overlay layers a `DisplayList` keeps besides the main command stream.
+pub const overlay_layers = 5;
+
+/// Commands are recorded into the main stream (`cmds`, layer 0) or, after `setLayer(n)`, into
+/// overlay layer `n` (1...`overlay_layers`). `mergeLayers` appends the overlays, lowest first,
+/// to `cmds`, so they are drawn after (above) everything in the main stream. Strings of all
+/// layers live in the one arena.
 pub const DisplayList = struct {
     arena: std.heap.ArenaAllocator,
     cmds: std.ArrayList(Command) = .empty,
+    overlay: [overlay_layers]std.ArrayList(Command) = @splat(.empty),
+    /// Where new commands go: 0 = `cmds`, n = `overlay[n - 1]`.
+    layer: u8 = 0,
 
     pub fn init(gpa: std.mem.Allocator) DisplayList {
         return .{ .arena = .init(gpa) };
@@ -51,11 +61,42 @@ pub const DisplayList = struct {
     /// Call at the start of every frame.
     pub fn reset(l: *DisplayList) void {
         l.cmds = .empty;
+        l.overlay = @splat(.empty);
+        l.layer = 0;
         _ = l.arena.reset(.retain_capacity);
     }
 
     fn push(l: *DisplayList, cmd: Command) void {
-        l.cmds.append(l.arena.allocator(), cmd) catch @panic("out of memory");
+        const dst = if (l.layer == 0) &l.cmds else &l.overlay[l.layer - 1];
+        dst.append(l.arena.allocator(), cmd) catch @panic("out of memory");
+    }
+
+    /// Directs the commands recorded from now on to layer `n` (0 = the main stream).
+    pub fn setLayer(l: *DisplayList, n: u8) void {
+        l.layer = @min(n, overlay_layers);
+    }
+
+    /// Appends the overlay layers (lowest first) to the main stream and empties them. Call
+    /// before rendering; `Ui.finish` does.
+    pub fn mergeLayers(l: *DisplayList) void {
+        const a = l.arena.allocator();
+        for (&l.overlay) |*o| {
+            l.cmds.appendSlice(a, o.items) catch @panic("out of memory");
+            o.clearRetainingCapacity();
+        }
+    }
+
+    /// A cheap soft shadow under `r`: a few stacked translucent rounded rectangles growing
+    /// from the rectangle outwards by up to `blur`, shifted down by `dy`. `color`'s alpha is the
+    /// darkest value near the edge.
+    pub fn shadow(l: *DisplayList, r: Rect, radius: f32, blur: f32, dy: f32, color: Color) void {
+        const steps = 7;
+        for (0..steps) |i| {
+            const f: f32 = @as(f32, @floatFromInt(steps - i)) / steps; // 1 (widest) .. 1/steps
+            const e = blur * f;
+            const a: f32 = @as(f32, @floatFromInt(color.a)) * 0.5 / @as(f32, steps) * (1.0 + (1.0 - f));
+            l.rrect(.{ .x = r.x - e, .y = r.y - e + dy, .w = r.w + 2 * e, .h = r.h + 2 * e }, radius + e, color.alpha(@intFromFloat(@min(255, @round(a)))));
+        }
     }
 
     /// Clips everything drawn until `popClip` to `r`. Clips nest and intersect.
@@ -157,4 +198,35 @@ test "svgIcon records one command" {
     l.svgIcon(.{ .x = 1, .y = 2, .w = 16, .h = 16 }, .{ .id = 4, .aspect = 1 }, .{ .r = 1, .g = 2, .b = 3 });
     try std.testing.expectEqual(@as(usize, 1), l.cmds.items.len);
     try std.testing.expectEqual(@as(u32, 4), l.cmds.items[0].svg_icon.icon.id);
+}
+
+test "layers: overlay commands are appended after the main ones and the layers empty" {
+    var l = DisplayList.init(std.testing.allocator);
+    defer l.deinit();
+    l.setLayer(2);
+    l.text(0, 0, 10, .{ .r = 1, .g = 1, .b = 1 }, .left, "top");
+    l.setLayer(1);
+    l.rect(.{ .x = 0, .y = 0, .w = 1, .h = 1 }, .{ .r = 2, .g = 2, .b = 2 });
+    l.setLayer(0);
+    l.rect(.{ .x = 0, .y = 0, .w = 5, .h = 5 }, .{ .r = 3, .g = 3, .b = 3 });
+    l.rect(.{ .x = 0, .y = 0, .w = 6, .h = 6 }, .{ .r = 3, .g = 3, .b = 3 });
+    try std.testing.expectEqual(@as(usize, 2), l.cmds.items.len);
+    l.mergeLayers();
+    try std.testing.expectEqual(@as(usize, 4), l.cmds.items.len);
+    try std.testing.expectEqual(@as(f32, 5), l.cmds.items[0].rrect.rect.w);
+    try std.testing.expectEqual(@as(u8, 2), l.cmds.items[2].rrect.color.r); // layer 1 before layer 2
+    try std.testing.expectEqualStrings("top", l.cmds.items[3].text.str);
+    l.mergeLayers(); // nothing left to append
+    try std.testing.expectEqual(@as(usize, 4), l.cmds.items.len);
+}
+
+test "shadow records stacked rounded rects, widest first" {
+    var l = DisplayList.init(std.testing.allocator);
+    defer l.deinit();
+    l.shadow(.{ .x = 10, .y = 10, .w = 20, .h = 20 }, 8, 12, 4, .{ .r = 0, .g = 0, .b = 0, .a = 90 });
+    try std.testing.expect(l.cmds.items.len >= 3);
+    const first = l.cmds.items[0].rrect.rect;
+    const last = l.cmds.items[l.cmds.items.len - 1].rrect.rect;
+    try std.testing.expect(first.w > last.w);
+    try std.testing.expect(l.cmds.items[l.cmds.items.len - 1].rrect.color.a > l.cmds.items[0].rrect.color.a);
 }

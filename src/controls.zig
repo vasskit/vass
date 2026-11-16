@@ -318,7 +318,7 @@ pub fn slider(ui: *Ui, r: Rect, value: *f32, opts: SliderOpts) SliderResult {
                 s.drag = id;
                 s.focus = id;
                 s.select = null;
-            } else if (in.pressed and s.focus == id) {
+            } else if (ui.pressedNow() and s.focus == id) {
                 s.focus = null; // a click elsewhere
             }
             if (s.drag == id) {
@@ -333,7 +333,7 @@ pub fn slider(ui: *Ui, r: Rect, value: *f32, opts: SliderOpts) SliderResult {
             res.focused = s.focus == id;
             if (res.focused) {
                 const inc = if (opts.step > 0) opts.step else (opts.max - opts.min) / 20;
-                for (in.events()) |ev| switch (ev) {
+                for (ui.events()) |ev| switch (ev) {
                     .key => |k| {
                         var v = value.*;
                         switch (k.code) {

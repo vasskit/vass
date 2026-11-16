@@ -12,6 +12,8 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 - `src/keys.zig` — modifier flags and keycode constants. Depends on nothing.
 - `src/text_edit.zig` — `TextEdit`: the pure text editing core (buffer, cursor, selection,
   key handling). No rendering, no SDL.
+- `src/popup.zig` — popups, menus, the dropdown and tooltips (the implementation behind the `Ui`
+  methods), the overlay input routing and the placement maths. Depends on `ui`, like `controls.zig`.
 - `src/png.zig` — minimal PNG writer, for handing generated images to the OS.
 - `src/image.zig` — `Image` handles, `ImageOpts`/`Fit` and the pure fit math. No platform.
 - `src/decode.zig` — PNG/JPEG/BMP/GIF decoding from memory (stb_image) to RGBA8, plus the pure
@@ -113,7 +115,7 @@ Layout is rect cutting: `Rect.cutTop/cutBottom/cutLeft/cutRight` shrink a rectan
 return the strip, and `inset`, `column`, `row`, `center` derive sub-rectangles.
 Widgets: `label`, `card`, `pill`, `tabs`, `button`, `meter`, `bar`, `hit`, `fitText`.
 `Input.pressed` is true only on the frame a left click arrived, and widgets do not
-occlude each other. `Ui.initHeadless` builds a Ui without a window, for tests.
+occlude each other (except under an open popup, see below). `Ui.initHeadless` builds a Ui without a window, for tests.
 
 ## Text input, scrolling, wrapping
 
@@ -191,7 +193,7 @@ adds a note; in memory only).
 - Undo/redo, double/triple-click word and line selection inside `textField` (only
   `textSelectable` has them), word-wise drag extension after a double click,
   grapheme-cluster-aware caret movement (combining marks and ZWJ emoji take several presses),
-  context menus. Selecting across several separate texts is not possible (one text at a time).
+  Selecting across several separate texts is not possible (one text at a time).
 - Scrollbar dragging and keyboard scrolling; horizontal scrolling.
 - Accessibility (no screen-reader tree), hover styling, Tab focus traversal, retained
   widgets, and any platform other than macOS.
@@ -254,6 +256,73 @@ various states) to `DIR/controls.bmp`.
 Rough edges: when a word longer than the line is broken between characters, the caret at the
 break shows on the next line's start (no caret affinity), so End on such a line appears to
 stay put; IME pre-edit text is not drawn; no undo.
+
+## Popups, menus, dropdowns and tooltips
+
+Implemented in `src/popup.zig`, exposed as `Ui` methods. Anything floating is drawn into an overlay
+layer of the display list, above everything else however late it was declared, and the widgets
+under it stop receiving the pointer and keys. It needs a `ui.state` (a caller-owned `State`) and a
+`ui.finish()` call after the last widget of every frame (before `Window.render`):
+
+    var ui = vass.Ui.init(&list, &window, input, .{});
+    ui.state = &ustate;                       // required for popups
+    ...widgets and popups...
+    ui.finish();                              // merges the overlay layers, remembers popup rectangles
+    window.render(&list, bg);
+
+    var menu: vass.PopupState = .{};          // caller-owned, stable address
+    if (ui.button(btn, "Actions", .{})) ui.openPopup(&menu);
+    if (ui.menu(&menu, btn, &.{
+        .{ .label = "New", .icon = .plus, .shortcut = "Cmd+N" },
+        .{ .separator = true },
+        .{ .label = "Delete", .danger = true },
+    }, .{})) |i| { ... }                      // index activated this frame; it closes itself
+
+- **`ui.beginPopup(&st, anchor, .{ w, h }, PopupOpts) ?Rect` / `ui.endPopup()`**: a panel (rounded,
+  surface colour, hairline, soft shadow) of outer size `size` placed `.below`, `.above`, `.right`,
+  `.left` the anchor rectangle, `.at_point` (a zero-size anchor, for context menus) or `.center` (in
+  the window), aligned `start`/`center`/`end`, `gap` away; it flips to the other side when it does not
+  fit and is shifted to stay 6 pt inside `ui.bounds` (the window, set by `Ui.init`; set it yourself
+  for a headless Ui). Returns the content rectangle (panel inset by `padding`) while open, else null;
+  call `endPopup` only after a rectangle. `bare` leaves the painting to you, `modal` dims the window and
+  blocks everything beneath, `dismiss_on_outside = false` keeps it open on outside clicks. Open it with
+  `ui.openPopup(&st)` (also from inside another popup), close it with `ui.closePopup(&st)`.
+- **Nesting**: up to 4 deep (a dropdown inside a popover inside a dialog). Each level draws above the
+  one before, even if its parent draws more widgets after it, and closes with its parent.
+- **Input**: widgets that were drawn before a popup know about it from last frame's rectangles
+  (`State.popups`): `Ui.hit` ignores the pointer inside a popup of a higher layer (and everywhere under
+  a modal one), mouse presses, keys and typed text do not reach lower layers while a popup is open
+  (`Ui.pressedNow`, `Ui.events`; the toolkit's own widgets use these, custom widgets should too). A
+  press outside every open popup closes the top one and is swallowed; Escape closes the topmost and is
+  consumed; the click that opens a popup cannot close it. The app's own `Input` is not changed, so
+  check `ui.popupOpen()` before acting on Escape or the arrows yourself.
+- **`ui.menu(&st, anchor, items, MenuOpts) ?usize`**: `MenuItem{ label, icon, shortcut, disabled,
+  checked, danger, separator }`; hover highlight, Up/Down/Home/End skipping disabled items and separators,
+  Enter/Space or a click activate; wheel scrolling when taller than the window. `ui.contextMenu(&st, area,
+  items, opts)` opens it at the pointer on a right click inside `area` (`Input.right_pressed`); for a
+  list with one shared state use `ui.contextOpen(&st, row)` per row and draw `ui.menu(&st,
+  st.pointAnchor(), items, .{ .placement = .at_point })` once.
+- **`ui.dropdown(rect, &DropdownState, items, &selected, DropdownOpts) bool`**: a select control with
+  a chevron; the menu is as wide as the control with a check on the current item. Focusable: when
+  focused and closed Up/Down change the selection and Enter/Space open it. True when `selected` changed.
+- **`ui.tooltip(rect, text, TooltipOpts)`**: call after the widget; shown below (above if that does not
+  fit) after the pointer has rested in `rect` for `delay` (0.5 s, from `Input.time`), hidden on leaving
+  and on a press, never takes input, drawn on the top layer. `State.needsRedraw()` is true while a timer
+  runs, for apps that only redraw on input.
+- **`DisplayList`** gained overlay layers (`setLayer`, `mergeLayers`) and `shadow(rect, radius, blur,
+  dy, color)`, a cheap soft shadow of stacked translucent rectangles.
+
+Not there yet: two sibling popups at the same depth do not block each other; the right button only
+opens and dismisses (no right-click drag); a popup that is closed by assigning `st.open = false` instead of
+`closePopup` leaves popups opened from it flagged open (they are never drawn, and close when it reopens); no animation, no type-ahead in
+dropdowns, no submenus (a menu item cannot open a menu, though a popover can contain widgets that open
+popups), no keyboard focus ring or Tab traversal inside popups.
+
+`zig build popups -- --snapshot DIR` writes `DIR/popups-1-tooltip.bmp`, `popups-2-menus.bmp` (a
+dropdown, a menu with icons, shortcuts, separators and disabled and danger items, and a context menu,
+all open), `popups-3-popover.bmp` (a dropdown inside a popover) and `popups-4-modal.bmp` (a confirm
+dialog). Interactive behaviour is covered by headless multi-frame tests; the real mouse and keyboard
+path was not exercised by a human.
 
 ## Images, file drops and the open-file dialog
 

@@ -6,6 +6,7 @@
 pub const geom = @import("geom.zig");
 pub const gfx = @import("gfx.zig");
 pub const ui = @import("ui.zig");
+pub const popup = @import("popup.zig");
 pub const keys = @import("keys.zig");
 pub const text_edit = @import("text_edit.zig");
 pub const png = @import("png.zig");
@@ -28,6 +29,13 @@ pub const Image = image.Image;
 pub const SvgIcon = image.SvgIcon;
 pub const ImageOpts = image.ImageOpts;
 pub const Ui = ui.Ui;
+pub const PopupState = ui.PopupState;
+pub const PopupOpts = ui.PopupOpts;
+pub const MenuItem = ui.MenuItem;
+pub const MenuOpts = ui.MenuOpts;
+pub const DropdownState = ui.DropdownState;
+pub const DropdownOpts = ui.DropdownOpts;
+pub const TooltipOpts = ui.TooltipOpts;
 pub const TextEdit = text_edit.TextEdit;
 
 test {
@@ -35,6 +43,7 @@ test {
     _ = ui;
     _ = @import("controls.zig");
     _ = @import("text_area.zig");
+    _ = @import("popup.zig");
     _ = icons;
     _ = svg;
     _ = raster;
