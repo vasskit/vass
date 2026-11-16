@@ -12,9 +12,78 @@ pub const Options = struct {
     optimize: std.builtin.OptimizeMode,
 };
 
-/// FreeType without zlib/bzip2/png/brotli/harfbuzz. Core font drivers
-/// (TrueType, CFF, Type 1, bitmap formats) and the smooth rasteriser are in.
-pub fn freetype(b: *std.Build, upstream: *std.Build.Dependency, o: Options) *std.Build.Step.Compile {
+/// zlib (inflate and deflate; no gz* file API). Needed by libpng and, as FreeType's system zlib,
+/// by its .gz font streams.
+pub fn zlib(b: *std.Build, upstream: *std.Build.Dependency, o: Options) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .target = o.target,
+        .optimize = o.optimize,
+        .link_libc = true,
+        .sanitize_c = .off,
+    });
+    mod.addIncludePath(upstream.path("."));
+    mod.addCSourceFiles(.{
+        .root = upstream.path("."),
+        .files = &.{
+            "adler32.c", "compress.c", "crc32.c",   "deflate.c", "infback.c", "inffast.c",
+            "inflate.c", "inftrees.c", "trees.c",   "uncompr.c", "zutil.c",
+        },
+        .flags = &.{ "-fno-sanitize=undefined", "-DHAVE_UNISTD_H", "-DHAVE_STDARG_H" },
+    });
+    const lib = b.addLibrary(.{ .name = "z", .linkage = .static, .root_module = mod });
+    lib.installHeader(upstream.path("zlib.h"), "zlib.h");
+    lib.installHeader(upstream.path("zconf.h"), "zconf.h");
+    return lib;
+}
+
+/// libpng (read and write sides) on top of `z`, with the portable C code only (no NEON/SSE
+/// shortcuts). `pnglibconf.h` is the project's prebuilt default configuration.
+pub fn libpng(b: *std.Build, upstream: *std.Build.Dependency, z: *std.Build.Step.Compile, z_upstream: *std.Build.Dependency, o: Options) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .target = o.target,
+        .optimize = o.optimize,
+        .link_libc = true,
+        .sanitize_c = .off,
+    });
+    const conf = b.addWriteFiles();
+    _ = conf.addCopyFile(upstream.path("scripts/pnglibconf.h.prebuilt"), "pnglibconf.h");
+    mod.addIncludePath(upstream.path("."));
+    mod.addIncludePath(conf.getDirectory());
+    mod.addIncludePath(z_upstream.path("."));
+    mod.linkLibrary(z);
+    mod.addCMacro("PNG_ARM_NEON_OPT", "0");
+    mod.addCMacro("PNG_INTEL_SSE_OPT", "0");
+    mod.addCMacro("PNG_MIPS_MSA_OPT", "0");
+    mod.addCMacro("PNG_POWERPC_VSX_OPT", "0");
+    mod.addCMacro("PNG_LOONGARCH_LSX_OPT", "0");
+    mod.addCSourceFiles(.{
+        .root = upstream.path("."),
+        .files = &.{
+            "png.c",      "pngerror.c", "pngget.c",   "pngmem.c",   "pngpread.c", "pngread.c",
+            "pngrio.c",   "pngrtran.c", "pngrutil.c", "pngset.c",   "pngtrans.c", "pngwio.c",
+            "pngwrite.c", "pngwtran.c", "pngwutil.c",
+        },
+        .flags = &.{"-fno-sanitize=undefined"},
+    });
+    const lib = b.addLibrary(.{ .name = "png", .linkage = .static, .root_module = mod });
+    lib.installHeader(upstream.path("png.h"), "png.h");
+    lib.installHeader(upstream.path("pngconf.h"), "pngconf.h");
+    lib.installHeader(conf.getDirectory().path(b, "pnglibconf.h"), "pnglibconf.h");
+    return lib;
+}
+
+/// What FreeType's PNG support is built against.
+pub const PngSupport = struct {
+    png: *std.Build.Step.Compile,
+    png_upstream: *std.Build.Dependency,
+    z: *std.Build.Step.Compile,
+    z_upstream: *std.Build.Dependency,
+};
+
+/// FreeType without bzip2/brotli/harfbuzz. Core font drivers (TrueType, CFF, Type 1, bitmap
+/// formats) and the smooth rasteriser are in, plus PNG bitmaps (colour emoji `sbix`/`CBDT`)
+/// and gzip streams through `png_support`'s libpng and zlib.
+pub fn freetype(b: *std.Build, upstream: *std.Build.Dependency, png_support: PngSupport, o: Options) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = o.target,
         .optimize = o.optimize,
@@ -24,6 +93,13 @@ pub fn freetype(b: *std.Build, upstream: *std.Build.Dependency, o: Options) *std
     });
     mod.addIncludePath(upstream.path("include"));
     mod.addCMacro("FT2_BUILD_LIBRARY", "1");
+    mod.addCMacro("FT_CONFIG_OPTION_USE_PNG", "1");
+    mod.addCMacro("FT_CONFIG_OPTION_SYSTEM_ZLIB", "1"); // one zlib in the binary: libpng's
+    mod.addIncludePath(png_support.png_upstream.path("."));
+    mod.addIncludePath(png_support.png.getEmittedIncludeTree());
+    mod.addIncludePath(png_support.z_upstream.path("."));
+    mod.linkLibrary(png_support.png);
+    mod.linkLibrary(png_support.z);
     mod.addCSourceFiles(.{
         .root = upstream.path("src"),
         .files = &.{

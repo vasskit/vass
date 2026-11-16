@@ -408,7 +408,6 @@ fn docFrame(w: *Win, ui: *Ui) void {
     w.rects.title = title_r;
     _ = ui.textField(title_r, &d.title, .{ .placeholder = "Title", .size = 14 });
     ui.tooltip(title_r, "The title is shared: the main window's list shows it too", .{});
-    if (w.state.focus == @as(?*const anyopaque, &d.title)) w.win.setTextInputArea(title_r, 0);
 
     // Dropdown, counter and undo / redo.
     const row_y = m + 32 + 10;
@@ -430,9 +429,8 @@ fn docFrame(w: *Win, ui: *Ui) void {
     // The text area fills the rest, above a status line.
     const body_y = row_y + 30 + 10;
     const body_r: Rect = .{ .x = m, .y = body_y, .w = bw - 2 * m, .h = @max(40, bh - body_y - m - 24) };
-    const res = ui.textArea(body_r, &d.body, .{ .placeholder = "Write something in this window", .size = 13 });
-    // The input method's candidate window belongs next to the caret of THIS window.
-    if (w.state.focus == @as(?*const anyopaque, &d.body)) w.win.setTextInputArea(res.input_area, res.caret_x);
+    // (The text widgets tell the input method where the caret is, through the Ui of THIS window.)
+    _ = ui.textArea(body_r, &d.body, .{ .placeholder = "Write something in this window", .size = 13 });
     const text = d.body.edit.text();
     ui.label(.{ .x = m, .y = bh - m - 14, .w = bw - 2 * m, .h = 16 }, std.fmt.bufPrint(&buf, "{d} characters, {d} lines", .{ text.len, std.mem.count(u8, text, "\n") + 1 }) catch "", .{ .size = 11, .color = t.dim });
 }

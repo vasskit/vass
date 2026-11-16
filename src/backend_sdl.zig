@@ -1,6 +1,7 @@
 //! SDL3 backend: windows (any number, see `Window`), input events, and a display-list renderer.
 //! SDL is declared by hand (only what is used) so the build needs no C headers.
 const std = @import("std");
+const builtin = @import("builtin");
 const geom = @import("geom.zig");
 const gfx = @import("gfx.zig");
 const Color = geom.Color;
@@ -10,6 +11,8 @@ const decode_mod = @import("decode.zig");
 const svg_mod = @import("svg.zig");
 const raster_mod = @import("raster.zig");
 const svg_cache = @import("svg_cache.zig");
+const emoji_mod = @import("emoji.zig");
+const compose = @import("text_compose.zig");
 pub const Image = image_mod.Image;
 pub const ImageOpts = image_mod.ImageOpts;
 pub const SvgIcon = image_mod.SvgIcon;
@@ -155,6 +158,15 @@ const c = struct {
     extern fn TTF_CloseFont(f: *Font) void;
     extern fn TTF_GetStringSize(f: *Font, text: [*]const u8, len: usize, w: *c_int, h: *c_int) bool;
     extern fn TTF_RenderText_Blended(f: *Font, text: [*]const u8, len: usize, fg: SdlColor) ?*Surface;
+    extern fn TTF_FontHasGlyph(f: *Font, ch: u32) bool;
+    extern fn TTF_GetFontHeight(f: *Font) c_int;
+    extern fn TTF_GetFontAscent(f: *Font) c_int;
+    extern fn TTF_FontIsScalable(f: *Font) bool;
+    extern fn TTF_SetFontSize(f: *Font, ptsize: f32) bool;
+    extern fn TTF_AddFallbackFont(f: *Font, fallback: *Font) bool;
+    /// The start of `SDL_Surface` (SDL 3.4), enough to read the pixels SDL_ttf drew.
+    const SurfaceHeader = extern struct { flags: u32, format: u32, w: c_int, h: c_int, pitch: c_int, pixels: ?[*]u8 };
+    const PIXELFORMAT_ARGB8888: u32 = 0x16362004;
 };
 
 /// UTF-8 text from the keyboard or an input method, copied out of the SDL
@@ -181,7 +193,8 @@ pub const TextChunk = struct {
 pub const Composition = struct {
     buf: [96]u8 = undefined,
     len: u8 = 0,
-    /// Cursor/selection inside the composition, in bytes; -1 if not set.
+    /// Cursor and selection inside the composition, in code points (SDL reports UTF-32 units on
+    /// macOS), not bytes; -1 if not set. `start` is the cursor, `length` the highlighted run.
     start: i32 = -1,
     length: i32 = -1,
 
@@ -432,6 +445,15 @@ pub const FontSet = struct {
     }
 };
 
+/// A font file for `WindowOptions.fallback_fonts` or `WindowOptions.emoji_font`: a TrueType or
+/// OpenType font (a collection's first face), as embedded bytes or a file on disk.
+pub const FontSource = union(enum) {
+    /// The font file's bytes; they must stay valid for the life of the window (`@embedFile`).
+    bytes: []const u8,
+    /// Path of a font file, read when the font is first needed.
+    path: [:0]const u8,
+};
+
 pub const WindowOptions = struct {
     title: [*:0]const u8,
     width: u32,
@@ -447,6 +469,22 @@ pub const WindowOptions = struct {
     focusable: bool = true,
     /// Custom fonts; null uses the system font.
     fonts: ?FontSet = null,
+    /// Fonts tried, in order, for a character the UI font has no glyph for (a script it does not
+    /// cover, symbols), before the system's own fallbacks. Opened the first time a string needs
+    /// one. The slice, and the bytes of any `.bytes` source, must stay valid for the life of the
+    /// window.
+    fallback_fonts: []const FontSource = &.{},
+    /// Also try the fonts macOS ships for symbols, Chinese, Japanese and Korean after
+    /// `fallback_fonts`. Has no effect on other systems (nothing is known to be installed).
+    system_fallback_fonts: bool = true,
+    /// Draw emoji in colour. The font is the system's colour emoji font (Apple Color Emoji on
+    /// macOS) unless `emoji_font` names another. Without a usable font, emoji draw as the UI
+    /// font's missing-glyph boxes and nothing fails.
+    colour_emoji: bool = true,
+    /// A colour emoji font to use instead of the system's: a bitmap font (PNG strikes: `sbix`,
+    /// `CBDT`) or a font with `COLR` colours. Bitmap strikes are scaled so the emoji's ascent
+    /// equals the text size. Same lifetime rules as `fallback_fonts`.
+    emoji_font: ?FontSource = null,
     /// The user can resize the window. Read the size each frame with `Window.logicalSize`.
     resizable: bool = false,
     /// Smallest size a resizable window can be dragged to (points; 0 = none).
@@ -688,7 +726,52 @@ const font_paths = [_][*:0]const u8{
     "/System/Library/Fonts/Helvetica.ttc",
 };
 
-const CachedFont = struct { px: u32, weight: gfx.Weight, font: *c.Font };
+/// Fonts tried after the UI font, and after `WindowOptions.fallback_fonts`, for characters the UI
+/// font lacks (symbols, then Han in Simplified Chinese and Japanese forms, kana, Hangul, then
+/// Arial Unicode for scripts the others do not cover). Whatever is not installed is skipped.
+const system_fallback_paths: []const [:0]const u8 = if (builtin.os.tag == .macos) &.{
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/\u{30D2}\u{30E9}\u{30AE}\u{30CE}\u{89D2}\u{30B4}\u{30B7}\u{30C3}\u{30AF} W3.ttc",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+} else &.{};
+
+/// Advance of the system emoji font's glyphs in percent of their bitmap width (see `EmojiState`).
+const system_emoji_advance_pct: u32 = 115;
+
+/// How far the system emoji font's glyphs sit below the baseline, in percent of the text size.
+const system_emoji_drop_pct: u32 = 15;
+
+/// The system colour emoji font.
+const system_emoji_path: ?[:0]const u8 = if (builtin.os.tag == .macos) "/System/Library/Fonts/Apple Color Emoji.ttc" else null;
+
+const CachedFont = struct { px: u32, weight: gfx.Weight, font: *c.Font, fb_attached: bool = false };
+/// A fallback font opened at one pixel size (shared by every weight of the UI font at that size);
+/// null when the file could not be opened.
+const FallbackFont = struct { index: u16, px: u32, font: ?*c.Font };
+/// A colour emoji font opened for one strike (a bitmap font) or one pixel size (a scalable one).
+const EmojiFont = struct { key: u32, font: *c.Font };
+const max_strikes = 24;
+
+/// The colour emoji font of a window, found on first use.
+const EmojiState = struct {
+    /// 0 not tried yet, 1 usable, 2 no usable font.
+    status: enum { untried, ready, unavailable } = .untried,
+    scalable: bool = false,
+    /// How wide a glyph's advance is as a percentage of the bitmap's width. Apple Color Emoji's
+    /// bitmaps are as wide as the em but the font advances 1.15 em (CoreText leaves that gap
+    /// between emoji); FreeType reports the bitmap width, so the gap is added here.
+    advance_pct: u32 = 100,
+    /// How far below the baseline the glyphs are moved, in percent of the text size. CoreText sets
+    /// Apple Color Emoji about 0.15 em lower than the origin FreeType reports for its bitmaps.
+    drop_pct: u32 = 0,
+    /// Bitmap fonts: the size of each strike in pixels (the font's ascent there), ascending; the
+    /// index into this array is what SDL_ttf takes as a "size" for a font that cannot scale.
+    strikes: [max_strikes]u16 = @splat(0),
+    n_strikes: u8 = 0,
+    fonts: std.ArrayList(EmojiFont) = .empty,
+};
 const ImageTex = struct { tex: *c.Texture, w: u32, h: u32 };
 /// Image ids are unique across windows and never reused, so a stale or foreign
 /// handle can only miss.
@@ -813,6 +896,15 @@ pub const Window = struct {
     clips: [16]geom.Rect = undefined,
     clip_n: usize = 0,
     font_set: ?FontSet = null,
+    fallback_sources: []const FontSource = &.{},
+    system_fallback: bool = true,
+    colour_emoji: bool = true,
+    emoji_source: ?FontSource = null,
+    /// Fallback fonts opened so far, per source and pixel size.
+    fb_fonts: std.ArrayList(FallbackFont) = .empty,
+    emoji: EmojiState = .{},
+    /// Advance (pixels) of each emoji cluster per pixel size, as `emojiAdvance` worked it out.
+    emoji_adv: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     images: std.AutoHashMapUnmanaged(u32, ImageTex) = .empty,
     svgs: std.AutoHashMapUnmanaged(u32, SvgEntry) = .empty,
     /// Rasterised icons per (icon, pixel size); a null texture marks a size that failed.
@@ -867,7 +959,17 @@ pub const Window = struct {
         _ = c.SDL_SetRenderScale(ren, density, density);
         if (opts.position) |p| _ = c.SDL_SetWindowPosition(win, @intFromFloat(@round(p[0])), @intFromFloat(@round(p[1])));
         if (show_after) _ = c.SDL_ShowWindow(win);
-        return .{ .gpa = gpa, .win = win, .ren = ren, .density = density, .font_set = opts.fonts };
+        return .{
+            .gpa = gpa,
+            .win = win,
+            .ren = ren,
+            .density = density,
+            .font_set = opts.fonts,
+            .fallback_sources = opts.fallback_fonts,
+            .system_fallback = opts.system_fallback_fonts,
+            .colour_emoji = opts.colour_emoji,
+            .emoji_source = opts.emoji_font,
+        };
     }
 
     /// Destroys the window and everything loaded into it (images, icons, fonts, text textures; a
@@ -892,6 +994,11 @@ pub const Window = struct {
         w.svgs.deinit(w.gpa);
         for (w.fonts.items) |f| c.TTF_CloseFont(f.font);
         w.fonts.deinit(w.gpa);
+        for (w.fb_fonts.items) |f| if (f.font) |font| c.TTF_CloseFont(font);
+        w.fb_fonts.deinit(w.gpa);
+        for (w.emoji.fonts.items) |f| c.TTF_CloseFont(f.font);
+        w.emoji.fonts.deinit(w.gpa);
+        w.emoji_adv.deinit(w.gpa);
         w.verts.deinit(w.gpa);
         w.idx.deinit(w.gpa);
         c.SDL_DestroyRenderer(w.ren);
@@ -1085,12 +1192,17 @@ pub const Window = struct {
         return c.SDL_TextInputActive(w.win);
     }
 
+    fn clampInt(v: f32) c_int {
+        if (!std.math.isFinite(v)) return 0;
+        return @intFromFloat(std.math.clamp(v, -1e6, 1e6));
+    }
+
     /// Tells the input method where the text being edited is (window points),
     /// so its candidate popup can sit next to it. `cursor_x` is the caret's
     /// x offset inside `r`.
     pub fn setTextInputArea(w: *Window, r: geom.Rect, cursor_x: f32) void {
-        const ir: c.SdlRect = .{ .x = @intFromFloat(r.x), .y = @intFromFloat(r.y), .w = @intFromFloat(r.w), .h = @intFromFloat(r.h) };
-        _ = c.SDL_SetTextInputArea(w.win, &ir, @intFromFloat(cursor_x));
+        const ir: c.SdlRect = .{ .x = clampInt(r.x), .y = clampInt(r.y), .w = clampInt(r.w), .h = clampInt(r.h) };
+        _ = c.SDL_SetTextInputArea(w.win, &ir, clampInt(cursor_x));
     }
 
     // ---- images -------------------------------------------------------
@@ -1633,23 +1745,295 @@ pub const Window = struct {
 
     // ---- text ---------------------------------------------------------
 
-    fn fontFor(w: *Window, px: u32, weight: gfx.Weight) ?*c.Font {
-        for (w.fonts.items) |f| if (f.px == px and f.weight == weight) return f.font;
+    fn openSource(src: FontSource, ptsize: f32) ?*c.Font {
+        switch (src) {
+            .bytes => |bytes| {
+                const io = c.SDL_IOFromConstMem(bytes.ptr, bytes.len) orelse return null;
+                // closeio = true: the font owns the stream (the bytes stay with the caller).
+                return c.TTF_OpenFontIO(io, true, ptsize);
+            },
+            .path => |path| return c.TTF_OpenFont(path.ptr, ptsize),
+        }
+    }
+
+    fn openUiFont(w: *Window, px: u32, weight: gfx.Weight) ?*c.Font {
         if (w.font_set) |set| {
             const bytes = set.forWeight(weight);
-            const io = c.SDL_IOFromConstMem(bytes.ptr, bytes.len) orelse return null;
-            // closeio = true: the font owns the stream (the bytes stay with the caller).
-            const font = c.TTF_OpenFontIO(io, true, @floatFromInt(px)) orelse return null;
-            w.fonts.append(w.gpa, .{ .px = px, .weight = weight, .font = font }) catch @panic("out of memory");
-            return font;
+            return openSource(.{ .bytes = bytes }, @floatFromInt(px));
         }
         for (font_paths) |path| {
-            if (c.TTF_OpenFont(path, @floatFromInt(px))) |font| {
-                w.fonts.append(w.gpa, .{ .px = px, .weight = weight, .font = font }) catch @panic("out of memory");
-                return font;
-            }
+            if (c.TTF_OpenFont(path, @floatFromInt(px))) |font| return font;
         }
         return null;
+    }
+
+    /// Index in `fonts` of the UI font for this size and weight, opening it the first time.
+    fn fontIndex(w: *Window, px: u32, weight: gfx.Weight) ?usize {
+        for (w.fonts.items, 0..) |f, i| if (f.px == px and f.weight == weight) return i;
+        const font = w.openUiFont(px, weight) orelse return null;
+        w.fonts.append(w.gpa, .{ .px = px, .weight = weight, .font = font }) catch @panic("out of memory");
+        return w.fonts.items.len - 1;
+    }
+
+    fn fallbackCount(w: *const Window) usize {
+        return w.fallback_sources.len + (if (w.system_fallback) system_fallback_paths.len else 0);
+    }
+
+    fn fallbackSource(w: *const Window, index: usize) FontSource {
+        if (index < w.fallback_sources.len) return w.fallback_sources[index];
+        if (comptime system_fallback_paths.len == 0) unreachable; // fallbackCount() is 0 then
+        return .{ .path = system_fallback_paths[index - w.fallback_sources.len] };
+    }
+
+    /// The fallback font number `index` at `px`, opened the first time; null if it cannot be opened.
+    fn fallbackFont(w: *Window, index: u16, px: u32) ?*c.Font {
+        for (w.fb_fonts.items) |f| if (f.index == index and f.px == px) return f.font;
+        const font = openSource(w.fallbackSource(index), @floatFromInt(px));
+        w.fb_fonts.append(w.gpa, .{ .index = index, .px = px, .font = font }) catch @panic("out of memory");
+        return font;
+    }
+
+    /// The UI font `i`, with the fallback fonts attached to it when `text` holds a character it
+    /// has no glyph for. Strings the UI font covers (all Latin text) never open a fallback.
+    fn withFallbacks(w: *Window, i: usize, text: []const u8) *c.Font {
+        const f = &w.fonts.items[i];
+        if (f.fb_attached or !needsFallback(f.font, text)) return f.font;
+        f.fb_attached = true;
+        for (0..w.fallbackCount()) |k| {
+            if (w.fallbackFont(@intCast(k), f.px)) |fb| _ = c.TTF_AddFallbackFont(f.font, fb);
+        }
+        return f.font;
+    }
+
+    // ---- colour emoji ----
+
+    /// Opens the emoji font and learns its strikes the first time; false if there is none.
+    fn emojiReady(w: *Window) bool {
+        if (!w.colour_emoji) return false;
+        switch (w.emoji.status) {
+            .ready => return true,
+            .unavailable => return false,
+            .untried => {},
+        }
+        w.emoji.status = .unavailable;
+        w.emoji.advance_pct = if (w.emoji_source == null) system_emoji_advance_pct else 100;
+        w.emoji.drop_pct = if (w.emoji_source == null) system_emoji_drop_pct else 0;
+        const src: FontSource = w.emoji_source orelse if (system_emoji_path) |p| .{ .path = p } else return false;
+        // Size 0.5 is strike 0 for a bitmap font, which takes an index, not a size.
+        const font = openSource(src, 0.5) orelse return false;
+        const st = &w.emoji;
+        if (c.TTF_FontIsScalable(font)) {
+            // Colour outlines (COLR): sized like any font, opened per pixel size on demand.
+            st.scalable = true;
+            c.TTF_CloseFont(font);
+            st.status = .ready;
+            return true;
+        }
+        var last: c_int = 0;
+        var idx: u8 = 0;
+        while (idx < max_strikes) : (idx += 1) {
+            if (idx > 0 and !c.TTF_SetFontSize(font, @as(f32, @floatFromInt(idx)) + 0.5)) break;
+            const asc = c.TTF_GetFontAscent(font);
+            // SDL_ttf clamps the index at the last strike, so the ascent stops growing there.
+            if (asc <= last or asc > std.math.maxInt(u16)) break;
+            st.strikes[idx] = @intCast(asc);
+            last = asc;
+        }
+        st.n_strikes = idx;
+        if (idx == 0) {
+            c.TTF_CloseFont(font);
+            return false;
+        }
+        // The font now sits on its last strike.
+        st.fonts.append(w.gpa, .{ .key = idx - 1, .font = font }) catch @panic("out of memory");
+        st.status = .ready;
+        return true;
+    }
+
+    const EmojiSize = struct { font: *c.Font, num: u32, den: u32 };
+
+    /// The emoji font opened for text `px` pixels tall, and the ratio (`num / den`) its glyph
+    /// bitmaps are scaled by: the smallest strike at least `px` tall, shrunk to `px`.
+    fn emojiFontFor(w: *Window, px: u32) ?EmojiSize {
+        if (!w.emojiReady()) return null;
+        const st = &w.emoji;
+        const src: FontSource = w.emoji_source orelse if (system_emoji_path) |p| .{ .path = p } else return null;
+        var key: u32 = px;
+        var ptsize: f32 = @floatFromInt(px);
+        var num: u32 = 1;
+        var den: u32 = 1;
+        if (!st.scalable) {
+            var k: usize = st.n_strikes - 1;
+            for (st.strikes[0..st.n_strikes], 0..) |strike, i| {
+                if (strike >= px) {
+                    k = i;
+                    break;
+                }
+            }
+            key = @intCast(k);
+            ptsize = @as(f32, @floatFromInt(k)) + 0.5;
+            num = px;
+            den = st.strikes[k];
+        }
+        for (st.fonts.items) |f| if (f.key == key) return .{ .font = f.font, .num = num, .den = den };
+        const font = openSource(src, ptsize) orelse return null;
+        st.fonts.append(w.gpa, .{ .key = key, .font = font }) catch @panic("out of memory");
+        return .{ .font = font, .num = num, .den = den };
+    }
+
+    const no_advance: u32 = std.math.maxInt(u32);
+
+    /// Width in pixels of the emoji cluster at `px`; null if the emoji font cannot draw it (no
+    /// font, or no glyph for its first code point), when it is drawn as ordinary text.
+    fn emojiAdvance(w: *Window, cluster: []const u8, px: u32) ?u32 {
+        var h = std.hash.Wyhash.init(px);
+        h.update(cluster);
+        const key = h.final();
+        if (w.emoji_adv.get(key)) |v| return if (v == no_advance) null else v;
+        const v = w.emojiAdvanceUncached(cluster, px);
+        w.emoji_adv.put(w.gpa, key, v orelse no_advance) catch {};
+        return v;
+    }
+
+    fn emojiAdvanceUncached(w: *Window, cluster: []const u8, px: u32) ?u32 {
+        const ef = w.emojiFontFor(px) orelse return null;
+        const n = std.unicode.utf8ByteSequenceLength(cluster[0]) catch return null;
+        if (n > cluster.len) return null;
+        const first = std.unicode.utf8Decode(cluster[0..n]) catch return null;
+        if (!c.TTF_FontHasGlyph(ef.font, first)) return null;
+        var tw: c_int = 0;
+        var th: c_int = 0;
+        if (!c.TTF_GetStringSize(ef.font, cluster.ptr, cluster.len, &tw, &th) or tw <= 0) return null;
+        return compose.scaled(@intCast(tw), ef.num * w.emoji.advance_pct, ef.den * 100);
+    }
+
+    /// An emoji cluster drawn at `px`: straight-alpha RGBA, `base` rows from the top to the baseline.
+    const EmojiBitmap = struct { w: u32, h: u32, base: u32, rgba: []u8 };
+
+    fn emojiBitmap(w: *Window, cluster: []const u8, px: u32) ?EmojiBitmap {
+        const ef = w.emojiFontFor(px) orelse return null;
+        // White: the emoji font's colours are in the glyphs, and SDL_ttf leaves them alone.
+        const surf = c.TTF_RenderText_Blended(ef.font, cluster.ptr, cluster.len, .{ .r = 255, .g = 255, .b = 255, .a = 255 }) orelse return null;
+        defer c.SDL_DestroySurface(surf);
+        const hdr: *const c.SurfaceHeader = @ptrCast(@alignCast(surf));
+        const pixels = hdr.pixels orelse return null;
+        if (hdr.format != c.PIXELFORMAT_ARGB8888 or hdr.w <= 0 or hdr.h <= 0 or hdr.pitch < hdr.w * 4) return null;
+        const sw: u32 = @intCast(hdr.w);
+        const sh: u32 = @intCast(hdr.h);
+        const dw = compose.scaled(sw, ef.num, ef.den);
+        const dh = compose.scaled(sh, ef.num, ef.den);
+        const asc: u32 = @intCast(@max(0, c.TTF_GetFontAscent(ef.font)));
+        const rgba = compose.scaleBgraPremulToRgba(w.gpa, pixels[0 .. @as(usize, @intCast(hdr.pitch)) * sh], sw, sh, @intCast(hdr.pitch), dw, dh) catch return null;
+        return .{ .w = dw, .h = dh, .base = compose.scaled(asc, ef.num, ef.den), .rgba = rgba };
+    }
+
+    /// Pixel width of `str` drawn with UI font `i`, as SDL_ttf lays it out (fallback fonts included).
+    fn plainWidth(w: *Window, i: usize, str: []const u8) u32 {
+        const font = w.withFallbacks(i, str);
+        var tw: c_int = 0;
+        var th: c_int = 0;
+        if (!c.TTF_GetStringSize(font, str.ptr, str.len, &tw, &th)) return 0;
+        return @intCast(@max(0, tw));
+    }
+
+    /// Whether `str` has an emoji cluster the emoji font can draw (otherwise the whole string goes
+    /// through SDL_ttf as it always did).
+    fn hasEmojiRuns(w: *Window, str: []const u8, px: u32) bool {
+        if (!w.colour_emoji or !emoji_mod.mayContainEmoji(str) or !w.emojiReady()) return false;
+        var it = emoji_mod.runs(str);
+        while (it.next()) |r| {
+            if (r.emoji and w.emojiAdvance(r.slice(str), px) != null) return true;
+        }
+        return false;
+    }
+
+    /// Pixel width of one run of a string that has emoji in it.
+    fn runWidth(w: *Window, i: usize, str: []const u8, r: emoji_mod.Run, px: u32) u32 {
+        if (r.emoji) {
+            if (w.emojiAdvance(r.slice(str), px)) |a| return a;
+        }
+        return w.plainWidth(i, r.slice(str));
+    }
+
+    /// The texture of `str` for text pixels `px` tall in colour `col`, or null if nothing could be drawn.
+    fn textTexture(w: *Window, i: usize, str: []const u8, col: Color, px: u32) ?CachedText {
+        if (w.hasEmojiRuns(str, px)) {
+            if (w.composeText(i, str, col, px)) |t| return t;
+        }
+        const font = w.withFallbacks(i, str);
+        const surf = c.TTF_RenderText_Blended(font, str.ptr, str.len, .{ .r = col.r, .g = col.g, .b = col.b, .a = col.a }) orelse return null;
+        defer c.SDL_DestroySurface(surf);
+        const tex = c.SDL_CreateTextureFromSurface(w.ren, surf) orelse return null;
+        var tw: f32 = 0;
+        var th: f32 = 0;
+        _ = c.SDL_GetTextureSize(tex, &tw, &th);
+        return .{ .tex = tex, .w = tw / w.density, .h = th / w.density, .last_frame = w.frame };
+    }
+
+    /// A line of text as straight-alpha RGBA pixels.
+    const Composed = struct { rgba: []u8, w: usize, h: usize };
+
+    /// Draws a string with emoji in it into pixels: each emoji cluster from the colour emoji font
+    /// (scaled to the text size, keeping its own colours; the text colour only sets its opacity)
+    /// and the stretches between them from the UI font, side by side on one baseline. The caller
+    /// frees `rgba` with the window's allocator.
+    fn composeBuffer(w: *Window, i: usize, str: []const u8, col: Color, px: u32) ?Composed {
+        const ui_font = w.fonts.items[i].font;
+        const height_i = c.TTF_GetFontHeight(ui_font);
+        const ascent_i = c.TTF_GetFontAscent(ui_font);
+        if (height_i <= 0) return null;
+        const height: usize = @intCast(height_i);
+        var total: usize = 0;
+        var it = emoji_mod.runs(str);
+        while (it.next()) |r| total += w.runWidth(i, str, r, px);
+        if (total == 0) return null;
+        const buf = w.gpa.alloc(u8, total * height * 4) catch return null;
+        @memset(buf, 0);
+        var x: usize = 0;
+        it = emoji_mod.runs(str);
+        while (it.next()) |r| {
+            const piece = r.slice(str);
+            const rw = w.runWidth(i, str, r, px);
+            if (r.emoji and w.emojiAdvance(piece, px) != null) {
+                if (w.emojiBitmap(piece, px)) |bm| {
+                    defer w.gpa.free(bm.rgba);
+                    // Centred in its advance, which is wider than the bitmap for the system font.
+                    const pad = @divFloor(@as(i64, @intCast(rw)) - bm.w, 2);
+                    compose.overRgba(buf, total, height, bm.rgba, bm.w, bm.h, @as(i64, @intCast(x)) + pad, @as(i64, ascent_i) - bm.base + @as(i64, (px * w.emoji.drop_pct + 50) / 100), col.a);
+                }
+            } else {
+                const font = w.withFallbacks(i, piece);
+                if (c.TTF_RenderText_Blended(font, piece.ptr, piece.len, .{ .r = col.r, .g = col.g, .b = col.b, .a = col.a })) |surf| {
+                    defer c.SDL_DestroySurface(surf);
+                    const hdr: *const c.SurfaceHeader = @ptrCast(@alignCast(surf));
+                    if (hdr.pixels != null and hdr.format == c.PIXELFORMAT_ARGB8888 and hdr.w > 0 and hdr.h > 0) {
+                        const sw: usize = @min(@as(usize, @intCast(hdr.w)), rw);
+                        const pitch: usize = @intCast(hdr.pitch);
+                        const sh: usize = @intCast(hdr.h);
+                        compose.overArgb(buf, total, height, hdr.pixels.?[0 .. pitch * sh], sw, sh, pitch, @intCast(x), 0);
+                    }
+                }
+            }
+            x += rw;
+        }
+        return .{ .rgba = buf, .w = total, .h = height };
+    }
+
+    fn composeText(w: *Window, i: usize, str: []const u8, col: Color, px: u32) ?CachedText {
+        const line = w.composeBuffer(i, str, col, px) orelse return null;
+        defer w.gpa.free(line.rgba);
+        const tex = c.SDL_CreateTexture(w.ren, c.PIXELFORMAT_RGBA32, c.TEXTUREACCESS_STATIC, @intCast(line.w), @intCast(line.h)) orelse return null;
+        if (!c.SDL_UpdateTexture(tex, null, line.rgba.ptr, @intCast(line.w * 4))) {
+            c.SDL_DestroyTexture(tex);
+            return null;
+        }
+        _ = c.SDL_SetTextureBlendMode(tex, c.BLENDMODE_BLEND);
+        return .{
+            .tex = tex,
+            .w = @as(f32, @floatFromInt(line.w)) / w.density,
+            .h = @as(f32, @floatFromInt(line.h)) / w.density,
+            .last_frame = w.frame,
+        };
     }
 
     /// Width in points that `str` takes when drawn at `size` (regular weight).
@@ -1657,14 +2041,20 @@ pub const Window = struct {
         return w.measureTextWeighted(str, size, .regular);
     }
 
-    /// Width in points that `str` takes when drawn at `size` in `weight`.
+    /// Width in points that `str` takes when drawn at `size` in `weight`: the width of the texture
+    /// `drawText` makes for it, emoji and fallback fonts included.
     pub fn measureTextWeighted(w: *Window, str: []const u8, size: f32, weight: gfx.Weight) f32 {
         if (str.len == 0) return 0;
-        const font = w.fontFor(@intFromFloat(@round(size * w.density)), weight) orelse return 0;
-        var tw: c_int = 0;
-        var th: c_int = 0;
-        if (!c.TTF_GetStringSize(font, str.ptr, str.len, &tw, &th)) return 0;
-        return @as(f32, @floatFromInt(tw)) / w.density;
+        const px: u32 = @intFromFloat(@round(size * w.density));
+        const i = w.fontIndex(px, weight) orelse return 0;
+        var total: u32 = 0;
+        if (w.hasEmojiRuns(str, px)) {
+            var it = emoji_mod.runs(str);
+            while (it.next()) |r| total += w.runWidth(i, str, r, px);
+        } else {
+            total = w.plainWidth(i, str);
+        }
+        return @as(f32, @floatFromInt(total)) / w.density;
     }
 
     fn drawText(w: *Window, x: f32, y: f32, str: []const u8, size: f32, col: Color, alignment: gfx.Align, weight: gfx.Weight) void {
@@ -1676,14 +2066,9 @@ pub const Window = struct {
         const key = h.final();
 
         const entry = w.texts.getPtr(key) orelse blk: {
-            const font = w.fontFor(px, weight) orelse return;
-            const surf = c.TTF_RenderText_Blended(font, str.ptr, str.len, .{ .r = col.r, .g = col.g, .b = col.b, .a = col.a }) orelse return;
-            defer c.SDL_DestroySurface(surf);
-            const tex = c.SDL_CreateTextureFromSurface(w.ren, surf) orelse return;
-            var tw: f32 = 0;
-            var th: f32 = 0;
-            _ = c.SDL_GetTextureSize(tex, &tw, &th);
-            w.texts.put(w.gpa, key, .{ .tex = tex, .w = tw / w.density, .h = th / w.density, .last_frame = w.frame }) catch @panic("out of memory");
+            const i = w.fontIndex(px, weight) orelse return;
+            const t = w.textTexture(i, str, col, px) orelse return;
+            w.texts.put(w.gpa, key, t) catch @panic("out of memory");
             break :blk w.texts.getPtr(key).?;
         };
         entry.last_frame = w.frame;
@@ -1709,6 +2094,38 @@ pub const Window = struct {
         }
     }
 };
+
+/// Characters that draw nothing (joiners, variation selectors, ...): a UI font need not have a
+/// glyph for them, so they do not by themselves call for the fallback fonts.
+fn isInvisible(cp: u21) bool {
+    return switch (cp) {
+        0xAD, 0x34F, 0x180B...0x180F, 0x200B...0x200F, 0x2028...0x202E, 0x2060...0x206F, 0xFE00...0xFE0F, 0xFEFF, 0xE0100...0xE01EF => true,
+        else => false,
+    };
+}
+
+/// Whether `text` has a character `font` has no glyph for.
+fn needsFallback(font: *c.Font, text: []const u8) bool {
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] < 0x80) {
+            i += 1;
+            continue;
+        }
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + n > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i..][0..n]) catch {
+            i += 1;
+            continue;
+        };
+        i += n;
+        if (!isInvisible(cp) and !c.TTF_FontHasGlyph(font, cp)) return true;
+    }
+    return false;
+}
 
 const rrect_seg = 10;
 
@@ -2203,4 +2620,238 @@ test "an open-file dialog result belongs to the window that opened it" {
     try std.testing.expect(dialog_orphaned);
     dialogCallback(null, &picked, 0);
     try std.testing.expect(dialog_done == null and !dialog_pending and !dialog_orphaned);
+}
+
+// ---- colour emoji and font fallback -----------------------------------------------------------
+
+const family_emoji = "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+const flag_ng = "\u{1F1F3}\u{1F1EC}";
+const white: Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
+
+/// A dummy-driver window whose emoji font works, or a skip: the system font may be absent (not
+/// macOS, a stripped install) or unreadable.
+fn emojiWindow(opts: WindowOptions) error{SkipZigTest}!*Window {
+    const w = try dummyWindow(opts);
+    if (!w.emojiReady()) {
+        w.destroy();
+        return error.SkipZigTest;
+    }
+    return w;
+}
+
+fn expectNear(want: f32, got: f32, tol: f32) !void {
+    try std.testing.expect(@abs(want - got) <= tol);
+}
+
+/// Bounding box of the pixels of `line` that are coloured (not grey, as the UI text is white or
+/// red here: a pixel with red, green and blue far apart).
+fn colourBox(line: Window.Composed) ?struct { x0: usize, x1: usize, n: usize } {
+    var x0: usize = line.w;
+    var x1: usize = 0;
+    var n: usize = 0;
+    for (0..line.h) |y| for (0..line.w) |x| {
+        const p = line.rgba[(y * line.w + x) * 4 ..][0..4];
+        if (p[3] < 128) continue;
+        const hi = @max(p[0], @max(p[1], p[2]));
+        const lo = @min(p[0], @min(p[1], p[2]));
+        if (hi - lo < 40) continue;
+        n += 1;
+        x0 = @min(x0, x);
+        x1 = @max(x1, x);
+    };
+    if (n == 0) return null;
+    return .{ .x0 = x0, .x1 = x1, .n = n };
+}
+
+test "emoji: measured width equals the drawn texture, and a family is one glyph wide" {
+    const win = try emojiWindow(.{ .title = "emoji", .width = 80, .height = 60 });
+    defer win.destroy();
+    const size: f32 = 20;
+    const px: u32 = 20;
+    const one = win.measureText("\u{1F600}", size);
+    const fam = win.measureText(family_emoji, size);
+    const flag = win.measureText(flag_ng, size);
+    try std.testing.expect(one > 0);
+    try expectNear(one, fam, one * 0.25); // not three or four glyphs
+    try expectNear(one, flag, one * 0.25);
+    try std.testing.expect(win.measureText("\u{1F469}\u{1F469}\u{1F467}", size) > 2 * fam); // without the joiners
+    try std.testing.expect(win.measureText("1\u{FE0F}\u{20E3}", size) < 1.5 * one);
+    // Each string: the texture drawText makes is exactly as wide as measureText says.
+    const i = win.fontIndex(px, .regular).?;
+    const strs = [_][]const u8{ "\u{1F600}", family_emoji, flag_ng, "caf\u{E9} " ++ family_emoji ++ " ok", "\u{1F44D}\u{1F3FD}", "\u{2764}\u{FE0F}", "1\u{FE0F}\u{20E3}" };
+    for (strs) |str| {
+        const t = win.textTexture(i, str, white, px) orelse return error.TestUnexpectedResult;
+        defer c.SDL_DestroyTexture(t.tex);
+        try std.testing.expectEqual(win.measureText(str, size), t.w);
+        try std.testing.expect(t.w > 0 and t.h > 0);
+    }
+}
+
+test "emoji: strings without emoji are measured and drawn as before" {
+    const win = try emojiWindow(.{ .title = "plain", .width = 80, .height = 60 });
+    defer win.destroy();
+    const off = try dummyWindow(.{ .title = "plain off", .width = 80, .height = 60, .colour_emoji = false });
+    defer off.destroy();
+    for ([_][]const u8{ "hello", "caf\u{E9}", "x \u{2764} y", "\u{A9} 2026", "tab\there" }) |str| {
+        try std.testing.expectEqual(off.measureText(str, 15), win.measureText(str, 15));
+    }
+}
+
+test "emoji: the glyph keeps its own colours whatever the text colour is, only opacity applies" {
+    const win = try emojiWindow(.{ .title = "colour", .width = 80, .height = 60 });
+    defer win.destroy();
+    const px: u32 = 24;
+    const i = win.fontIndex(px, .regular).?;
+    const red: Color = .{ .r = 255, .g = 0, .b = 0, .a = 255 };
+    const blue: Color = .{ .r = 0, .g = 0, .b = 255, .a = 255 };
+    const half: Color = .{ .r = 255, .g = 0, .b = 0, .a = 128 };
+    for ([_][]const u8{ "\u{1F600}", family_emoji, flag_ng }) |str| {
+        const a = win.composeBuffer(i, str, red, px) orelse return error.TestUnexpectedResult;
+        defer win.gpa.free(a.rgba);
+        const b = win.composeBuffer(i, str, blue, px) orelse return error.TestUnexpectedResult;
+        defer win.gpa.free(b.rgba);
+        const h = win.composeBuffer(i, str, half, px) orelse return error.TestUnexpectedResult;
+        defer win.gpa.free(h.rgba);
+        // Coloured (not grey) pixels exist, and the text colour changes nothing.
+        const box = colourBox(a) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(box.n > 50);
+        try std.testing.expectEqualSlices(u8, a.rgba, b.rgba);
+        // Half opacity: same colours, about half the alpha.
+        try std.testing.expectEqual(a.rgba.len, h.rgba.len);
+        var checked: usize = 0;
+        var k: usize = 0;
+        while (k < a.rgba.len) : (k += 4) {
+            if (a.rgba[k + 3] != 255) continue;
+            try std.testing.expectEqualSlices(u8, a.rgba[k..][0..3], h.rgba[k..][0..3]);
+            try std.testing.expect(h.rgba[k + 3] >= 127 and h.rgba[k + 3] <= 129);
+            checked += 1;
+        }
+        try std.testing.expect(checked > 50);
+    }
+    // Text next to it is tinted as usual.
+    const mixed = win.composeBuffer(i, "ab \u{1F600}", red, px) orelse return error.TestUnexpectedResult;
+    defer win.gpa.free(mixed.rgba);
+    var red_text: usize = 0;
+    var k: usize = 0;
+    while (k < mixed.rgba.len) : (k += 4) {
+        const p = mixed.rgba[k..][0..4];
+        if (p[3] > 200 and p[0] == 255 and p[1] == 0 and p[2] == 0) red_text += 1;
+    }
+    try std.testing.expect(red_text > 20);
+}
+
+test "emoji: the caret positions around a cluster match where it is drawn" {
+    const win = try emojiWindow(.{ .title = "caret", .width = 80, .height = 60 });
+    defer win.destroy();
+    const px: u32 = 26;
+    const i = win.fontIndex(px, .regular).?;
+    const size: f32 = 26;
+    inline for ([_][]const u8{ family_emoji, flag_ng, "\u{1F44D}\u{1F3FD}", "\u{1F600}" }) |cluster| {
+        const str = "ab" ++ cluster;
+        // Prefix before the cluster and through it, as a text field measures them for the caret.
+        const x0 = win.measureText("ab", size);
+        const x1 = win.measureText(str, size);
+        try std.testing.expect(x1 > x0);
+        const line = win.composeBuffer(i, str, white, px) orelse return error.TestUnexpectedResult;
+        defer win.gpa.free(line.rgba);
+        try std.testing.expectEqual(@as(usize, @intFromFloat(x1)), line.w);
+        const box = colourBox(line) orelse return error.TestUnexpectedResult;
+        // The coloured pixels lie between the two caret positions and fill most of the gap.
+        try std.testing.expect(@as(f32, @floatFromInt(box.x0)) >= x0 - 1);
+        try std.testing.expect(@as(f32, @floatFromInt(box.x1)) <= x1);
+        try std.testing.expect(@as(f32, @floatFromInt(box.x1 - box.x0)) >= 0.5 * (x1 - x0));
+    }
+    // The widths add up piece by piece, so every cluster boundary is a caret stop.
+    const a = win.measureText("a", size);
+    const e = win.measureText(family_emoji, size);
+    try expectNear(a + e, win.measureText("a" ++ family_emoji, size), 0.01);
+    try expectNear(a + e + a, win.measureText("a" ++ family_emoji ++ "a", size), 0.01);
+}
+
+test "emoji: it sits on the baseline at the text size, at any pixel size" {
+    const win = try emojiWindow(.{ .title = "size", .width = 80, .height = 60 });
+    defer win.destroy();
+    for ([_]u32{ 13, 20, 26, 30, 44, 70, 200 }) |px| {
+        const i = win.fontIndex(px, .regular).?;
+        const line = win.composeBuffer(i, "\u{1F600}", white, px) orelse return error.TestUnexpectedResult;
+        defer win.gpa.free(line.rgba);
+        // About an em and a bit wide (the font advances 1.15 em), and inside the line box (not cut
+        // off at the top by a wrong baseline).
+        try std.testing.expect(line.w >= px and line.w <= px * 13 / 10 + 1);
+        var first: usize = line.h;
+        var last: usize = 0;
+        for (0..line.h) |y| for (0..line.w) |x| {
+            if (line.rgba[(y * line.w + x) * 4 + 3] > 128) {
+                first = @min(first, y);
+                last = @max(last, y);
+            }
+        };
+        try std.testing.expect(last >= first);
+        const asc: usize = @intCast(c.TTF_GetFontAscent(win.fonts.items[i].font));
+        try std.testing.expect(last <= asc + px / 5); // at most a little below the baseline
+        try std.testing.expect(first <= asc);
+        try std.testing.expect(last - first + 1 >= px * 6 / 10); // fills most of an em in height
+    }
+}
+
+test "emoji: a missing or broken emoji font leaves boxes and breaks nothing" {
+    const plain = try dummyWindow(.{ .title = "off", .width = 80, .height = 60, .colour_emoji = false });
+    defer plain.destroy();
+    const str = "caf\u{E9} " ++ family_emoji ++ " " ++ flag_ng;
+    const want = plain.measureText(str, 15);
+    try std.testing.expect(want > 0);
+    const bad = [_]WindowOptions{
+        .{ .title = "missing", .width = 80, .height = 60, .emoji_font = .{ .path = "/nonexistent/NoSuchEmoji.ttc" } },
+        .{ .title = "garbage", .width = 80, .height = 60, .emoji_font = .{ .bytes = "this is not a font" } },
+    };
+    for (bad) |opts| {
+        const win = try dummyWindow(opts);
+        defer win.destroy();
+        try std.testing.expect(!win.emojiReady());
+        try std.testing.expectEqual(want, win.measureText(str, 15));
+        var list = gfx.DisplayList.init(std.testing.allocator);
+        defer list.deinit();
+        list.text(2, 2, 15, white, .left, str);
+        win.render(&list, .{ .r = 0, .g = 0, .b = 0, .a = 255 });
+        try std.testing.expectEqual(want, win.measureText(str, 15));
+    }
+}
+
+test "emoji: a whole display list with emoji everywhere renders" {
+    const win = try emojiWindow(.{ .title = "render", .width = 200, .height = 100 });
+    defer win.destroy();
+    var list = gfx.DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    list.text(2, 2, 13, white, .left, "Shipped \u{1F680} " ++ family_emoji);
+    list.text(100, 22, 13, white, .center, flag_ng ++ " a");
+    list.text(198, 42, 13, .{ .r = 255, .g = 255, .b = 255, .a = 90 }, .right, "\u{2764}\u{FE0F} dim");
+    list.text(2, 62, 16, white, .left, "\u{1F44D}\u{1F3FD} semibold");
+    win.render(&list, .{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    win.render(&list, .{ .r = 0, .g = 0, .b = 0, .a = 255 }); // cached textures
+    try std.testing.expect(win.texts.count() >= 4);
+}
+
+test "fallback fonts: CJK has glyphs through the system fallbacks, and only when asked for" {
+    const on = try dummyWindow(.{ .title = "fb on", .width = 80, .height = 60 });
+    defer on.destroy();
+    // Hiragino Sans GB is the second system fallback; no font, no test.
+    if (builtin.os.tag != .macos or on.fallbackFont(1, 20) == null) return error.SkipZigTest;
+    const off = try dummyWindow(.{ .title = "fb off", .width = 80, .height = 60, .system_fallback_fonts = false });
+    defer off.destroy();
+    const cjk = "\u{4F60}\u{597D}";
+    const with = on.measureText(cjk, 20);
+    const without = off.measureText(cjk, 20);
+    try std.testing.expect(with > 0 and without > 0);
+    try std.testing.expect(with != without); // real glyphs, not the UI font's boxes
+    // The fallback fonts are opened only for strings that need them: Latin text opened none.
+    const latin = try dummyWindow(.{ .title = "latin", .width = 80, .height = 60 });
+    defer latin.destroy();
+    _ = latin.measureText("caf\u{E9} hello", 20);
+    try std.testing.expectEqual(@as(usize, 0), latin.fb_fonts.items.len);
+    _ = latin.measureText(cjk, 20);
+    try std.testing.expect(latin.fb_fonts.items.len > 0);
+    // An app's own fallback list works on its own, in place of the system's.
+    const own = try dummyWindow(.{ .title = "own", .width = 80, .height = 60, .system_fallback_fonts = false, .fallback_fonts = &.{.{ .path = "/System/Library/Fonts/Hiragino Sans GB.ttc" }} });
+    defer own.destroy();
+    try std.testing.expectEqual(with, own.measureText(cjk, 20));
 }

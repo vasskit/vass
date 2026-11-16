@@ -45,10 +45,14 @@ pub fn build(b: *std.Build) void {
         const ft_dep = b.lazyDependency("freetype", .{});
         const ttf_dep = b.lazyDependency("sdl_ttf", .{});
         const hb_dep = b.lazyDependency("harfbuzz", .{});
-        if (sdl_dep != null and ft_dep != null and ttf_dep != null and hb_dep != null) {
+        const z_dep = b.lazyDependency("zlib", .{});
+        const png_dep = b.lazyDependency("libpng", .{});
+        if (sdl_dep != null and ft_dep != null and ttf_dep != null and hb_dep != null and z_dep != null and png_dep != null) {
             const o: deps.Options = .{ .target = target, .optimize = optimize };
             const sdl = sdl_dep.?.artifact("SDL3");
-            const ft = deps.freetype(b, ft_dep.?, o);
+            const z = deps.zlib(b, z_dep.?, o);
+            const png = deps.libpng(b, png_dep.?, z, z_dep.?, o);
+            const ft = deps.freetype(b, ft_dep.?, .{ .png = png, .png_upstream = png_dep.?, .z = z, .z_upstream = z_dep.? }, o);
             const hb = deps.harfbuzz(b, hb_dep.?, ft_dep.?, o);
             const ttf = deps.sdlTtf(b, ttf_dep.?, sdl, ft, ft_dep.?, hb, hb_dep.?, o);
             addMacosSdkPaths(b, ttf.root_module, target);

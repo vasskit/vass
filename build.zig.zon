@@ -24,6 +24,18 @@
             .hash = "N-V-__8AABCJSwZ_b-_pzs_bdrf6CKkC58JNxsp0b1FfvNqV",
             .lazy = true,
         },
+        // zlib and libpng: FreeType needs libpng to read the PNG bitmaps in colour emoji fonts
+        // (Apple Color Emoji's `sbix` table). Built from source, read-only side of libpng plus all of zlib.
+        .zlib = .{
+            .url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.2.tar.gz",
+            .hash = "N-V-__8AAI4ANwDM8MWhHTUFLKfvLE_n2NQk6mh0sFDzhTqO",
+            .lazy = true,
+        },
+        .libpng = .{
+            .url = "https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.58.tar.gz",
+            .hash = "N-V-__8AAJexYAClrDiJ2R-eT-rfMNK2Qd3--2FRhY7e5nvn",
+            .lazy = true,
+        },
         // Single-header image decoder (PNG, JPEG, BMP, GIF), built from src/stb_impl.c.
         .stb = .{
             .url = "https://github.com/nothings/stb/archive/9600522de53973336fa033a289858a4354cbb04c.tar.gz",

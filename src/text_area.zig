@@ -13,6 +13,8 @@ const geom = @import("geom.zig");
 const keys = @import("keys.zig");
 const text_edit = @import("text_edit.zig");
 const ui_mod = @import("ui.zig");
+const text_input = @import("text_input.zig");
+const popup = @import("popup.zig");
 const Rect = geom.Rect;
 const Ui = ui_mod.Ui;
 const TextEdit = text_edit.TextEdit;
@@ -33,12 +35,22 @@ pub const TextAreaState = struct {
     seen_len: usize = std.math.maxInt(usize),
     /// `edit.undo_serial` as of last frame: an undo or redo scrolls the caret into view.
     seen_serial: u32 = 0,
+    /// What a double or triple click selected, so a drag grows by words or lines.
+    multi: text_edit.MultiClick = .{},
+    /// The right-click menu (Undo, Redo, Cut, Copy, Paste, Select All); drawn as a popup.
+    ctx: popup.PopupState = .{},
+    /// The text as drawn while an input-method pre-edit is spliced in, rebuilt each frame.
+    disp: std.ArrayList(u8) = .empty,
+    /// Pre-edit bookkeeping (see `text_input.composingNow`).
+    was_focused: bool = false,
+    ime_block: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) TextAreaState {
         return .{ .edit = .{ .gpa = gpa, .multiline = true } };
     }
 
     pub fn deinit(s: *TextAreaState) void {
+        s.disp.deinit(s.edit.gpa);
         s.edit.deinit();
     }
 
@@ -87,6 +99,8 @@ pub const TextAreaOpts = struct {
     /// Return reports `submitted` instead of inserting a line break; Shift+Return
     /// inserts one. Off: Return inserts a line break and never submits.
     submit_on_enter: bool = false,
+    /// A right click opens the Undo / Redo / Cut / Copy / Paste / Select All menu (needs `ui.state`).
+    context_menu: bool = true,
     /// For `measureTextArea`: the fewest and most lines of height it reports.
     /// (`textArea` itself fills whatever rectangle it is given.)
     min_lines: usize = 1,
@@ -98,9 +112,10 @@ pub const TextAreaResult = struct {
     changed: bool = false,
     /// Return was pressed while focused, with `submit_on_enter`.
     submitted: bool = false,
-    /// The line the caret is on, as a screen rectangle, and the caret's offset
-    /// from its left edge: pass both to `Window.setTextInputArea` while focused
-    /// so the input method places its candidate window at the caret.
+    /// While focused: where the caret (or the input-method pre-edit) is, as a screen rectangle one
+    /// line high, and the input method's caret offset from its left edge. `textArea` already
+    /// passes them to `Ui.setTextInputArea`; they are here for apps that call
+    /// `Window.setTextInputArea` themselves.
     input_area: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     caret_x: f32 = 0,
 };
@@ -155,27 +170,7 @@ fn lineCount(ui: *const Ui, text: []const u8, size: f32, w: f32) usize {
 
 /// Inserts `str` without carriage returns (pasted CRLF text becomes LF), as one edit of `kind`.
 fn insertClean(st: *TextAreaState, str: []const u8, kind: text_edit.EditKind) void {
-    if (std.mem.indexOfScalar(u8, str, '\r') == null) {
-        st.edit.insertAs(str, kind) catch {};
-        return;
-    }
-    const gpa = st.edit.gpa;
-    if (gpa.alloc(u8, str.len)) |clean| {
-        defer gpa.free(clean);
-        var n: usize = 0;
-        for (str) |b| {
-            if (b != '\r') {
-                clean[n] = b;
-                n += 1;
-            }
-        }
-        st.edit.insertAs(clean[0..n], kind) catch {};
-    } else |_| {
-        var parts = std.mem.splitScalar(u8, str, '\r');
-        while (parts.next()) |p| {
-            if (p.len > 0) st.edit.insertAs(p, kind) catch {};
-        }
-    }
+    text_input.insertClean(&st.edit, str, kind);
 }
 
 fn moveVertical(ui: *const Ui, st: *TextAreaState, size: f32, w: f32, down: bool, extend: bool) void {
@@ -283,43 +278,75 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
     const hv = ui.hit(r);
     if (hv.hovered) ui.setCursor(.text);
     var dragging = false;
+    // A composition that was already showing last frame: clicks are the input method's then.
+    const comp_before = st.was_focused and focused and in.composition.len > 0 and !st.ime_block;
 
     if (ui.state) |s| {
-        const off = ui.offsetAtPoint(st.edit.text(), size, box.w, in.mouse_x - box.x, in.mouse_y - box.y + st.scroll_y);
+        const wants_off = hv.clicked or (in.right_pressed and hv.hovered) or s.drag == id;
+        const off = if (wants_off) ui.offsetAtPoint(st.edit.text(), size, box.w, in.mouse_x - box.x, in.mouse_y - box.y + st.scroll_y) else 0;
         if (hv.clicked) {
+            const clicks = ui.clickCount();
             s.focus = id;
             s.select = null; // one selection at a time
             focused = true;
             st.blink_origin = in.time;
             st.want_x = null;
-            const cur = st.edit.text();
-            switch (in.mouse_clicks) {
-                0, 1 => {
-                    s.drag = id;
-                    st.edit.moveTo(off, in.mouse_mods.shift);
-                },
-                2 => {
-                    s.drag = null;
-                    const wr = ui_mod.wordRange(cur, off);
-                    st.edit.anchor = wr.start;
-                    st.edit.cursor = wr.end;
-                },
-                else => {
-                    s.drag = null;
-                    st.edit.anchor = text_edit.lineStart(cur, off);
-                    st.edit.cursor = text_edit.lineEnd(cur, off);
-                },
+            if (!comp_before) {
+                const cur = st.edit.text();
+                s.drag = id;
+                if (in.mouse_mods.shift) {
+                    st.multi = .{};
+                    st.edit.moveTo(off, true);
+                } else if (st.multi.begin(cur, off, clicks, false)) |rg| {
+                    st.edit.select(rg.start, rg.end);
+                } else st.edit.moveTo(off, false);
             }
+        } else if (opts.context_menu and in.right_pressed and !st.ctx.open and hv.hovered and !popup.pressSwallowed(ui)) {
+            // Right click: focus the area; keep the selection when the click is inside it, else
+            // put the caret there; then open the menu (which hands focus back when it closes).
+            s.focus = id;
+            s.select = null;
+            focused = true;
+            st.blink_origin = in.time;
+            st.want_x = null;
+            const sel = st.edit.selection();
+            if (!comp_before and (!st.edit.hasSelection() or off < sel.start or off > sel.end)) st.edit.moveTo(off, false);
+            _ = ui.contextOpen(&st.ctx, r);
         } else if (ui.pressedNow() and focused) {
             s.focus = null;
             focused = false;
         } else if (s.drag == id) {
-            if (in.down) {
-                st.edit.moveTo(off, true);
+            if (comp_before) {
+                if (!in.down) s.drag = null;
+            } else if (in.down) {
+                if (st.multi.gran != .char) {
+                    const m = st.multi.extend(st.edit.text(), off);
+                    st.edit.select(m.anchor, m.cursor);
+                } else st.edit.moveTo(off, true);
                 dragging = true;
             } else s.drag = null;
         }
+
+        if (opts.context_menu and st.ctx.open) {
+            const caps: text_input.Caps = .{
+                .editable = true,
+                .has_selection = st.edit.hasSelection(),
+                .has_text = st.edit.text().len > 0,
+                .can_undo = st.edit.canUndo(),
+                .can_redo = st.edit.canRedo(),
+            };
+            if (text_input.contextMenu(ui, &st.ctx, caps)) |act| {
+                s.focus = id;
+                focused = true;
+                st.want_x = null;
+                st.edit.now = in.time;
+                st.blink_origin = in.time;
+                if (text_input.applyAction(ui, &st.edit, act, true)) res.changed = true;
+            }
+        }
     }
+
+    const composing = text_input.composingNow(&st.was_focused, &st.ime_block, focused, in.composition.len > 0);
 
     if (focused) {
         const s = ui.state.?;
@@ -333,36 +360,61 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
                     insertClean(st, chunk.slice(), .typing);
                     res.changed = true;
                 },
-                .key => |k| handleKey(ui, st, k.code, k.mods, opts, size, box.w, &res, s, &focused),
+                .key => |k| {
+                    if (composing and text_input.imeOwnsKey(k)) continue;
+                    handleKey(ui, st, k.code, k.mods, opts, size, box.w, &res, s, &focused);
+                },
             }
         }
     }
 
-    // Layout, wheel, and keeping the caret in view.
+    // What is drawn: the text, with the pre-edit spliced in at the caret (replacing the selection).
     const text = st.edit.text();
-    const content_h = @max(lh, ui.measureWrapped(text, size, box.w));
-    const caret = locate(ui, text, size, box.w, st.edit.cursor);
-    const cx = caretX(ui, caret, size, st.edit.cursor);
+    const sel = st.edit.selection();
+    const pre = if (composing and focused) text_input.preedit(&in.composition, false, text_input.roomFor(&st.edit, sel.end - sel.start)) else null;
+    const caret_off = text_edit.snapCluster(text, st.edit.cursor);
+    const d = text_input.display(st.edit.gpa, &st.disp, text, false, pre, if (pre != null) sel else .{ .start = caret_off, .end = caret_off });
+    const dtext = d.text;
+    const dcur = d.caretAt(caret_off);
+
+    // Layout, wheel, and keeping the caret in view.
+    const content_h = @max(lh, ui.measureWrapped(dtext, size, box.w));
+    const caret = locate(ui, dtext, size, box.w, dcur);
+    const cx = caretX(ui, caret, size, dcur);
     const caret_top = @as(f32, @floatFromInt(caret.index)) * lh;
     if (hv.hovered and in.wheel_y != 0 and content_h > box.h) {
         st.scroll_y -= in.wheel_y * t.scroll_step;
         in.wheel_y = 0; // consumed, so an enclosing scroll area doesn't also move
     }
-    if (focused and (dragging or st.edit.cursor != st.seen_cursor or text.len != st.seen_len or st.edit.undo_serial != st.seen_serial)) {
+    if (focused and (dragging or dcur != st.seen_cursor or dtext.len != st.seen_len or st.edit.undo_serial != st.seen_serial)) {
         if (caret_top < st.scroll_y) {
             st.scroll_y = caret_top;
         } else if (caret_top + lh > st.scroll_y + box.h) {
             st.scroll_y = caret_top + lh - box.h;
         }
     }
-    st.seen_cursor = st.edit.cursor;
-    st.seen_len = text.len;
+    st.seen_cursor = dcur;
+    st.seen_len = dtext.len;
     st.seen_serial = st.edit.undo_serial;
     const max_scroll = @max(0, content_h - box.h);
     st.scroll_y = std.math.clamp(st.scroll_y, 0, max_scroll);
 
+    // The caret's line (also what `input_area` reports, for apps that set the text input area
+    // themselves) and, for the input method, a tighter rectangle: under the pre-edit's first line,
+    // or at the caret.
     res.input_area = .{ .x = box.x, .y = box.y - st.scroll_y + caret_top, .w = box.w, .h = lh };
     res.caret_x = cx;
+    if (focused) {
+        const first = if (pre != null) locate(ui, dtext, size, box.w, d.pre_start) else caret;
+        const fx = caretX(ui, first, size, if (pre != null) d.pre_start else dcur);
+        var w: f32 = 1;
+        if (pre != null) {
+            const e = @min(d.preEnd(), first.end);
+            if (e > d.pre_start) w = @max(1, caretX(ui, first, size, e) - fx);
+        }
+        const area: Rect = .{ .x = box.x + fx, .y = box.y - st.scroll_y + @as(f32, @floatFromInt(first.index)) * lh, .w = w, .h = lh };
+        ui.setTextInputArea(area, if (pre != null and caret.index == first.index) @max(0, cx - fx) else 0);
+    }
 
     // Draw.
     if (!opts.bare) {
@@ -370,42 +422,63 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
         ui.list.rrect(r.inset(1.5), 8.5, t.card);
     }
     ui.pushClip(box);
-    if (text.len == 0) {
+    if (dtext.len == 0) {
         if (opts.placeholder.len > 0) _ = ui.labelWrapped(box, opts.placeholder, .{ .size = size, .color = t.dim });
     } else {
-        const sel = st.edit.selection();
-        const show_sel = focused and st.edit.hasSelection();
+        const show_sel = focused and pre == null and st.edit.hasSelection();
+        const sel_s = text_edit.snapCluster(text, sel.start);
+        const sel_e = text_edit.snapCluster(text, sel.end);
         const space_w = ui.measure(" ", size);
         var y = box.y - st.scroll_y;
-        var it = ui.wrapText(text, size, box.w);
+        var it = ui.wrapText(dtext, size, box.w);
         while (it.next()) |line| : (y += lh) {
             if (y + lh < box.y) continue;
             if (y > box.y + box.h) break;
+            const l = lineOf(dtext, line, 0);
             if (show_sel) {
-                const l = lineOf(text, line, 0);
-                const a = @max(sel.start, l.start);
-                const b = @min(sel.end, l.end);
+                const a = @max(sel_s, l.start);
+                const b = @min(sel_e, l.end);
                 var x0 = box.x;
                 var x1 = box.x;
                 var any = true;
                 if (a < b) {
                     x0 = box.x + ui.measure(line[0 .. a - l.start], size);
                     x1 = box.x + ui.measure(line[0 .. b - l.start], size);
-                } else if (sel.start <= l.end and sel.end > l.end) {
+                } else if (sel_s <= l.end and sel_e > l.end) {
                     x0 = box.x + ui.measure(line, size);
                     x1 = x0;
                 } else any = false;
                 if (any) {
                     // The selection runs on past a line break: show the break as a stub.
-                    if (sel.end > l.end and l.end < text.len and sel.start <= l.end and (text[l.end] == '\n' or text[l.end] == '\r' or text[l.end] == ' ')) x1 += space_w;
+                    if (sel_e > l.end and l.end < dtext.len and sel_s <= l.end and (dtext[l.end] == '\n' or dtext[l.end] == '\r' or dtext[l.end] == ' ')) x1 += space_w;
                     x1 = @min(x1, box.x + box.w);
                     if (x1 > x0) ui.list.rect(.{ .x = x0, .y = y, .w = x1 - x0, .h = lh }, t.selection);
                 }
             }
             if (line.len > 0) ui.list.text(box.x, y, size, t.text, .left, line);
+            if (pre) |p| {
+                // The pre-edit's part of this line: underline, and the highlighted clause.
+                const a = @max(d.pre_start, l.start);
+                const b = @min(d.preEnd(), l.end);
+                if (a < b) {
+                    const x0 = box.x + ui.measure(line[0 .. a - l.start], size);
+                    const x1 = box.x + ui.measure(line[0 .. b - l.start], size);
+                    var clause: ?text_input.ClauseX = null;
+                    if (p.clause) |c| {
+                        const ca = @max(d.pre_start + c.start, a);
+                        const cb = @min(d.pre_start + c.end, b);
+                        if (ca < cb) clause = .{
+                            .x0 = box.x + ui.measure(line[0 .. ca - l.start], size),
+                            .x1 = box.x + ui.measure(line[0 .. cb - l.start], size),
+                        };
+                    }
+                    text_input.drawPreeditMarks(ui, x0, x1, y, lh, clause);
+                }
+            }
         }
     }
-    if (focused and @mod(in.time - st.blink_origin, 1.06) < 0.53) {
+    const show_caret = focused and (pre == null or pre.?.clause == null);
+    if (show_caret and @mod(in.time - st.blink_origin, 1.06) < 0.53) {
         ui.list.rect(.{ .x = box.x + cx, .y = box.y - st.scroll_y + caret_top, .w = 1.5, .h = lh }, t.text);
     }
     ui.popClip();
@@ -697,7 +770,7 @@ test "textArea: double click selects the word, triple click the hard line" {
     try st.edit.setText("hello world\nxy");
     _ = areaFrame(&list, &state, .{ .mouse_x = 30, .mouse_y = 20, .pressed = true, .down = true, .mouse_clicks = 2 }, &st, test_rect, test_opts);
     try std.testing.expectEqualStrings("world", st.edit.selectedText());
-    try std.testing.expect(state.drag == null);
+    try std.testing.expect(state.drag != null); // dragging now grows by words
     _ = areaFrame(&list, &state, .{ .mouse_x = 30, .mouse_y = 20, .pressed = true, .down = true, .mouse_clicks = 3 }, &st, test_rect, test_opts);
     try std.testing.expectEqualStrings("hello world", st.edit.selectedText());
 }

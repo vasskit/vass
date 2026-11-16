@@ -78,6 +78,9 @@ pub const Delta = struct {
     before: Sel,
     after: Sel,
     kind: Kind,
+    /// The inserted text continues the grapheme cluster before it (a combining mark, a ZWJ
+    /// sequence), so a typing run is never cut there: no pause ends the run.
+    joins: bool = false,
 };
 
 pub const History = struct {
@@ -134,7 +137,7 @@ pub const History = struct {
     /// Whether `d` continues the newest entry `top`.
     fn continues(h: *const History, top: Entry, d: Delta, now: f64) bool {
         if (!h.open or !d.kind.mergeable() or d.kind != top.kind) return false;
-        if (@abs(now - top.time) > h.limits.pause) return false;
+        if (@abs(now - top.time) > h.limits.pause and !d.joins) return false;
         if (top.data.len + d.removed.len + d.inserted.len > h.limits.max_group_bytes) return false;
         // The caret must be exactly where the run left it.
         if (d.before.cursor != top.after.cursor or d.before.anchor != top.after.anchor) return false;

@@ -297,7 +297,6 @@ const Live = struct {
         }
         ui.state = &l.app.state;
         try frame(l.app, &ui, l.lay);
-        if (l.app.state.focus != null) l.win.setTextInputArea(l.lay.field, 0);
         l.win.render(l.list, l.theme.bg);
     }
 

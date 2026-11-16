@@ -1,11 +1,16 @@
 //! A pure text editing core: a UTF-8 buffer with a cursor and a selection.
 //! No rendering and no platform calls, so everything here is unit-tested.
 //!
-//! `cursor` and `anchor` are byte offsets that always sit on UTF-8 character
-//! (code point) boundaries. The selection is the range between them; with
-//! `anchor == cursor` there is none. Movement is per code point, so a
-//! combining sequence or a ZWJ emoji takes several presses (no grapheme
-//! clusters yet).
+//! `cursor` and `anchor` are byte offsets that sit on extended grapheme cluster
+//! boundaries (`grapheme.zig`, UAX #29), which are also UTF-8 code point
+//! boundaries. The selection is the range between them; with `anchor == cursor`
+//! there is none. Movement and deletion are per cluster, so a base letter with
+//! its combining marks, an emoji ZWJ sequence, a flag or a Hangul syllable moves
+//! and deletes as one character. Backspace removes the whole cluster before the
+//! caret (macOS can peel the last code point off a decomposed sequence; this does
+//! not). A caret can only end up inside a cluster when text is inserted in front
+//! of a combining mark by other means than the keyboard; it is then drawn at the
+//! cluster's start and the next movement leaves the cluster.
 //!
 //! Clipboard access stays outside: `copy`/`cut` return the text for the caller
 //! to put on the clipboard, and `insert` takes what the caller pasted.
@@ -18,6 +23,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const keys = @import("keys.zig");
 const undo_mod = @import("undo.zig");
+const grapheme = @import("grapheme.zig");
 
 pub const History = undo_mod.History;
 pub const EditKind = undo_mod.Kind;
@@ -208,11 +214,18 @@ pub const TextEdit = struct {
     }
 
     /// Moves the cursor to byte offset `pos` (clamped, and moved back to the
-    /// start of its character). With `extend` the anchor stays, growing the selection.
+    /// start of its grapheme cluster). With `extend` the anchor stays, growing the selection.
     pub fn moveTo(e: *TextEdit, pos: usize, extend: bool) void {
         e.history.breakGroup();
-        e.cursor = snap(e.buf.items, pos);
+        e.cursor = snapCluster(e.buf.items, pos);
         if (!extend) e.anchor = e.cursor;
+    }
+
+    /// Selects from `anchor` to `cursor` (byte offsets, moved back to cluster starts).
+    pub fn select(e: *TextEdit, anchor: usize, cursor: usize) void {
+        e.history.breakGroup();
+        e.anchor = snapCluster(e.buf.items, anchor);
+        e.cursor = snapCluster(e.buf.items, cursor);
     }
 
     /// Moves the cursor. Without `extend`, an existing selection collapses to
@@ -252,6 +265,7 @@ pub const TextEdit = struct {
         const before = e.sel();
         const start = e.selection().start;
         const had_selection = e.hasSelection();
+        var truncated = false;
         // The selection is about to be overwritten: keep a copy for the history.
         var removed: []u8 = &.{};
         var lost = false;
@@ -276,10 +290,29 @@ pub const TextEdit = struct {
                     .before = before,
                     .after = .{ .cursor = e.cursor, .anchor = e.cursor },
                     .kind = k,
+                    .joins = start > 0 and !had_selection and inserted.len > 0 and !grapheme.isBoundary(e.buf.items, start),
                 }, e.now);
             }
         }
         defer e.anchor = e.cursor;
+        // Cut short by `max_len`: never leave half a cluster (a ZWJ sequence, a flag) behind. The
+        // piece that did not fit decides: if it would have joined the last cluster, that cluster
+        // goes too.
+        var cut_piece: []const u8 = "";
+        defer if (truncated) {
+            const gpa = e.gpa;
+            const at = e.cursor;
+            if (e.buf.insertSlice(gpa, at, cut_piece)) {
+                var p = at;
+                while (p > start and !grapheme.isBoundary(e.buf.items, p)) p = grapheme.prevBoundary(e.buf.items, p);
+                p = @max(p, start);
+                e.buf.replaceRangeAssumeCapacity(at, cut_piece.len, &.{});
+                if (p < at) {
+                    e.buf.replaceRangeAssumeCapacity(p, at - p, &.{});
+                    e.cursor = p;
+                }
+            } else |_| {}
+        };
         e.deleteRangeRaw(e.selection().start, e.selection().end);
         var i: usize = 0;
         while (i < str.len) {
@@ -294,7 +327,11 @@ pub const TextEdit = struct {
             const piece = str[i .. i + n];
             i += n;
             if (!e.multiline and (piece[0] == '\n' or piece[0] == '\r')) continue;
-            if (e.buf.items.len + n > e.max_len) break;
+            if (e.buf.items.len + n > e.max_len) {
+                truncated = true;
+                cut_piece = piece;
+                break;
+            }
             try e.buf.insertSlice(e.gpa, e.cursor, piece);
             e.cursor += n;
         }
@@ -450,19 +487,20 @@ pub fn snap(s: []const u8, pos: usize) usize {
     return p;
 }
 
-pub fn prevBoundary(s: []const u8, pos: usize) usize {
-    var p = @min(pos, s.len);
-    if (p == 0) return 0;
-    p -= 1;
-    while (p > 0 and isContinuation(s[p])) p -= 1;
-    return p;
+/// Moves `pos` back to the start of the grapheme cluster it is inside (clamped to the length).
+/// `snap` does the same for code points only.
+pub fn snapCluster(s: []const u8, pos: usize) usize {
+    return grapheme.snapDown(s, pos);
 }
 
+/// The previous grapheme cluster boundary before `pos` (0 at the start).
+pub fn prevBoundary(s: []const u8, pos: usize) usize {
+    return grapheme.prevBoundary(s, pos);
+}
+
+/// The next grapheme cluster boundary after `pos` (the length at the end).
 pub fn nextBoundary(s: []const u8, pos: usize) usize {
-    if (pos >= s.len) return s.len;
-    var p = pos + 1;
-    while (p < s.len and isContinuation(s[p])) p += 1;
-    return p;
+    return grapheme.nextBoundary(s, pos);
 }
 
 /// Word characters: ASCII letters and digits, '_', and anything non-ASCII.
@@ -470,21 +508,105 @@ fn isWordByte(b: u8) bool {
     return std.ascii.isAlphanumeric(b) or b == '_' or b >= 0x80;
 }
 
-/// Start of the word at or before `pos` (skipping separators first).
+/// Start of the word at or before `pos` (skipping separators first). Steps by cluster, so it
+/// never stops inside one (a combining mark after a space stays with its base).
 pub fn wordStart(s: []const u8, pos: usize) usize {
-    var p = @min(pos, s.len);
-    while (p > 0 and !isWordByte(s[p - 1])) p -= 1;
-    while (p > 0 and isWordByte(s[p - 1])) p -= 1;
+    var p = snapCluster(s, pos);
+    while (p > 0) {
+        const q = prevBoundary(s, p);
+        if (isWordByte(s[q])) break;
+        p = q;
+    }
+    while (p > 0) {
+        const q = prevBoundary(s, p);
+        if (!isWordByte(s[q])) break;
+        p = q;
+    }
     return p;
 }
 
 /// End of the word at or after `pos` (skipping separators first).
 pub fn wordEnd(s: []const u8, pos: usize) usize {
-    var p = @min(pos, s.len);
-    while (p < s.len and !isWordByte(s[p])) p += 1;
-    while (p < s.len and isWordByte(s[p])) p += 1;
+    var p = snapCluster(s, pos);
+    while (p < s.len and !isWordByte(s[p])) p = nextBoundary(s, p);
+    while (p < s.len and isWordByte(s[p])) p = nextBoundary(s, p);
     return p;
 }
+
+fn byteClass(b: u8) u8 {
+    if (b == '\n' or b == '\r') return 3;
+    if (b == ' ' or b == '\t') return 1;
+    if (isWordByte(b)) return 0;
+    return 2;
+}
+
+/// Start and end of the "word" at caret position `pos`: the run of same-class
+/// clusters (word characters, blanks, other punctuation) around it. Newlines
+/// are never included. The ends are cluster boundaries.
+pub fn wordRange(str: []const u8, pos: usize) TextEdit.Range {
+    if (str.len == 0) return .{ .start = 0, .end = 0 };
+    var p = snapCluster(str, pos);
+    if (p >= str.len) p = prevBoundary(str, str.len);
+    const cls = byteClass(str[p]);
+    var s = p;
+    while (s > 0) {
+        const q = prevBoundary(str, s);
+        if (byteClass(str[q]) != cls) break;
+        s = q;
+    }
+    var e = nextBoundary(str, p);
+    while (e < str.len and byteClass(str[e]) == cls) e = nextBoundary(str, e);
+    return .{ .start = s, .end = e };
+}
+
+/// The unit a mouse selection grows by.
+pub const Granularity = enum { char, word, line };
+
+/// Mouse selection by click count, shared by every text widget: a double click selects the word,
+/// a triple click the line (between newlines; a single-line field has one), and dragging after
+/// either grows the selection by whole words or lines, like macOS. Keep one next to the
+/// widget's selection (`begin` on the press, `extend` while the button is held).
+pub const MultiClick = struct {
+    gran: Granularity = .char,
+    /// The word or line that was selected by the click.
+    start: usize = 0,
+    end: usize = 0,
+
+    pub const Sel = struct { anchor: usize, cursor: usize };
+
+    /// A press at byte offset `off` with click number `clicks` (0 and 1 are single). For a double
+    /// or triple click returns the range to select; null for a single click (the caller places
+    /// the caret). With `all` the double click selects everything too (password fields).
+    pub fn begin(m: *MultiClick, str: []const u8, off: usize, clicks: u8, all: bool) ?TextEdit.Range {
+        if (clicks < 2) {
+            m.* = .{};
+            return null;
+        }
+        const r: TextEdit.Range = if (all)
+            .{ .start = 0, .end = str.len }
+        else if (clicks == 2)
+            wordRange(str, off)
+        else
+            .{ .start = lineStart(str, off), .end = lineEnd(str, off) };
+        // With `all` there is nothing to grow (a drag keeps everything selected).
+        m.* = .{ .gran = if (all) .char else if (clicks > 2) .line else .word, .start = r.start, .end = r.end };
+        return r;
+    }
+
+    /// The selection while the pointer is at byte offset `off` after a `begin`: the clicked
+    /// word or line joined with the word or line under the pointer.
+    pub fn extend(m: MultiClick, str: []const u8, off: usize) Sel {
+        const unit: TextEdit.Range = switch (m.gran) {
+            .char => .{ .start = off, .end = off },
+            .word => wordRange(str, off),
+            .line => .{ .start = lineStart(str, off), .end = lineEnd(str, off) },
+        };
+        if (m.gran == .char) return .{ .anchor = m.start, .cursor = m.end };
+        if (off < m.start) return .{ .anchor = m.end, .cursor = unit.start };
+        if (off > m.end) return .{ .anchor = m.start, .cursor = unit.end };
+        return .{ .anchor = m.start, .cursor = m.end };
+    }
+};
 
 /// Start of the line (after the previous '\n') that contains `pos`.
 pub fn lineStart(s: []const u8, pos: usize) usize {
@@ -563,6 +685,53 @@ test "multi-byte characters move and delete whole" {
     defer f.deinit();
     try t.expect(f.backspace(.char));
     try expectText(&f, "x", 1, 1);
+}
+
+test "grapheme clusters move, select and delete as one character" {
+    const family = "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    var e = try fresh("e\u{301}" ++ family ++ "\u{1F1F3}\u{1F1EC}!");
+    defer e.deinit();
+    e.moveTo(0, false);
+    e.move(.right, false);
+    try t.expectEqual(@as(usize, 3), e.cursor);
+    e.move(.right, true);
+    try t.expectEqualStrings(family, e.selectedText());
+    e.moveTo(4, false); // inside the family: back to the start of its cluster
+    try t.expectEqual(@as(usize, 3), e.cursor);
+    e.moveTo(e.text().len, false);
+    e.move(.left, false);
+    try t.expect(e.backspace(.char)); // the flag
+    try t.expect(e.backspace(.char)); // the family
+    try t.expectEqualStrings("e\u{301}!", e.text());
+    e.moveTo(0, false);
+    try t.expect(e.delete(.char));
+    try t.expectEqualStrings("!", e.text());
+}
+
+test "MultiClick: word and line units, growing in both directions" {
+    const s = "one two three\nfour";
+    var m: MultiClick = .{};
+    try t.expect(m.begin(s, 5, 1, false) == null);
+    const w = m.begin(s, 5, 2, false).?;
+    try t.expectEqual(@as(usize, 4), w.start);
+    try t.expectEqual(@as(usize, 7), w.end);
+    var x = m.extend(s, 9);
+    try t.expectEqual(@as(usize, 4), x.anchor);
+    try t.expectEqual(@as(usize, 13), x.cursor);
+    x = m.extend(s, 0);
+    try t.expectEqual(@as(usize, 7), x.anchor);
+    try t.expectEqual(@as(usize, 0), x.cursor);
+    x = m.extend(s, 5); // back inside the clicked word: just the word
+    try t.expectEqual(@as(usize, 4), x.anchor);
+    try t.expectEqual(@as(usize, 7), x.cursor);
+    const l = m.begin(s, 5, 3, false).?;
+    try t.expectEqual(@as(usize, 0), l.start);
+    try t.expectEqual(@as(usize, 13), l.end);
+    x = m.extend(s, 16);
+    try t.expectEqual(@as(usize, 0), x.anchor);
+    try t.expectEqual(@as(usize, 18), x.cursor);
+    const all = m.begin(s, 5, 2, true).?;
+    try t.expectEqual(s.len, all.end);
 }
 
 test "moveTo snaps into the middle of a character back to its start" {

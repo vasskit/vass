@@ -12,6 +12,8 @@ pub const focus = @import("focus.zig");
 pub const split = @import("split.zig");
 pub const keys = @import("keys.zig");
 pub const text_edit = @import("text_edit.zig");
+pub const grapheme = @import("grapheme.zig");
+pub const emoji = @import("emoji.zig");
 pub const png = @import("png.zig");
 pub const image = @import("image.zig");
 pub const decode = @import("decode.zig");
@@ -52,6 +54,9 @@ pub const TextEdit = text_edit.TextEdit;
 
 test {
     _ = text_edit;
+    _ = grapheme;
+    _ = emoji;
+    _ = @import("text_compose.zig");
     _ = ui;
     _ = @import("controls.zig");
     _ = @import("text_area.zig");
@@ -59,6 +64,7 @@ test {
     _ = focus;
     _ = split;
     _ = @import("focus_test.zig");
+    _ = @import("text_input_test.zig");
     _ = icons;
     _ = svg;
     _ = raster;

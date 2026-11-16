@@ -5,9 +5,15 @@
 //!     zig build controls                      run it
 //!     zig build controls -- --snapshot DIR    draw a few frames, save DIR/controls.bmp, then
 //!                                             DIR/controls-focus.bmp (nine Tab presses: the
-//!                                             focus ring on the second segmented control), exit
-//!                                             (in controls.bmp the first text area is focused
-//!                                             with a selection across lines)
+//!                                             focus ring on the second segmented control), then
+//!                                             a scripted run through the text input group:
+//!                                             DIR/controls-text-word.bmp (a word selected by a
+//!                                             double click), controls-text-composition.bmp (an
+//!                                             input-method pre-edit, fed synthetically),
+//!                                             controls-text-menu.bmp (the right-click menu) and
+//!                                             controls-text-password.bmp (a password field with
+//!                                             a selection); exit (in controls.bmp the first
+//!                                             text area is focused with a selection across lines)
 //!
 //! Keyboard: Tab / Shift+Tab move between all controls; Space / Enter toggle checkboxes and
 //! switches and select radios; Left / Right (Home / End) change a focused segmented control;
@@ -20,7 +26,7 @@ const Ui = vass.Ui;
 const ui_mod = vass.ui;
 
 const win_w = 560;
-const win_h = 800;
+const win_h = 886;
 const margin: f32 = 24;
 const row_h: f32 = 26;
 
@@ -48,11 +54,21 @@ const App = struct {
     composer: ui_mod.TextAreaState,
     empty: ui_mod.TextAreaState,
     sent: usize = 0,
+    /// The "Text input" group: a password field and a field holding combining marks and emoji.
+    pw: ui_mod.TextFieldState,
+    marks: ui_mod.TextFieldState,
+    /// Where those two were drawn this frame, for the scripted snapshots to aim at.
+    pw_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    marks_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// Where the "Text input" group ends this frame (below the field and the emoji samples).
+    input_bottom: f32 = 0,
 
     fn deinit(app: *App) void {
         app.notes.deinit();
         app.composer.deinit();
         app.empty.deinit();
+        app.pw.deinit();
+        app.marks.deinit();
     }
 };
 
@@ -69,6 +85,7 @@ fn smallButton(ui: *Ui, r: Rect, label: []const u8, enabled: bool) bool {
 }
 
 fn frame(app: *App, ui: *Ui, win: ?*vass.platform.Window) void {
+    _ = win; // the text widgets tell the input method where the caret is themselves
     const t = ui.theme;
     const col_w = (win_w - 3 * margin) / 2;
     const left = margin;
@@ -133,8 +150,34 @@ fn frame(app: *App, ui: *Ui, win: ?*vass.platform.Window) void {
     const empty_r: Rect = .{ .x = right, .y = ry, .w = col_w, .h = 64 };
     _ = ui.textArea(empty_r, &app.empty, .{ .placeholder = "Write something\u{2026}" });
 
+    // Text input: a password field (bullets, no copy or cut, double click selects all) and a
+    // field with a combining accent, a family emoji and a flag, which move, select and delete as
+    // one character each. Right click for the context menu; the input method's pre-edit is
+    // drawn inline.
+    var gy = ry + 64 + 22;
+    heading(ui, right, gy, "TEXT INPUT");
+    gy += 22;
+    app.pw_rect = .{ .x = right, .y = gy, .w = col_w, .h = 32 };
+    _ = ui.textField(app.pw_rect, &app.pw, .{ .placeholder = "Password", .password = true, .size = 13 });
+    gy += 40;
+    app.marks_rect = .{ .x = right, .y = gy, .w = col_w, .h = 32 };
+    _ = ui.textField(app.marks_rect, &app.marks, .{ .placeholder = "Combining marks and emoji", .size = 13 });
+    gy += 32 + 10;
+
+    // Emoji are drawn in colour from the system emoji font, one glyph per sequence: a flag, a
+    // ZWJ family, a skin tone, a keycap, a heart with U+FE0F, then inside a sentence, then CJK
+    // from the fallback fonts.
+    const label_opts: ui_mod.LabelOpts = .{ .size = 13 };
+    ui.labelAt(right, gy, "\u{1F1F3}\u{1F1EC}  \u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}  \u{1F44D}\u{1F3FD}  1\u{FE0F}\u{20E3}  \u{2764}\u{FE0F}", label_opts);
+    gy += 22;
+    ui.labelAt(right, gy, "Shipped \u{1F680} on time, caf\u{E9} \u{2615} after!", label_opts);
+    gy += 22;
+    ui.labelAt(right, gy, "\u{4F60}\u{597D}  \u{3053}\u{3093}\u{306B}\u{3061}\u{306F}  \u{D55C}\u{AD6D}\u{C5B4}", label_opts);
+    gy += 18;
+    app.input_bottom = gy;
+
     // Full width below the columns: the text area with content, the composer.
-    var by = @max(ly + row_h, ry + 64) + 28;
+    var by = @max(ly + row_h, @max(ry + 64, app.input_bottom)) + 28;
     heading(ui, margin, by, "TEXT AREA, SCROLLING (FIXED 112 HIGH)");
     // Undo / Redo for the text area, level with its heading: dim while there is nothing to do.
     const btn_w: f32 = 52;
@@ -149,8 +192,7 @@ fn frame(app: *App, ui: *Ui, win: ?*vass.platform.Window) void {
     }
     by += 22;
     const area_r: Rect = .{ .x = margin, .y = by, .w = win_w - 2 * margin, .h = 112 };
-    const res = ui.textArea(area_r, &app.notes, .{ .size = 13 });
-    if (win) |w| if (app.state.focus == @as(?*const anyopaque, &app.notes)) w.setTextInputArea(res.input_area, res.caret_x);
+    _ = ui.textArea(area_r, &app.notes, .{ .size = 13 });
     by += 112 + 22;
 
     heading(ui, margin, by, "AUTO-GROWING, RETURN SENDS (1 TO 4 LINES)");
@@ -159,7 +201,6 @@ fn frame(app: *App, ui: *Ui, win: ?*vass.platform.Window) void {
     const comp_h = ui.measureTextArea(&app.composer, win_w - 2 * margin, opts);
     const comp_r: Rect = .{ .x = margin, .y = by, .w = win_w - 2 * margin, .h = comp_h };
     const cres = ui.textArea(comp_r, &app.composer, opts);
-    if (win) |w| if (app.state.focus == @as(?*const anyopaque, &app.composer)) w.setTextInputArea(cres.input_area, cres.caret_x);
     if (cres.submitted and app.composer.edit.text().len > 0) {
         app.sent += 1;
         app.composer.clear();
@@ -185,8 +226,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var app: App = .{ .notes = ui_mod.TextAreaState.init(gpa), .composer = ui_mod.TextAreaState.init(gpa), .empty = ui_mod.TextAreaState.init(gpa) };
+    var app: App = .{
+        .notes = ui_mod.TextAreaState.init(gpa),
+        .composer = ui_mod.TextAreaState.init(gpa),
+        .empty = ui_mod.TextAreaState.init(gpa),
+        .pw = ui_mod.TextFieldState.init(gpa),
+        .marks = ui_mod.TextFieldState.init(gpa),
+    };
     defer app.deinit();
+    try app.marks.edit.setText("cafe\u{301} \u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{1F1F3}\u{1F1EC}");
     try app.notes.edit.setText(sample);
     try app.composer.edit.setText("First line\nSecond line");
 
@@ -228,11 +276,84 @@ pub fn main(init: std.process.Init) !void {
         const snap_focus = if (snapshot_dir) |dir| n == 7 and dir.len > 0 else false;
         if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/controls.bmp", .{snapshot_dir.?}, 0);
         if (snap_focus) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/controls-focus.bmp", .{snapshot_dir.?}, 0);
+        if (snapshot_dir != null and n >= 8) {
+            if (script(&app, &win, &input, snapshot_dir.?, arena, n)) running = false;
+        }
         live.draw(input);
-        if (snap_focus) running = false;
         input.endFrame();
         vass.platform.sleepMs(16);
     }
+}
+
+/// An input-method composition, as the backend would deliver it (`start` and `length` count
+/// code points; -1 means not set).
+fn composition(str: []const u8, start: i32, length: i32) vass.platform.Composition {
+    var c: vass.platform.Composition = .{};
+    @memcpy(c.buf[0..str.len], str);
+    c.len = @intCast(str.len);
+    c.start = start;
+    c.length = length;
+    return c;
+}
+
+fn press(input: *ui_mod.Input, r: Rect, dx: f32, clicks: u8) void {
+    input.mouse_x = r.x + dx;
+    input.mouse_y = r.y + r.h / 2;
+    input.pressed = true;
+    input.down = true;
+    input.mouse_clicks = clicks;
+}
+
+fn release(input: *ui_mod.Input) void {
+    input.down = false;
+    input.released = true;
+}
+
+/// The scripted part of the snapshot run (frame `n` >= 8): synthetic mouse, keys and input-method
+/// events against the text input group. Returns true after the last snapshot. Nothing here needs
+/// a real input method: the composition is injected into `Input` the way `Input.feed` would.
+fn script(app: *App, win: *vass.platform.Window, input: *ui_mod.Input, dir: []const u8, arena: std.mem.Allocator, n: u32) bool {
+    const snap = struct {
+        fn at(w: *vass.platform.Window, a: std.mem.Allocator, d: []const u8, name: []const u8) void {
+            w.snapshot_path = std.fmt.allocPrintSentinel(a, "{s}/controls-text-{s}.bmp", .{ d, name }, 0) catch null;
+        }
+    }.at;
+    switch (n) {
+        // A double click on "cafe\u{301}": the word is selected, accent and all, as one letter.
+        8 => press(input, app.marks_rect, 24, 2),
+        9 => {
+            release(input);
+            snap(win, arena, dir, "word");
+        },
+        // The input method starts composing after the word: "ni hao" with the first syllable
+        // (the part being converted) highlighted.
+        10 => app.marks.edit.moveTo(std.mem.indexOf(u8, app.marks.edit.text(), " ").? + 1, false),
+        11 => input.composition = composition("ni hao", 0, 2),
+        12 => snap(win, arena, dir, "composition"),
+        // Cancelled; then a right click on the field opens the context menu.
+        13 => {
+            input.composition = .{};
+            input.mouse_x = app.marks_rect.x + 30;
+            input.mouse_y = app.marks_rect.y + 16;
+            input.right_pressed = true;
+        },
+        14 => snap(win, arena, dir, "menu"),
+        15 => input.pushKey(vass.keys.escape, .{}),
+        // The password field: type, then select the last two characters with Shift+Left.
+        16 => press(input, app.pw_rect, 40, 1),
+        17 => {
+            release(input);
+            input.pushText("hunter2!");
+        },
+        18 => {
+            input.pushKey(vass.keys.left, .{ .shift = true });
+            input.pushKey(vass.keys.left, .{ .shift = true });
+        },
+        19 => snap(win, arena, dir, "password"),
+        20 => return true,
+        else => {},
+    }
+    return false;
 }
 
 /// Draws one frame. The main loop and the window's resize callback both call it, so the
