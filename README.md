@@ -1,7 +1,7 @@
 # Vass
 
 A GUI toolkit for Zig, built app-first: features are added when an app needs them.
-This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
+This is the first vertical slice, driven by [Claude Buddy](../apps/ClaudeBuddy).
 
 ## Layout
 
