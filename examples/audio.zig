@@ -32,7 +32,6 @@ const App = struct {
     gpa: std.mem.Allocator,
     /// A snapshot run: the silent dummy driver and synthetic data.
     snapshot: bool,
-    state: ui_mod.State = .{},
     audio: audio_mod.Audio = undefined, // created in `setup`
     icons: struct { mic: vass.SvgIcon = .none, play: vass.SvgIcon = .none, pause: vass.SvgIcon = .none, stop: vass.SvgIcon = .none } = .{},
     notes: [4]Sound = @splat(.none),

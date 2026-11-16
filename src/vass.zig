@@ -7,7 +7,8 @@
 //! The source tree is grouped by the package each folder would become: `core/` (geometry, display
 //! list, keys, image handles, PNG writer), `platform/` (SDL3 backend, macOS extras), `text/`
 //! (grapheme/emoji tables, editing core, undo, emoji compositing), `layout/`, `image/` (decoders,
-//! SVG, rasteriser, texture cache policy), `audio/` and `ui/` (the immediate-mode widgets).
+//! SVG, rasteriser, texture cache policy), `audio/`, `ui/` (the immediate-mode widgets) and `app/`
+//! (the application loop over `platform` and `ui`).
 //! The tests of every file are pulled in by the `test` block at the end of this file.
 pub const geom = @import("core/geom.zig");
 pub const layout = @import("layout/layout.zig");
@@ -31,6 +32,8 @@ pub const audio = @import("audio/audio.zig");
 pub const platform = @import("platform/backend_sdl.zig");
 /// macOS-only extras: menu-bar item, overlay window behaviour, notch metrics.
 pub const macos = @import("platform/macos.zig");
+/// The application loop: windows, events, frames, redraw policy, scripted runs.
+pub const app = @import("app/app.zig");
 
 pub const Rect = geom.Rect;
 pub const Color = geom.Color;
@@ -57,6 +60,11 @@ pub const SplitterOpts = split.SplitterOpts;
 pub const SplitterResult = split.SplitterResult;
 pub const SplitState = split.SplitState;
 pub const TextEdit = text_edit.TextEdit;
+/// Runs a program in one window: `vass.run(App, &state, .{ .window = ... })`; see `vass.app`.
+pub const run = app.run;
+pub const Runner = app.Runner;
+pub const AppContext = app.Context;
+pub const AppConfig = app.Config;
 
 test {
     _ = text_edit;
@@ -84,4 +92,5 @@ test {
     _ = @import("audio/audio_pcm.zig");
     _ = @import("audio/audio_mixer.zig");
     _ = platform;
+    _ = app;
 }

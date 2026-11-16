@@ -67,7 +67,6 @@ const colour_svg =
 ;
 
 const App = struct {
-    state: ui_mod.State = .{},
     lucide: [lucide.len]SvgIcon = @splat(.none),
     phosphor: [phosphor.len]SvgIcon = @splat(.none),
     colour: SvgIcon = .none,

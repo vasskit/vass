@@ -37,7 +37,6 @@ const sample =
     "Up and Down move across visual lines, Cmd+Up and Cmd+Down jump to the ends, and the wheel scrolls once the text is taller than the box.";
 
 const App = struct {
-    state: ui_mod.State = .{},
     check_a: bool = true,
     check_b: bool = false,
     check_c: bool = true,
@@ -86,7 +85,6 @@ fn smallButton(ui: *Ui, r: Rect, label: []const u8, enabled: bool) bool {
 }
 
 pub fn frame(app: *App, ui: *Ui) void {
-    defer ui.finish();
     const t = ui.theme;
     const col_w = (win_w - 3 * margin) / 2;
     const left = margin;
@@ -185,11 +183,11 @@ pub fn frame(app: *App, ui: *Ui) void {
     const btn_y = by - 4;
     if (smallButton(ui, .{ .x = win_w - margin - 2 * btn_w - 6, .y = btn_y, .w = btn_w, .h = 22 }, "Undo", app.notes.canUndo())) {
         _ = app.notes.undo();
-        app.state.focusOn(&app.notes);
+        ui.state.?.focusOn(&app.notes);
     }
     if (smallButton(ui, .{ .x = win_w - margin - btn_w, .y = btn_y, .w = btn_w, .h = 22 }, "Redo", app.notes.canRedo())) {
         _ = app.notes.redo();
-        app.state.focusOn(&app.notes);
+        ui.state.?.focusOn(&app.notes);
     }
     by += 22;
     const area_r: Rect = .{ .x = margin, .y = by, .w = win_w - 2 * margin, .h = 112 };
@@ -231,7 +229,6 @@ pub fn main(init: std.process.Init) !void {
         const text = app.notes.edit.text();
         app.notes.edit.anchor = std.mem.indexOf(u8, text, "wraps").?;
         app.notes.edit.cursor = std.mem.indexOf(u8, text, "Cmd+Up").?;
-        app.state.focusOn(&app.notes);
     }
 
     try harness.run(@This(), env, .{
@@ -245,8 +242,9 @@ pub fn step(app: *App, s: *harness.Step) !void {
     if (!s.env.cli.snapshot()) return;
     // Second snapshot: no focus, then nine Tabs through the controls in call order
     // (two checkboxes, two switches, three radios, two segmented controls).
+    if (s.n == 0) s.state.focusOn(&app.notes); // the text area starts focused, with its selection
     if (s.n == 4) {
-        app.state.blur();
+        s.state.blur();
         for (0..9) |_| s.input.pushKey(vass.keys.tab, .{});
     }
     if (s.n == 3) try s.save("controls", .{});

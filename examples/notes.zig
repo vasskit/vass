@@ -52,7 +52,6 @@ const App = struct {
     notes: std.ArrayList(*Note) = .empty,
     field: ui_mod.TextFieldState,
     scroll: ui_mod.ScrollState = .{ .key_scroll = true },
-    state: ui_mod.State = .{},
 
     fn deinit(app: *App) void {
         for (app.notes.items) |n| {
@@ -243,7 +242,7 @@ pub fn event(app: *App, s: *harness.Step, ev: vass.platform.Event) void {
     switch (ev) {
         .mouse_down => |m| std.debug.print("down b={d} x={d:.0} y={d:.0} win={d}/{d}\n", .{ m.button, m.x, m.y, m.window, s.win.id() }),
         .mouse_up => |m| std.debug.print("up b={d} x={d:.0}\n", .{ m.button, m.x }),
-        .mouse_move => |m| std.debug.print("move x={d:.0} y={d:.0} down={} cur={d} anc={d} drag={}\n", .{ m.x, m.y, s.input.down, app.field.edit.cursor, app.field.edit.anchor, app.state.drag != null }),
+        .mouse_move => |m| std.debug.print("move x={d:.0} y={d:.0} down={} cur={d} anc={d} drag={}\n", .{ m.x, m.y, s.input.down, app.field.edit.cursor, app.field.edit.anchor, s.state.drag != null }),
         else => {},
     }
 }

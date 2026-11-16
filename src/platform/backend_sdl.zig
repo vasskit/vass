@@ -43,6 +43,7 @@ const c = struct {
     const WINDOW_NOT_FOCUSABLE: u64 = 0x80000000;
     const EVENT_WINDOW_CLOSE_REQUESTED: u32 = 0x210;
     const EVENT_QUIT: u32 = 0x100;
+    const EVENT_USER: u32 = 0x8000;
     const EVENT_KEY_DOWN: u32 = 0x300;
     const EVENT_KEY_UP: u32 = 0x301;
     const EVENT_TEXT_EDITING: u32 = 0x302;
@@ -136,6 +137,8 @@ const c = struct {
     extern fn SDL_HideWindow(w: *SdlWindow) bool;
     extern fn SDL_RaiseWindow(w: *SdlWindow) bool;
     extern fn SDL_PollEvent(e: *SdlEvent) bool;
+    extern fn SDL_WaitEvent(e: *SdlEvent) bool;
+    extern fn SDL_WaitEventTimeout(e: *SdlEvent, timeout_ms: i32) bool;
     extern fn SDL_StartTextInput(w: *SdlWindow) bool;
     extern fn SDL_StopTextInput(w: *SdlWindow) bool;
     extern fn SDL_SetTextInputArea(w: *SdlWindow, rect: ?*const SdlRect, cursor: c_int) bool;
@@ -188,6 +191,17 @@ pub const TextChunk = struct {
         return t;
     }
 };
+
+/// Where the `TextChunk` that starts at `str[start]` ends: after at most `TextChunk.buf.len`
+/// bytes, on a character boundary (unless one character alone does not fit). Splits a longer
+/// string into the chunks the platform delivers it in.
+pub fn textChunkEnd(str: []const u8, start: usize) usize {
+    var end = @min(start + @sizeOf(@FieldType(TextChunk, "buf")), str.len);
+    if (end < str.len) {
+        while (end > start + 1 and str[end] & 0xC0 == 0x80) end -= 1;
+    }
+    return end;
+}
 
 /// An in-progress input-method composition ("preedit" text).
 pub const Composition = struct {
@@ -638,10 +652,7 @@ fn eventString(raw: []const u8, off: usize) []const u8 {
 /// Splits `pending_text` into chunks of at most 32 bytes on character boundaries.
 fn nextPendingChunk() ?Event {
     if (pending_pos >= pending_len) return null;
-    var end = @min(pending_pos + 32, pending_len);
-    if (end < pending_len) {
-        while (end > pending_pos + 1 and pending_text[end] & 0xC0 == 0x80) end -= 1;
-    }
+    const end = textChunkEnd(pending_text[0..pending_len], pending_pos);
     const chunk = TextChunk.from(pending_text[pending_pos..end]);
     pending_pos = end;
     return .{ .text_input = .{ .window = pending_window, .text = chunk } };
@@ -692,8 +703,47 @@ fn decodeRaw(ev_type: u32, raw: []const u8) ?Event {
     }
 }
 
+/// An event `waitEvent` took from SDL that `pollEvent` has not returned yet.
+var held_event: ?Event = null;
+
+/// Blocks until an event arrives or `timeout_ms` has passed (null: no limit); true if one arrived.
+/// The event stays queued for `pollEvent`. An event the toolkit does not decode (a window
+/// exposed, say) also ends the wait, so a caller that redraws on every wake-up repaints for it.
+/// Costs no CPU while it waits: this is what an app that draws only on demand sleeps in.
+pub fn waitEvent(timeout_ms: ?u32) bool {
+    if (held_event != null or pending_pos < pending_len) return true;
+    var e: c.SdlEvent = undefined;
+    const got = if (timeout_ms) |ms|
+        c.SDL_WaitEventTimeout(&e, @intCast(@min(ms, std.math.maxInt(i32))))
+    else
+        c.SDL_WaitEvent(&e);
+    if (!got) return false;
+    held_event = decodeRaw(e.type, &e.raw);
+    return true;
+}
+
+/// Ends a `waitEvent` that is blocking (or the next one) without any real input: for a thread
+/// that finished something the UI should show. Safe to call from any thread.
+pub fn wakeEventLoop() void {
+    var e: c.SdlEvent = undefined;
+    @memset(&e.raw, 0);
+    e.type = c.EVENT_USER;
+    _ = c.SDL_PushEvent(&e);
+}
+
+/// Makes SDL use its dummy video driver (real windows and software renderers, nothing on
+/// screen) for the windows opened from now on. For tests and headless runs; call it before the
+/// first window.
+pub fn useDummyVideo() void {
+    _ = c.SDL_SetHint("SDL_VIDEO_DRIVER", "dummy");
+}
+
 /// Returns the next pending event for any window, or null when the queue is empty.
 pub fn pollEvent() ?Event {
+    if (held_event) |ev| {
+        held_event = null;
+        return ev;
+    }
     if (nextPendingChunk()) |ev| return ev;
     var e: c.SdlEvent = undefined;
     while (c.SDL_PollEvent(&e)) {
@@ -2175,6 +2225,25 @@ fn testRaw(ev_type: u32, window: u32, x: f32, y: f32, data: ?[*:0]const u8) [128
     return raw;
 }
 
+test "text is chunked on character boundaries, in chunks of at most 32 bytes" {
+    // 31 ASCII bytes, then a 2-byte character that straddles the 32nd byte, then more.
+    const a31 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const str = a31 ++ "é" ++ "tail";
+    try std.testing.expectEqual(@as(usize, 31), textChunkEnd(str, 0));
+    try std.testing.expectEqual(str.len, textChunkEnd(str, 31));
+    try std.testing.expectEqual(@as(usize, 32), textChunkEnd(a31 ++ "bbbbbbbbb", 0));
+    try std.testing.expectEqual(@as(usize, 3), textChunkEnd("abc", 0));
+    // Whatever the string, the chunks cover it exactly and each one is valid UTF-8.
+    const mixed = "héllo wörld, 日本語のテキスト, \u{1F600} and more text to be split up";
+    var i: usize = 0;
+    while (i < mixed.len) {
+        const end = textChunkEnd(mixed, i);
+        try std.testing.expect(end > i and end - i <= 32);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(mixed[i..end]));
+        i = end;
+    }
+}
+
 test "drop events decode, copying the path" {
     const raw = testRaw(c.EVENT_DROP_FILE, 3, 10.5, 20, "/Users/me/pic.png");
     const ev = decodeDropEvent(c.EVENT_DROP_FILE, &raw).?;
@@ -2330,6 +2399,35 @@ test "frame callback: runs for this window's expose/resize events with the new s
     win.setFrameCallback(null, null);
     pushWindowEvent(c.EVENT_WINDOW_EXPOSED, win.id());
     try std.testing.expectEqual(before + 1, t.calls);
+}
+
+fn wakeFromThread() void {
+    sleepMs(30);
+    wakeEventLoop();
+}
+
+test "waitEvent: times out when idle, ends on an event or a wake-up, keeps the event for pollEvent" {
+    useDummyVideo();
+    var win = Window.init(std.testing.allocator, .{ .title = "t", .width = 100, .height = 80 }) catch return error.SkipZigTest;
+    defer win.deinit();
+    while (pollEvent()) |_| {}
+    try std.testing.expect(!waitEvent(5));
+
+    // A decoded event ends the wait and is still there for pollEvent, once.
+    pushWindowEvent(c.EVENT_WINDOW_FOCUS_GAINED, win.id());
+    try std.testing.expect(waitEvent(1000));
+    try std.testing.expect(waitEvent(0)); // already holding one
+    try std.testing.expectEqual(win.id(), pollEvent().?.focus_gained);
+    try std.testing.expect(pollEvent() == null);
+
+    // A wake-up ends the wait but is no `Event`; one from another thread works too.
+    wakeEventLoop();
+    try std.testing.expect(waitEvent(1000));
+    try std.testing.expect(pollEvent() == null);
+    const th = try std.Thread.spawn(.{}, wakeFromThread, .{});
+    try std.testing.expect(waitEvent(5000));
+    th.join();
+    while (pollEvent()) |_| {}
 }
 
 // ---- several windows --------------------------------------------------------------------------

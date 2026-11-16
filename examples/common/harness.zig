@@ -1,5 +1,6 @@
-//! The plumbing every example repeats, in one place: command line, window setup, the frame loop,
-//! the live-resize callback and snapshot files. An example then reads as "state + `frame(app, ui)`":
+//! What the examples share beyond the toolkit's own loop (`vass.app`): the command line and the
+//! mapping from the example's hooks to a live or a snapshot run. An example then reads as "state
+//! + `frame(app, ui)`":
 //!
 //!     pub fn main(init: std.process.Init) !void {
 //!         const env = try harness.start(init, "split", .{}) orelse return;
@@ -11,11 +12,12 @@
 //! `run` takes the example's own file (`@This()`) as the hook namespace, so the hooks are plain
 //! top-level `pub fn`s of the example, found by name:
 //!
-//!   * `frame(app: *App, ui: *Ui) void | !void` (required): builds one frame of UI. `App` is the
-//!     example's state struct, which must have a `state: vass.ui.State` field (the Ui's keyboard
-//!     focus, drags and so on). Call `ui.finish()` at the end if the example has popups.
+//!   * `frame(app: *App, ui: *Ui) void | !void` (required): builds one frame of UI. The loop keeps
+//!     the Ui's state (focus, popups) and calls `ui.finish()` itself; read the state as `ui.state`.
 //!   * `setup(app: *App, win: *Window) !void`: once, after the window exists (load images, sounds).
-//!   * `teardown(app: *App, win: *Window) void`: once, before the window is destroyed.
+//!   * `teardown(app: *App, win: *Window) void`: once, when the run ends however it ends (the close
+//!     button, Cmd+Q, the end of a snapshot run, an error); the window is destroyed after it returns.
+//!     Not called if `setup` failed: `setup` cleans up after itself.
 //!   * `event(app: *App, s: *Step, ev: Event) void`: every event that is about to be fed to the
 //!     input (not called while a snapshot or script run ignores the real mouse and keyboard).
 //!   * `step(app: *App, s: *Step) !void`: once per loop iteration, after the events and before the
@@ -24,7 +26,7 @@
 //!
 //! Without a `step`, a snapshot run draws `Config.snapshot_frame` frames, saves `DIR/<name>.bmp`
 //! and exits. Snapshot runs use a hidden window (`--hold` shows it) and a fake clock, so the
-//! images are reproducible.
+//! images are reproducible. They are `vass.app` scripted runs: the same loop as a live run.
 const std = @import("std");
 const vass = @import("vass");
 
@@ -55,7 +57,7 @@ pub const Cli = struct {
 pub const Env = struct {
     /// Leak-checked in debug builds by the runtime.
     gpa: std.mem.Allocator,
-    /// Lives until the process exits; snapshot paths are allocated from it.
+    /// Lives until the process exits.
     arena: std.mem.Allocator,
     cli: Cli,
     /// The example's name, the default stem of its snapshot file.
@@ -92,7 +94,7 @@ pub fn start(init: std.process.Init, comptime name: []const u8, comptime accept:
 }
 
 pub const Config = struct {
-    /// The window. `hidden` is set by `run` (hidden in a snapshot run unless `--hold`).
+    /// The window. `hidden` is set by the loop (hidden in a snapshot run unless `--hold`).
     window: vass.platform.WindowOptions,
     /// Start the input method (text fields and areas need it).
     text_input: bool = false,
@@ -104,9 +106,9 @@ pub const Config = struct {
     snapshot_name: ?[]const u8 = null,
     /// Seconds the fake clock advances per frame (it is used in snapshot runs).
     snapshot_clock_step: f64 = 0,
-    /// Use the fake clock (true) or the real one (false). Null: fake in snapshot runs.
+    /// Use the fake clock (true) or the real one (false) in a snapshot run. Null: fake.
     fixed_clock: ?bool = null,
-    /// Feed the real mouse and keyboard to the input. Null: yes unless this is a snapshot run.
+    /// Feed the real mouse and keyboard to the input in a snapshot run. Null: no.
     feed_input: ?bool = null,
     /// Pause after each frame while snapshotting; live runs always wait 16 ms.
     snapshot_sleep_ms: u32 = 16,
@@ -125,26 +127,28 @@ pub const Step = struct {
     time: f64,
     list: *vass.DisplayList,
     theme: ui_mod.Theme,
+    /// The Ui's state: keyboard focus, drags, popups.
+    state: *ui_mod.State,
     /// A snapshot was requested for this frame (it is written by the draw).
     saved: bool = false,
-    finish: bool = false,
-    halt: bool = false,
+    /// The scripted run's step (null in a live run).
+    core: ?vass.app.Step = null,
 
     /// Saves this frame as `DIR/<stem>.bmp`, the stem being `fmt` filled in with `args`.
     pub fn save(s: *Step, comptime fmt: []const u8, args: anytype) !void {
-        const dir = s.env.cli.snapshot_dir orelse return;
-        s.win.snapshot_path = try std.fmt.allocPrintSentinel(s.env.arena, "{s}/" ++ fmt ++ ".bmp", .{dir} ++ args, 0);
+        const core = s.core orelse return;
+        try core.save(fmt, args);
         s.saved = true;
     }
 
     /// Ends the run after this frame has been drawn.
     pub fn done(s: *Step) void {
-        s.finish = true;
+        if (s.core) |core| core.done();
     }
 
     /// Ends the run now, without drawing this frame.
     pub fn stop(s: *Step) void {
-        s.halt = true;
+        if (s.core) |core| core.stop();
     }
 
     /// A Ui over the current input without any state, for measuring text before the real frame.
@@ -157,85 +161,97 @@ pub const Step = struct {
 /// written. Call it again with another `cfg` to run the same state in another window (a second size).
 pub fn run(comptime Ex: type, env: Env, cfg: Config, app: anytype) !void {
     const App = @TypeOf(app.*);
-    const snapshot = env.cli.snapshot();
-    const gpa = env.gpa;
-
-    var opts = cfg.window;
-    opts.hidden = snapshot and !env.cli.hold;
-    var win = try Window.init(gpa, opts);
-    defer win.deinit();
-    if (cfg.text_input) win.startTextInput();
-    if (@hasDecl(Ex, "setup")) try Ex.setup(app, &win);
-    defer if (@hasDecl(Ex, "teardown")) Ex.teardown(app, &win);
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-
-    var input: ui_mod.Input = .{};
-    const L = Live(Ex, App);
-    var live: L = .{ .app = app, .win = &win, .list = &list, .input = &input, .theme = cfg.theme };
-    // Redraw while the OS live-resizes the window (the loop below is blocked then).
-    win.setFrameCallback(&live, L.onResize);
-
-    const feed = cfg.feed_input orelse !snapshot;
-    const fixed_clock = cfg.fixed_clock orelse snapshot;
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        const time: f64 = if (fixed_clock)
-            @as(f64, @floatFromInt(n)) * cfg.snapshot_clock_step
-        else
-            @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-        var step: Step = .{ .env = env, .n = n, .win = &win, .input = &input, .time = time, .list = &list, .theme = cfg.theme };
-
-        while (vass.platform.pollEvent()) |ev| switch (ev) {
-            .quit, .close_requested => running = false,
-            else => if (feed) {
-                if (@hasDecl(Ex, "event")) Ex.event(app, &step, ev);
-                input.feed(ev, win.id());
-            },
-        };
-        input.time = time;
-
-        if (@hasDecl(Ex, "step")) try Ex.step(app, &step);
-        if (snapshot) if (cfg.snapshot_frame) |f| if (n == f) {
-            try step.save("{s}", .{cfg.snapshot_name orelse env.name});
-            step.done();
-        };
-        if (step.halt) break;
-
-        try live.draw(input);
-        if (@hasDecl(Ex, "after")) try Ex.after(app, &step);
-        if (step.finish) running = false;
-
-        // The Ui worked on a copy of the input; keep what it consumed.
-        input.endFrame();
-        vass.platform.sleepMs(if (snapshot) cfg.snapshot_sleep_ms else 16);
-    }
-}
-
-/// Everything one frame needs, so the main loop and the resize callback draw the same way.
-fn Live(comptime Ex: type, comptime App: type) type {
-    return struct {
+    const Host = struct {
+        const Self = @This();
         app: *App,
-        win: *Window,
-        list: *vass.DisplayList,
-        input: *ui_mod.Input,
-        theme: ui_mod.Theme,
+        env: Env,
+        cfg: Config,
+        scripted: bool,
 
-        fn draw(l: *@This(), in: ui_mod.Input) !void {
-            l.list.reset();
-            var ui = Ui.init(l.list, l.win, in, l.theme);
-            ui.state = &l.app.state;
-            const R = @typeInfo(@TypeOf(Ex.frame)).@"fn".return_type.?;
-            if (comptime @typeInfo(R) == .error_union) try Ex.frame(l.app, &ui) else Ex.frame(l.app, &ui);
-            l.win.render(l.list, l.theme.bg);
+        fn makeStep(h: *Self, ctx: *vass.app.Context, core: ?vass.app.Step) Step {
+            // The loop ends when the main window is closed and keeps every window until `teardown`
+            // has returned, so every hook finds it.
+            const w = ctx.runner.mainWindow().?;
+            return .{
+                .env = h.env,
+                .n = ctx.runner.iteration,
+                .win = w.window,
+                .input = &w.input,
+                .time = ctx.time(),
+                .list = &w.list,
+                .theme = h.cfg.theme,
+                .state = &w.state,
+                .saved = if (ctx.runner.script) |sc| sc.saved else false,
+                .core = core,
+            };
         }
 
-        /// Called by the window while it is being resized: an idle frame, so no click or key is
-        /// replayed and `input.time` (hence animations) stays where the last real frame left it.
-        fn onResize(ctx: ?*anyopaque) void {
-            const l: *@This() = @ptrCast(@alignCast(ctx.?));
-            l.draw(l.input.idle()) catch |e| std.log.warn("resize frame failed: {s}", .{@errorName(e)});
+        pub fn frame(h: *Self, ui: *Ui) !void {
+            const R = @typeInfo(@TypeOf(Ex.frame)).@"fn".return_type.?;
+            if (comptime @typeInfo(R) == .error_union) try Ex.frame(h.app, ui) else Ex.frame(h.app, ui);
+        }
+
+        pub fn setup(h: *Self, ctx: *vass.app.Context) !void {
+            if (@hasDecl(Ex, "setup")) try Ex.setup(h.app, ctx.window());
+        }
+
+        pub fn teardown(h: *Self, ctx: *vass.app.Context) void {
+            if (@hasDecl(Ex, "teardown")) Ex.teardown(h.app, ctx.window());
+        }
+
+        pub fn event(h: *Self, ctx: *vass.app.Context, ev: vass.platform.Event) bool {
+            if (!@hasDecl(Ex, "event")) return false;
+            switch (ev) {
+                .quit, .close_requested => {},
+                else => {
+                    var s = h.makeStep(ctx, null);
+                    Ex.event(h.app, &s, ev);
+                },
+            }
+            return false;
+        }
+
+        /// A live run's per-turn hook; a snapshot run's is `script`.
+        pub fn update(h: *Self, ctx: *vass.app.Context) !void {
+            if (h.scripted or !@hasDecl(Ex, "step")) return;
+            var s = h.makeStep(ctx, null);
+            try Ex.step(h.app, &s);
+        }
+
+        pub fn script(h: *Self, core: *vass.app.Step) !void {
+            const ctx_runner = core.runner;
+            var ctx = ctx_runner.context(null);
+            var s = h.makeStep(&ctx, core.*);
+            if (@hasDecl(Ex, "step")) try Ex.step(h.app, &s);
+            if (h.cfg.snapshot_frame) |f| if (core.n == f) {
+                try s.save("{s}", .{h.cfg.snapshot_name orelse h.env.name});
+                s.done();
+            };
+        }
+
+        pub fn afterFrame(h: *Self, ctx: *vass.app.Context) !void {
+            if (!@hasDecl(Ex, "after")) return;
+            var s = h.makeStep(ctx, null);
+            try Ex.after(h.app, &s);
         }
     };
+
+    const snapshot = env.cli.snapshot();
+    var window = cfg.window;
+    window.hidden = snapshot and !env.cli.hold;
+    var host: Host = .{ .app = app, .env = env, .cfg = cfg, .scripted = snapshot };
+    try vass.app.run(Host, &host, .{
+        .window = window,
+        .theme = cfg.theme,
+        .text_input = cfg.text_input,
+        .gpa = env.gpa,
+        .script = if (snapshot) .{
+            .dir = env.cli.snapshot_dir,
+            .clock_step = cfg.snapshot_clock_step,
+            .real_clock = !(cfg.fixed_clock orelse true),
+            .sleep_ms = cfg.snapshot_sleep_ms,
+            .hold = env.cli.hold,
+            .os_input = cfg.feed_input orelse false,
+        } else null,
+    });
 }

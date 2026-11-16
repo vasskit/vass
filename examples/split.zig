@@ -26,7 +26,6 @@ const right_opts: split.SplitterOpts = .{ .min = 200, .max = 420, .default = 280
 const bottom_opts: split.SplitterOpts = .{ .axis = .horizontal, .min = 70, .max = 400, .default = 160, .invert = true };
 
 const App = struct {
-    state: ui_mod.State = .{},
     left: split.SplitState = .init(270),
     right: split.SplitState = .init(300),
     bottom: split.SplitState = .init(170),
@@ -63,7 +62,6 @@ fn pane(ui: *Ui, r: Rect, title: []const u8, hint: []const u8) void {
 }
 
 pub fn frame(app: *App, ui: *Ui) void {
-    defer ui.finish();
     const t = ui.theme;
     var area = (Rect{ .x = 0, .y = 0, .w = ui.bounds.w, .h = ui.bounds.h }).inset(12);
 

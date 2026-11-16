@@ -34,13 +34,16 @@ the public root and keeps every public name (`vass.ui`, `vass.Layout`, `vass.aud
   dropdown, tooltips), `split.zig` (split panes), `focus.zig` (keyboard focus), `icons.zig`, and the
   headless `focus_test.zig` / `text_input_test.zig`. These depend on `platform` for text measuring
   and event types.
+- `src/app/` — the application loop (`vass.app`, `vass.run`): windows, events, one frame per window,
+  redraw policy, scripted runs (see "Application loop"). It sits on `platform` and `ui`.
 - `build/deps.zig` — build helpers compiling zlib, libpng, FreeType, HarfBuzz and SDL_ttf from
   source (SDL3 comes from the castholm/SDL package).
 - `examples/` — the example programs (see "Examples"), `tools/` — the table generators.
 
 Layering rule: `core/` imports nothing outside `core/`; `text/` imports only `core/` and itself;
 `layout/` and `image/` know nothing about the platform; only `platform/` talks to SDL (and
-`audio/audio.zig` to SDL's audio streams). `ui/` sits on top of all of them.
+`audio/audio.zig` to SDL's audio streams). `ui/` sits on top of all of them, and `app/` on `platform`
+and `ui`: nothing in the other folders imports `app/`.
 
 ## Examples
 
@@ -58,13 +61,13 @@ with everything after `--` forwarded:
 helper and `examples/assets/` holds what the examples `@embedFile` (paths relative to the file, e.g.
 `@embedFile("assets/chime.wav")`). Every example gets the `vass` module and nothing else.
 
-`examples/common/harness.zig` is the plumbing the examples used to repeat: `--snapshot DIR`,
-`--hold` (show the window during a snapshot run) and the per-example `--script` / `--debug-input`,
-the window with the hidden-in-snapshot rule, the live-resize frame callback, the loop and the
-snapshot files. An example is its state plus `pub fn frame(app: *App, ui: *Ui)`, and `main` is
-`harness.start(...)` then `harness.run(@This(), env, .{ .window = ... }, &app)`; optional hooks
-`setup`, `teardown`, `event`, `step` (scripted input) and `after` are described at the top of the
-file. `windows.zig` manages several windows itself and only uses the command line part.
+`examples/common/harness.zig` is what the examples share beyond the toolkit's loop: the command line
+(`--snapshot DIR`, `--hold` to show the window during a snapshot run, the per-example `--script` /
+`--debug-input`) and the mapping from an example's hooks to a `vass.run`. An example is its state plus
+`pub fn frame(app: *App, ui: *Ui)`, and `main` is `harness.start(...)` then
+`harness.run(@This(), env, .{ .window = ... }, &app)`; the optional hooks `setup`, `teardown`,
+`event`, `step` (scripted input) and `after` are described at the top of the file. `windows.zig`
+uses the multi-window `Runner` directly and only the command line part of the harness.
 
 ## Using it
 
@@ -122,8 +125,110 @@ In your `build.zig`:
 
 Add `zig-pkg/` to the app's `.gitignore` (Zig 0.17 unpacks dependencies there).
 
-Then `@import("vass")`: create a `vass.platform.Window`, fill a `vass.DisplayList` each
-frame, and call `window.render(&list, clear_color)`.
+Then `@import("vass")` and hand `vass.run` a state type with a `frame` function (see "Application
+loop"). The pieces underneath it are public too: a `vass.platform.Window`, a `vass.DisplayList` filled
+each frame, and `window.render(&list, clear_color)`.
+
+## Application loop
+
+`vass.run` is the loop every program otherwise writes by hand: create the window, give it an `Input`,
+poll events and feed them, build the `Ui`, call your frame function, `ui.finish()`, render, sleep;
+plus the live-resize redraw, the input method, a deterministic snapshot mode and the cleanup.
+
+    const Notes = struct {
+        text: vass.ui.TextFieldState,
+        pub fn frame(app: *Notes, ui: *vass.Ui) void { ... }   // the only required hook
+    };
+    pub fn main(init: std.process.Init) !void {
+        var app: Notes = .{ .text = vass.ui.TextFieldState.init(init.gpa) };
+        try vass.run(Notes, &app, .{ .gpa = init.gpa, .text_input = true, .window = .{ .title = "Notes", .width = 900, .height = 600, .resizable = true } });
+    }
+
+**Who owns what.** The loop owns, per window, the `Input`, the `ui.State` (focus, popups, tooltip
+timer, splitter drags; it is attached to every `Ui`, read it in a frame as `ui.state`) and the display
+list. You own your app state. `ui.finish()` is called for you after the frame (it is safe to call it
+yourself too: only the first call counts). Frames and hooks run on the main thread.
+
+**Hooks.** All optional but `frame`, found by name on the type, with their signatures checked at
+compile time (a function that may fail can return `!void`):
+
+| hook | when |
+|---|---|
+| `frame(app, ui)` or `frame(app, ui, ctx)` | every frame of the window |
+| `setup(app, ctx) !void` | once, after the window exists: load images, sounds. If it fails, `teardown` is not called: clean up what it did |
+| `teardown(app, ctx)` | once, when the loop ends however it ends (close button, `ctx.quit`, Cmd+Q, a script, an error from a hook); every window is still there and is destroyed after it returns |
+| `event(app, ctx, ev) bool` | every event first; `true` consumes it (global shortcuts) |
+| `update(app, ctx)` | once per loop turn, before the frames: timers, polling, results from a worker. **Not** called for the live-resize redraws of a window being resized |
+| `afterFrame(app, ctx)` | after the frames of a turn; not once the loop has been told to end |
+| `closeRequested(app, ctx) bool` | the close button (also `(app, ctx, window)`); `false` keeps the window |
+| `theme(app) Theme` | a theme chosen every frame, instead of `Config.theme` |
+| `script(app, step)` | scripted runs only, below |
+
+The hooks are called `setup` and `teardown`, not `init` and `deinit`, so a state type with its own
+`pub fn init(gpa) !App` and `deinit` goes to `vass.run` as it is.
+
+`ctx` (a `vass.AppContext`) gives `ctx.window()` (the platform window), `ctx.uiState()`, `ctx.gpa`, `ctx.frameAlloc()`
+(an arena reset at the start of every loop turn, and, separately, at the start of every live-resize
+frame), `ctx.time()` (the clock `Input.time` follows), `ctx.quit()` (no further frame is drawn),
+`ctx.requestRedraw()`, `ctx.redrawAt(t)`, `ctx.redrawEvery(ms)`, and the window set (`open`, `close`,
+`requestClose`, `windows` (a copy for this turn), `find`). `window()` and `uiState()` panic when no
+window is open, which only an app that ends with `End.last_window_closed` or `End.explicit` can have
+closed; it uses `windowOrNull()` and `uiStateOrNull()`. `Config` also takes `.theme`, `.background`
+(the clear colour, default `theme.bg`), `.text_input`, `.frame_ms` and `.gpa`.
+
+**Several windows.** `vass.Runner` is the loop with a dynamic set of windows. `use` a program type for
+the hooks above, `open` windows (before `run`, from `init`, or later from any hook or frame) each with
+its own state type and `frame`, then `run`. The per-window state type may also declare `theme(w)` and
+`windowClosed(w, ctx)` (called just before its window is destroyed: free what `w` is). Windows are
+drawn in `WindowSpec.draw_order`, then in the order opened. Closing is deferred: `ctx.close(w)` marks
+the window and the loop destroys it between frames, so it is safe from another window's frame, from
+the window's own frame, or from a hook. What ends the loop is `Options.end`: the main window closed
+(the default: the first one opened, or `WindowSpec.main`), the last window closed, or never (an app that
+lives in the menu bar; it quits with `ctx.quit()` or Cmd+Q, which always end it). When the loop ends
+the windows are not destroyed at once: first every window's `windowClosed` runs (last opened first),
+then `teardown`, then the windows go, so both can still use all of them. A window the app
+hides and shows again (`AppWindow.hide`/`show`) is not drawn while hidden. `examples/windows.zig`
+is the reference; see "Several windows".
+Shared data is the caller's: plain app state that every window's frame reads.
+
+**The turn.** Each loop turn (`Runner.iterate`): events (the `event` hook, then `Input.feed` for every
+window, which keeps only its own), `Input.time`, `update`, `script`, destroy closed windows, a frame per
+window, `Input.endFrame`, `afterFrame`, sleep. Once the loop has been told to end (a quit, the end
+policy, `ctx.quit()`, a script's `done` after its frame) the turn stops there. A resizable window also
+gets the live-resize callback (`Window.setFrameCallback`) wired for you: it draws that window with
+`Input.idle()` and without `update`.
+
+**Redraw policy.** `Config.redraw` / `Options.redraw`:
+
+- `.always` (the default, what hand-written loops did): a frame every turn, then sleep `frame_ms` (16).
+- `.on_demand`: block in the OS's event wait (no CPU) and draw only when something asks. Every trigger
+  draws at least two frames, because an immediate-mode UI needs a second one to settle (popups use the
+  last frame's rectangles). What asks: any input event or a `wake()` from another thread (two frames);
+  a widget that is animating (`ui.requestRedraw()` every frame it runs; frames come at the `frame_ms`
+  pace until a frame does not ask again); a time a widget asked for (`ui.requestRedrawAt(t)`: the
+  tooltip delay, and the blink of the caret of a focused text field or text area use it, so an idle
+  window with a tooltip waiting or a caret in it wakes only when the tooltip is due or the caret
+  flips); and the app itself (`ctx.requestRedraw()`, `ctx.redrawAt(t)`, `ctx.redrawEvery(ms)` or
+  `redraw_every_ms` for an audio meter or a playback position, set while it runs and cleared after).
+  `update` runs once per wake-up, not at a steady rate. A program with its own time-based drawing
+  (a toggle that slides) calls `ui.requestRedraw()` while it moves.
+
+**Scripted runs.** `Config.script = .{ .dir = "out", .clock_step = 0.016 }` (or
+`Runner.initScripted`) runs the same loop with hidden windows, a fake clock that is `clock_step`
+times the turns so far, the real mouse and keyboard ignored, and the program's `script(app, step: *vass.app.Step)`
+hook called each turn after `update`. The hook injects input with `step.click(x, y)`, `press`,
+`release`, `move`, `wheel`, `key(code, mods)`, `text`, `compose`, `focus`, `dropFile`, `inject(ev)`
+(they travel through the same dispatch as OS events: your `event` hook and `Input.feed` see them),
+aims at another window with `step.to(window)`, reads `step.n` (the turn), writes `<dir>/<name>.bmp`
+with `try step.save("name-{d}", .{i})`, and ends the run with `step.done()` (after this frame) or
+`step.stop()` (now); `save` and `done` make the turn draw even in an `.on_demand` run. `step.input()` and `step.state()` reach the window's `Input` and `ui.State` for
+scripts that set fields directly. Because it is the live loop, code that only runs in the live app
+(an `update` that polls) runs in snapshot runs too, and `max_frames` stops a script that never ends.
+Command-line parsing is yours; `examples/common/harness.zig` is a small one.
+
+**By hand.** A `vass.platform.Window` can still be driven without any of this (see "Custom fonts,
+weights, resizing, list helpers" for the rule a resizable window then follows: register
+`setFrameCallback` and draw an idle frame from it).
 
 ## Widgets and layout
 
@@ -306,6 +411,7 @@ call `ui.setCursor` themselves; `Window.setCursor` does the same without a Ui.
 Widgets that need memory across frames take a caller-owned state struct; there is no hidden
 per-widget state. Keyboard focus lives in a caller-owned `vass.ui.State`:
 
+    // (with `vass.run` the loop keeps the Input and the State; the rest of this section is what it does)
     var input: vass.ui.Input = .{};          // across frames
     var ustate: vass.ui.State = .{};         // across frames: who has focus
     var field = vass.ui.TextFieldState.init(gpa);   // keep its address stable
@@ -459,24 +565,16 @@ documents, a window per document (title field, text area with undo, dropdown, co
 and an always-on-top inspector that reports on whichever document window has focus. Windows are
 opened and closed at run time, in any order. `zig build windows -- --snapshot DIR` writes
 `windows-1-open-*.bmp`, `windows-2-typed-*.bmp` and `windows-3-closed-*.bmp` (one BMP per window,
-all windows hidden). Claude Buddy runs three windows the same way.
+all windows hidden). Claude Buddy runs three windows with a loop of its own.
 
-**The pattern.** One record per window, holding what that window needs and nothing shared:
-
-    const Win = struct {
-        win: *vass.platform.Window,   // from Window.create
-        list: vass.DisplayList,
-        input: vass.ui.Input = .{},
-        state: vass.ui.State = .{},   // focus, popups, tooltip, splitter drags, click count
-        // plus the state of the widgets that need one (DropdownState, TextAreaState, ...)
-    };
-
-Each loop turn: `while (pollEvent()) |ev|` feed the event to every window's `Input`
-(`w.input.feed(ev, w.win.id())` keeps only the events of that window; fed to all of them it
-reaches the right one), draw every window (`Ui.init(&w.list, w.win, w.input, theme)`, widgets,
-`ui.finish()`, `w.win.render`, `w.input.endFrame()`), then do the things that need a window
-created or destroyed. Shared app data (the document list) is plain app state that every window's
-frame function reads, so an edit in one window shows in the others on the next frame.
+**The pattern** (the loop itself is in "Application loop"). A `vass.Runner` owns the windows; for
+each one you write a state struct with a `frame`, and the runner keeps what every window needs and
+nothing shared: the platform `Window`, an `Input`, a `ui.State` (focus, popups, tooltip timer,
+splitter drags, click count), a display list, and the live-resize callback. Per-window widget state
+(a `DropdownState`) lives in your struct. Shared app data (the document list) is plain state in the
+program that every window's frame reads, so an edit in one window shows in the others on the next
+frame. The runner feeds every event to every window's `Input` (`feed` keeps only the events of that
+window), draws the windows in order and destroys closed ones between frames.
 
 **What is per window.** `Window` (renderer, fonts, text, image and icon textures, frame callback,
 text input on or off, cursor request, drag region, title, position), `Input` (pointer, held
@@ -496,18 +594,17 @@ whichever window opened it; its result is delivered to the window that opened it
 dropped if that window is destroyed first). Fonts are opened per window.
 
 **Lifetime rules.**
-- A `Window` must not move in memory while a frame callback is registered or a `Ui` holds it. For
-  a window that comes and goes use `Window.create(gpa, opts)` (heap-allocated, stable address) and
-  `w.destroy()`; `Window.init` / `deinit` are the by-value form.
-- Open a window at any time; destroy it between frames or from another window's frame or frame
-  callback (its callback is unregistered by `deinit`, other windows' callbacks keep working).
-  Never destroy a window from inside its own frame callback or while it is rendering: that frees
-  it under the running code, so `deinit` panics instead. The example records a close request and
-  destroys the window after the frame.
-- Closing: `Event.close_requested` carries the id of the window whose close button was pressed;
-  nothing is closed for you, so destroy that window (or ignore the request). `Event.quit` is the
-  whole app (Cmd+Q, or the last window closed). Cmd+W is an ordinary `key_down` with `mods.cmd`
-  and `code == 'w'` and a `window` id (SDL has no default binding for it).
+- With the `Runner` none of this is your problem: it heap-allocates windows (stable addresses) and
+  destroys them between frames. By hand: a `Window` must not move in memory while a frame callback is
+  registered or a `Ui` holds it, so for a window that comes and goes use `Window.create(gpa, opts)`
+  and `w.destroy()` (`Window.init` / `deinit` are the by-value form); destroy it between frames or
+  from another window's frame or frame callback, never from its own frame callback or while it is
+  rendering (that frees it under the running code, so `deinit` panics instead).
+- Closing: `Event.close_requested` carries the id of the window whose close button was pressed. The
+  `Runner` asks `closeRequested` and closes it (a main window ends the loop); by hand, nothing is
+  closed for you. `Event.quit` is the whole app (Cmd+Q, or the last window closed). Cmd+W is an
+  ordinary `key_down` with `mods.cmd` and `code == 'w'` and a `window` id (SDL has no default binding
+  for it): handle it in the `event` hook and call `ctx.requestClose(window)`.
 - Destroy in any order; the last window to go shuts SDL down, and a window opened afterwards
   starts it again.
 
@@ -525,8 +622,8 @@ drawn and nothing is shared. Load what each window needs into that window.
 - `Input.feed` ignores other windows' events. `mouse_leave` clears hover; `focus_lost` ends a
   held button (as a release, so a drag finishes cleanly), drops an input-method composition and
   an unfinished drop highlight, and clears `Input.window_focused` (set again by `focus_gained`).
-- Text input is per window: call `startTextInput` for each window that has a text field (the
-  example does it when a document window opens). Typed text goes to the window with keyboard
+- Text input is per window: call `startTextInput` for each window that has a text field
+  (`WindowSpec.text_input`; the example sets it for document windows). Typed text goes to the window with keyboard
   focus only, so a text field focused in window A cannot see keys typed in B. `setTextInputArea`
   is per window too (the example sets it for the window's own focused field).
   `Window.hasFocus()`, `hasMouseFocus()` and `textInputActive()` query the state.
@@ -539,8 +636,9 @@ Frame time. Each renderer is created with vsync off (`SDL_SetRenderVSync(ren, 0)
 N windows is not N waits for the display. Measured on this machine (hidden windows, 200 frames
 drawn back to back, no sleeping): 8.3 ms per frame with one window and the same 8.3 ms with four,
 about one refresh of a 120 Hz display; the cost does not multiply with the window count. Only
-hidden windows were measured (a real, visible window may be paced differently by the OS), and the
-app still sleeps between frames itself; redraw-on-demand is on the roadmap.
+hidden windows were measured (a real, visible window may be paced differently by the OS). The loop
+sleeps between frames itself (`.always`), or draws only on demand (`.on_demand`, see "Application
+loop").
 
 ## Not there yet
 
@@ -625,18 +723,16 @@ SDL_ttf exactly as before.
 - `WindowOptions.resizable` / `min_width` / `min_height`, and `Window.logicalSize()` to lay out
   each frame (no resize event is needed).
 - Several windows: see "Several windows" below.
-- **Live resize needs a frame callback.** While the user drags a window edge, macOS runs its
-  own loop and your `while (running)` loop is blocked inside `pollEvent`, so nothing is drawn
-  and the OS stretches the last frame until the mouse is released. Put one frame of work in a
-  function and register it with `win.setFrameCallback(ctx, func)` (after the `Window` has its
-  final address; `deinit` unregisters it). SDL then calls it on the main thread from inside the
-  event pump (about 60 times a second during a drag, once per distinct size), with the window's
-  size and scale already refreshed, so `logicalSize()` and `Ui.init` see the new size. In it,
-  draw with `input.idle()` (a copy without this frame's click, keys or scroll, so nothing is
-  replayed or consumed) and leave your own timers and polling to the main loop. It is never
-  re-entered, never runs during `render`, and is ignored on other threads. See `Live` in
-  `examples/notes.zig`. `ScrollState` offsets are re-clamped to the content each frame, so a
-  scroll area stays put (not jump to the top) as the window grows or shrinks.
+- **Live resize needs a frame callback** when you drive a `Window` by hand (`vass.run` wires it for
+  you). While the user drags a window edge, macOS runs its own loop and yours is blocked inside
+  `pollEvent`, so nothing is drawn. Register `win.setFrameCallback(ctx, func)` (after the `Window` has
+  its final address; `deinit` unregisters it); SDL calls it on the main thread from inside the event
+  pump (about 60 times a second during a drag, once per distinct size), with the window's size and
+  scale already refreshed. In it, draw one frame with `input.idle()` (a copy without this frame's
+  click, keys or scroll, so nothing is replayed or consumed) and leave your own timers and polling to
+  the main loop. It is never re-entered, never runs during `render`, and is ignored on other threads.
+  `ScrollState` offsets are re-clamped to the content each frame, so a scroll area stays put (not
+  jump to the top) as the window grows or shrinks.
 - `Ui.chip` / `chipWidth` (small label pills, clickable via the returned `Interaction`),
   `Ui.listRow` (selected/hover highlight for a row), `Ui.labelLines` (wrap to N lines, ending
   in "..."), `Ui.flattenText` (collapse whitespace for previews), `ScrollState.reveal`
@@ -1021,10 +1117,10 @@ playhead are staged), so the picture needs no sound card and no microphone.
   in `level`, `recordingSeconds`, `update` and `stopRecording`, so the audio thread never touches
   the recording buffer and a stalled UI loses nothing. `deinit` destroys the streams (which waits
   for a callback in progress) before freeing anything.
-- **Redraws.** Vass has no blocking event wait: the app owns its loop (`pollEvent`, draw, sleep),
-  so progress bars and meters animate on their own as long as the app keeps drawing, which the
-  examples and Habor do every frame. For an app that redraws only on input, `audio.busy()` is
-  true while a sound is playing or the microphone is open: keep drawing frames while it is.
+- **Redraws.** Progress bars and meters animate on their own as long as the app keeps drawing,
+  which the `.always` loop does every frame. In an `.on_demand` loop (see "Application loop") nothing
+  redraws by itself: while `audio.busy()` is true (a sound is playing or the microphone is open) set
+  `ctx.redrawEvery(33)` or call `ctx.requestRedraw()` from `update`, and clear it when it is not.
   `audio.update()` is optional per-frame housekeeping (drains the microphone, pauses the output
   device after 2 s of silence; the next `play` restarts it).
 - **Devices and drivers.** Nothing is opened until needed: the playback device on the first

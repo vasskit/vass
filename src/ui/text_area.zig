@@ -478,7 +478,8 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
         }
     }
     const show_caret = focused and (pre == null or pre.?.clause == null);
-    if (show_caret and @mod(in.time - st.blink_origin, 1.06) < 0.53) {
+    if (show_caret) ui.requestCaretBlink(st.blink_origin);
+    if (show_caret and ui.caretVisible(st.blink_origin)) {
         ui.list.rect(.{ .x = box.x + cx, .y = box.y - st.scroll_y + caret_top, .w = 1.5, .h = lh }, t.text);
     }
     ui.popClip();

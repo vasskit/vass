@@ -790,6 +790,7 @@ pub fn tooltipVisible(ui: *Ui, r: Rect, delay: f32) bool {
             tip.anchor = .{ in.mouse_x, in.mouse_y };
         }
         s.tip.waiting_next = true;
+        ui.requestRedrawAt(tip.since + delay);
         return false;
     }
     return true;

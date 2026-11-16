@@ -46,7 +46,6 @@ const context_items = [_]vass.MenuItem{
 };
 
 const App = struct {
-    state: ui_mod.State = .{},
     size_dd: vass.ui.DropdownState = .{},
     size_sel: usize = 1,
     open_dd: vass.ui.DropdownState = .{},
@@ -85,7 +84,6 @@ fn dangerButton(ui: *Ui, r: Rect, str: []const u8) bool {
 }
 
 pub fn frame(app: *App, ui: *Ui) void {
-    defer ui.finish();
     const t = ui.theme;
     var y: f32 = 22;
     ui.labelAt(margin, y, "Popups", .{ .size = 24 });
@@ -217,7 +215,7 @@ pub fn step(app: *App, s: *harness.Step) !void {
         app.size_dd.popup = .{};
         app.open_dd.popup = .{};
         app.sort_dd.popup = .{};
-        app.state = .{};
+        s.state.* = .{};
         input.* = .{};
         input.time = s.time;
         switch (scene) {

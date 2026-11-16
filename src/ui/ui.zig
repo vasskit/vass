@@ -115,10 +115,7 @@ pub const Input = struct {
     pub fn pushText(in: *Input, str: []const u8) void {
         var i: usize = 0;
         while (i < str.len) {
-            var end = @min(i + 32, str.len);
-            if (end < str.len) {
-                while (end > i + 1 and str[end] & 0xC0 == 0x80) end -= 1;
-            }
+            const end = backend.textChunkEnd(str, i);
             in.push(.{ .text = backend.TextChunk.from(str[i..end]) });
             i = end;
         }
@@ -266,6 +263,25 @@ pub const ClickTracker = struct {
 /// See `Ui.setTextInputArea`.
 pub const ImeArea = struct { rect: Rect, cursor_x: f32 };
 
+/// What the widgets of a frame ask of an app loop that draws only when something changed
+/// (`Ui.requestRedraw`, `Ui.requestRedrawAt`): the tooltip timer and the text caret's blink use it.
+/// The `Ui` collects the requests of the frame in progress; `Ui.finish` publishes them.
+pub const Redraw = struct {
+    /// A widget is animating: draw the next frame as soon as the loop's pacing allows.
+    animating: bool = false,
+    /// The earliest time a widget wants a frame at (inf: none).
+    at: f64 = std.math.inf(f64),
+    animating_next: bool = false,
+    at_next: f64 = std.math.inf(f64),
+
+    fn rotate(r: *Redraw) void {
+        r.animating = r.animating_next;
+        r.at = r.at_next;
+        r.animating_next = false;
+        r.at_next = std.math.inf(f64);
+    }
+};
+
 /// What outlives a frame in the Ui itself: which widget has keyboard focus
 /// (identified by the address of its state struct) and which one is being
 /// dragged. Caller-owned; attach with `ui.state = &state`. Without one,
@@ -290,10 +306,22 @@ pub const State = struct {
     /// The focusable widgets of this frame and the last, and the focus-ring state; see `focus.zig`.
     reg: focus.Registry = .{},
 
+    /// What the widgets of the last finished frame asked of the loop; see `Redraw`.
+    redraw: Redraw = .{},
+    /// Frames finished with `Ui.finish` on this state (one per frame).
+    frames: u64 = 0,
+
     /// True while something animates on its own and the app should keep drawing frames even
-    /// without input: a tooltip waiting for its delay.
+    /// without input: a tooltip waiting for its delay. (An app loop that draws on demand reads
+    /// `redraw` instead, which also says when a frame is next due.)
     pub fn needsRedraw(s: *const State) bool {
         return s.tip.waiting;
+    }
+
+    /// Whether the last frame wants another one at time `now` (on `Input.time`'s clock): a
+    /// widget is animating, or a time it asked for has come.
+    pub fn wantsFrame(s: *const State, now: f64) bool {
+        return s.redraw.animating or s.redraw.at <= now;
     }
 
     pub fn blur(s: *State) void {
@@ -568,6 +596,8 @@ pub const Ui = struct {
     /// The cursor requested this frame by `setCursor` (null: nobody asked). Headless Uis
     /// record it without any platform call, so tests can read it.
     cursor: ?Cursor = null,
+    /// `finish` ran for this frame.
+    finished: bool = false,
     /// Splitter bookkeeping for this frame has started (see `split.splitter`).
     grabs_begun: bool = false,
     /// This frame's press, counted (see `clickCount`).
@@ -1621,7 +1651,8 @@ pub const Ui = struct {
             } else text_input.drawPreeditMarks(ui, x0, x1, ty, line_h, null);
         }
         const show_caret = focused and (pre == null or pre.?.clause == null);
-        if (show_caret and @mod(in.time - st.blink_origin, 1.06) < 0.53) {
+        if (show_caret) ui.requestCaretBlink(st.blink_origin);
+        if (show_caret and ui.caretVisible(st.blink_origin)) {
             ui.list.rect(.{ .x = tx + caret_x, .y = ty, .w = 1.5, .h = line_h }, t.text);
         }
         // The caret's line (also what `input_area` reports, for apps that set the text input area
@@ -1724,9 +1755,55 @@ pub const Ui = struct {
     /// Ends the frame: appends the overlay layers (popups, tooltips) to the main display list and
     /// remembers this frame's popup rectangles for next frame's input routing. Call after the
     /// last widget, before `Window.render`. Without it popups are not drawn.
+    ///
+    /// Safe to call more than once per frame (only the first call counts), and an app loop
+    /// (`vass.app`) calls it for you after the frame function.
     pub fn finish(ui: *Ui) void {
-        if (ui.state) |s| s.grabs.rotate();
+        if (ui.finished) return;
+        ui.finished = true;
+        if (ui.state) |s| {
+            s.grabs.rotate();
+            s.redraw.rotate();
+            s.frames += 1;
+        }
         popup.finish(ui);
+    }
+
+    /// Says that something on screen is animating, so a loop that draws only on demand keeps
+    /// drawing frames (at its own pace) until a frame does not ask again. Call it every frame the
+    /// animation runs: a toggle's knob sliding, a progress bar, a meter fed by audio. No effect
+    /// without a `State`.
+    pub fn requestRedraw(ui: *Ui) void {
+        if (ui.state) |s| s.redraw.animating_next = true;
+    }
+
+    /// Asks for a frame at `time` (on the clock of `Input.time`) even if nothing happens before:
+    /// a delay that runs out, a blink. The loop sleeps until then. Several requests keep the
+    /// earliest. No effect without a `State`.
+    pub fn requestRedrawAt(ui: *Ui, time: f64) void {
+        if (ui.state) |s| s.redraw.at_next = @min(s.redraw.at_next, time);
+    }
+
+    /// `requestRedrawAt` for `seconds` from now.
+    pub fn requestRedrawIn(ui: *Ui, seconds: f64) void {
+        ui.requestRedrawAt(ui.input.time + seconds);
+    }
+
+    /// Period of a caret's blink in seconds (visible for the first half), see `requestCaretBlink`.
+    pub const blink_period: f64 = 1.06;
+
+    /// Whether a caret whose blink started at `origin` is visible now.
+    pub fn caretVisible(ui: *const Ui, origin: f64) bool {
+        return @mod(ui.input.time - origin, blink_period) < blink_period / 2.0;
+    }
+
+    /// Asks for the frame at which a caret whose blink started at `origin` next turns on or off.
+    pub fn requestCaretBlink(ui: *Ui, origin: f64) void {
+        const phase = @mod(ui.input.time - origin, blink_period);
+        const half = blink_period / 2.0;
+        // A hair past the change, so the frame sees the new phase.
+        const left = (if (phase < half) half - phase else blink_period - phase) + 0.001;
+        ui.requestRedrawIn(left);
     }
 
     /// Opens `st` (no-op if open). Opening from the click of a button is safe: the click that
@@ -3345,4 +3422,52 @@ test "Input.feed: losing focus ends a held button and a composition; leaving the
     in.endFrame();
     in.feed(.{ .focus_lost = 1 }, 1);
     try std.testing.expect(!in.released);
+}
+
+test "finish counts a frame once and publishes the frame's redraw requests" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var st: State = .{};
+    var ui = Ui.initHeadless(&list, .{ .time = 2 }, .{}, null);
+    ui.state = &st;
+    ui.requestRedrawAt(5);
+    ui.requestRedrawIn(1); // 3: the earlier of the two
+    ui.requestRedraw();
+    try std.testing.expect(!st.wantsFrame(100)); // nothing is published before finish
+    ui.finish();
+    ui.finish();
+    try std.testing.expectEqual(@as(u64, 1), st.frames);
+    try std.testing.expect(st.redraw.animating);
+    try std.testing.expectEqual(@as(f64, 3), st.redraw.at);
+    // The next frame asks for nothing, so the requests are gone.
+    ui = Ui.initHeadless(&list, .{ .time = 3 }, .{}, null);
+    ui.state = &st;
+    ui.finish();
+    try std.testing.expectEqual(@as(u64, 2), st.frames);
+    try std.testing.expect(!st.wantsFrame(1e9));
+    // Without a state the requests are dropped quietly.
+    var bare = Ui.initHeadless(&list, .{}, .{}, null);
+    bare.requestRedraw();
+    bare.requestRedrawAt(1);
+    bare.finish();
+}
+
+test "a caret asks for the frame where it next turns on or off, a hair after the change" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var st: State = .{};
+    const cases = [_]struct { now: f64, origin: f64, visible: bool, next: f64 }{
+        .{ .now = 10, .origin = 10, .visible = true, .next = 10.531 },
+        .{ .now = 10.3, .origin = 10, .visible = true, .next = 10.531 },
+        .{ .now = 10.6, .origin = 10, .visible = false, .next = 11.061 },
+        .{ .now = 11.07, .origin = 10, .visible = true, .next = 11.591 },
+    };
+    for (cases) |c| {
+        var ui = Ui.initHeadless(&list, .{ .time = c.now }, .{}, null);
+        ui.state = &st;
+        try std.testing.expectEqual(c.visible, ui.caretVisible(c.origin));
+        ui.requestCaretBlink(c.origin);
+        ui.finish();
+        try std.testing.expectApproxEqAbs(c.next, st.redraw.at, 1e-9);
+    }
 }

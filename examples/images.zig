@@ -23,7 +23,6 @@ const App = struct {
     gpa: std.mem.Allocator,
     /// A snapshot run: the drop target is shown highlighted, with two images dropped on it.
     snapshot: bool,
-    state: ui_mod.State = .{},
     test_img: Image = .none,
     sticker: Image = .none,
     jpeg: Image = .none,

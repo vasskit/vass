@@ -37,7 +37,6 @@ const activity = [_]struct { what: []const u8, when: []const u8 }{
 };
 
 const App = struct {
-    state: ui_mod.State = .{},
     side_scroll: ui_mod.ScrollState = .{},
     content_scroll: ui_mod.ScrollState = .{ .arrow_keys = false },
     selected: usize = 0,
@@ -79,7 +78,6 @@ fn outlines(ui: *Ui, lay: *const vass.Layout, from: usize, to: usize) void {
 }
 
 pub fn frame(app: *App, ui: *Ui) void {
-    defer ui.finish();
     _ = app.frame_arena.reset(.retain_capacity);
     const arena = app.frame_arena.allocator();
     const t = ui.theme;
