@@ -1,5 +1,6 @@
 //! A showcase of the form controls: checkbox, toggle, radio, segmented control
-//! and the multi-line text area, in several states. Fully interactive.
+//! and the multi-line text area, in several states. Fully interactive; the scrolling
+//! text area has Undo / Redo buttons beside its heading (Cmd+Z / Cmd+Shift+Z work too).
 //!
 //!     zig build controls                      run it
 //!     zig build controls -- --snapshot DIR    draw a few frames, save DIR/controls.bmp, exit
@@ -51,6 +52,14 @@ const App = struct {
 
 fn heading(ui: *Ui, x: f32, y: f32, str: []const u8) void {
     ui.labelAt(x, y, str, .{ .size = 11, .color = ui.theme.dim, .weight = .semibold });
+}
+
+/// A small text button; a disabled one is drawn dim and never reports a click.
+fn smallButton(ui: *Ui, r: Rect, label: []const u8, enabled: bool) bool {
+    if (enabled) return ui.button(r, label, .{});
+    ui.list.rrect(r, ui.theme.card_radius, ui.theme.card);
+    ui.list.text(r.x + r.w / 2, r.y + (r.h - 14) / 2, ui.theme.font_button, ui.theme.dim.alpha(90), .center, label);
+    return false;
 }
 
 fn frame(app: *App, ui: *Ui, win: ?*vass.platform.Window) void {
@@ -121,6 +130,17 @@ fn frame(app: *App, ui: *Ui, win: ?*vass.platform.Window) void {
     // Full width below the columns: the text area with content, the composer.
     var by = @max(ly + row_h, ry + 64) + 28;
     heading(ui, margin, by, "TEXT AREA, SCROLLING (FIXED 112 HIGH)");
+    // Undo / Redo for the text area, level with its heading: dim while there is nothing to do.
+    const btn_w: f32 = 52;
+    const btn_y = by - 4;
+    if (smallButton(ui, .{ .x = win_w - margin - 2 * btn_w - 6, .y = btn_y, .w = btn_w, .h = 22 }, "Undo", app.notes.canUndo())) {
+        _ = app.notes.undo();
+        app.state.focusOn(&app.notes);
+    }
+    if (smallButton(ui, .{ .x = win_w - margin - btn_w, .y = btn_y, .w = btn_w, .h = 22 }, "Redo", app.notes.canRedo())) {
+        _ = app.notes.redo();
+        app.state.focusOn(&app.notes);
+    }
     by += 22;
     const area_r: Rect = .{ .x = margin, .y = by, .w = win_w - 2 * margin, .h = 112 };
     const res = ui.textArea(area_r, &app.notes, .{ .size = 13 });
@@ -172,6 +192,8 @@ pub fn main(init: std.process.Init) !void {
 
     const theme: vass.ui.Theme = .{ .card_radius = 12 };
     var input: ui_mod.Input = .{};
+    var live: Live = .{ .app = &app, .win = &win, .list = &list, .input = &input, .theme = theme };
+    win.setFrameCallback(&live, Live.onResize);
 
     if (snapshot_dir != null) {
         // A selection from the middle of the first paragraph into the third.
@@ -189,16 +211,37 @@ pub fn main(init: std.process.Init) !void {
             else => if (snapshot_dir == null) input.feed(ev, win.id()),
         };
         input.time = if (snapshot_dir != null) 0 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-        list.reset();
-        var ui = Ui.init(&list, &win, input, theme);
-        ui.state = &app.state;
-        frame(&app, &ui, &win);
 
         const snap = if (snapshot_dir) |dir| n == 3 and dir.len > 0 else false;
         if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/controls.bmp", .{snapshot_dir.?}, 0);
-        win.render(&list, theme.bg);
+        live.draw(input);
         if (snap) running = false;
         input.endFrame();
         vass.platform.sleepMs(16);
     }
 }
+
+/// Draws one frame. The main loop and the window's resize callback both call it, so the
+/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
+const Live = struct {
+    app: *App,
+    win: *vass.platform.Window,
+    list: *vass.DisplayList,
+    input: *ui_mod.Input,
+    theme: vass.ui.Theme,
+
+    fn draw(l: *Live, in: ui_mod.Input) void {
+        l.list.reset();
+        var ui = Ui.init(l.list, l.win, in, l.theme);
+        ui.state = &l.app.state;
+        frame(l.app, &ui, l.win);
+        l.win.render(l.list, l.theme.bg);
+    }
+
+    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
+    fn onResize(ctx: ?*anyopaque) void {
+        const l: *Live = @ptrCast(@alignCast(ctx.?));
+        l.draw(l.input.idle());
+    }
+};
+

@@ -11,7 +11,9 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
   `gfx` and, for text measuring and event types, the backend.
 - `src/keys.zig` — modifier flags and keycode constants. Depends on nothing.
 - `src/text_edit.zig` — `TextEdit`: the pure text editing core (buffer, cursor, selection,
-  key handling). No rendering, no SDL.
+  key handling, undo/redo). No rendering, no SDL.
+- `src/undo.zig` — `History`: the delta-based undo/redo stacks and the typing coalescing rules
+  behind `TextEdit`. Pure data.
 - `src/popup.zig` — popups, menus, the dropdown and tooltips (the implementation behind the `Ui`
   methods), the overlay input routing and the placement maths. Depends on `ui`, like `controls.zig`.
 - `src/png.zig` — minimal PNG writer, for handing generated images to the OS.
@@ -144,8 +146,8 @@ per-widget state. Keyboard focus lives in a caller-owned `vass.ui.State`:
 
 - **`textField`**: single line. Click to focus (and place the caret), drag or shift-click to
   select, Escape or a click elsewhere to blur, Return reports `submitted`. Arrows, home/end,
-  alt for words, cmd for line ends, shift to select, cmd+A/C/X/V, backspace/delete (with alt
-  or cmd for word/line). Scrolls horizontally to keep the caret visible, blinks off
+  alt for words, cmd for line ends, shift to select, cmd+A/C/X/V, cmd+Z / cmd+shift+Z for
+  undo/redo, backspace/delete (with alt or cmd for word/line). Scrolls horizontally to keep the caret visible, blinks off
   `Input.time`, and is clipped to its rectangle. Typed text arrives through
   `Input.events()` in order with key presses; apps with their own shortcuts should ignore
   keys while `ustate.focus != null`.
@@ -153,6 +155,23 @@ per-widget state. Keyboard focus lives in a caller-owned `vass.ui.State`:
   `insert`, `backspace`, `delete`, `move`, `moveTo`, `selectAll`, `copy`/`cut`, and
   `handleKey(code, mods) -> Action` (changed / copy / cut / paste / submit / cancel ...).
   Offsets are bytes on UTF-8 code point boundaries; clipboard access stays with the caller.
+- **Undo/redo** comes with every `TextEdit`, hence with `TextFieldState` and `TextAreaState` and
+  both widgets, with no setup. Cmd+Z undoes, Cmd+Shift+Z redoes (off macOS also Ctrl+Z,
+  Ctrl+Shift+Z and Ctrl+Y; `TextEdit.ctrl_undo`); the caret and selection are restored and kept in
+  view, and `changed` is reported. Programmatically: `undo() bool`, `redo() bool`, `canUndo()`,
+  `canRedo()`, `clearHistory()` on `TextEdit` and on both states (e.g. for Undo/Redo buttons, see
+  `examples/controls.zig`). Edits are stored as deltas, not snapshots, in `edit.history`
+  (default caps: 1000 steps and 1 MiB, oldest dropped first; tune `edit.history.limits`).
+  Coalescing follows macOS: consecutive typed characters, consecutive backspaces and consecutive
+  forward deletes each form one step, which ends at a space typed after a word, at a pause over
+  1 s (`TextEdit.now`, which the widgets set from `Input.time`; set it yourself outside the
+  widgets), on any caret move, click or selection change, on a line break, and when the kind of
+  edit changes. Paste, cut, word/line deletion and typing over a selection are one step each, and
+  composed (IME) text counts as typing. A new edit clears the redo stack. `setText`, `clear` and
+  `TextAreaState.clear` also clear the history (they are resets, not edits); `replaceAll` swaps the
+  text as one undoable step; `insertAs(str, kind)` records an insertion as a given kind. Running
+  out of memory while recording drops the history, never the edit; if the text was changed behind
+  the history's back (writing `edit.buf` directly) the next undo/redo notices and drops it.
 - **`beginScroll` / `endScroll`**: wheel scrolling while hovered (`Theme.scroll_step` points
   per line), clamped, children clipped, and a thin scrollbar thumb drawn over the right edge
   when the content overflows. `Ui.hit` ignores the pointer outside the current clip, so
@@ -190,7 +209,7 @@ adds a note; in memory only).
 
 - IME composition display: the backend delivers `text_editing` and `Input.composition`, but
   `textField` does not draw the pre-edit text yet. Committed IME text does work.
-- Undo/redo, double/triple-click word and line selection inside `textField` (only
+- Double/triple-click word and line selection inside `textField` (only
   `textSelectable` has them), word-wise drag extension after a double click,
   grapheme-cluster-aware caret movement (combining marks and ZWJ emoji take several presses),
   Selecting across several separate texts is not possible (one text at a time).
@@ -206,6 +225,18 @@ adds a note; in memory only).
   and `Ui.measureWeighted` / `Window.measureTextWeighted` honour it.
 - `WindowOptions.resizable` / `min_width` / `min_height`, and `Window.logicalSize()` to lay out
   each frame (no resize event is needed).
+- **Live resize needs a frame callback.** While the user drags a window edge, macOS runs its
+  own loop and your `while (running)` loop is blocked inside `pollEvent`, so nothing is drawn
+  and the OS stretches the last frame until the mouse is released. Put one frame of work in a
+  function and register it with `win.setFrameCallback(ctx, func)` (after the `Window` has its
+  final address; `deinit` unregisters it). SDL then calls it on the main thread from inside the
+  event pump (about 60 times a second during a drag, once per distinct size), with the window's
+  size and scale already refreshed, so `logicalSize()` and `Ui.init` see the new size. In it,
+  draw with `input.idle()` (a copy without this frame's click, keys or scroll, so nothing is
+  replayed or consumed) and leave your own timers and polling to the main loop. It is never
+  re-entered, never runs during `render`, and is ignored on other threads. See `Live` in
+  `examples/notes.zig`. `ScrollState` offsets are re-clamped to the content each frame, so a
+  scroll area stays put (not jump to the top) as the window grows or shrinks.
 - `Ui.chip` / `chipWidth` (small label pills, clickable via the returned `Interaction`),
   `Ui.listRow` (selected/hover highlight for a row), `Ui.labelLines` (wrap to N lines, ending
   in "..."), `Ui.flattenText` (collapse whitespace for previews), `ScrollState.reveal`
@@ -255,7 +286,7 @@ various states) to `DIR/controls.bmp`.
 
 Rough edges: when a word longer than the line is broken between characters, the caret at the
 break shows on the next line's start (no caret affinity), so End on such a line appears to
-stay put; IME pre-edit text is not drawn; no undo.
+stay put; IME pre-edit text is not drawn.
 
 ## Popups, menus, dropdowns and tooltips
 

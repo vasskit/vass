@@ -23,6 +23,7 @@ pub const a: u32 = 'a';
 pub const c: u32 = 'c';
 pub const v: u32 = 'v';
 pub const x: u32 = 'x';
+pub const y: u32 = 'y';
 pub const z: u32 = 'z';
 pub const home: u32 = 0x4000004a;
 pub const page_up: u32 = 0x4000004b;

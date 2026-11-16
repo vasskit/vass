@@ -48,6 +48,10 @@ const c = struct {
     const EVENT_MOUSE_BUTTON_UP: u32 = 0x402;
     const EVENT_MOUSE_WHEEL: u32 = 0x403;
     const EVENT_WINDOW_MOUSE_LEAVE: u32 = 0x20D;
+    const EVENT_WINDOW_EXPOSED: u32 = 0x204;
+    const EVENT_WINDOW_RESIZED: u32 = 0x206;
+    const EVENT_WINDOW_PIXEL_SIZE_CHANGED: u32 = 0x207;
+    const EventWatch = *const fn (userdata: ?*anyopaque, event: *SdlEvent) callconv(.c) bool;
     const SdlPoint = extern struct { x: c_int, y: c_int };
     const HitTest = *const fn (w: *SdlWindow, area: *const SdlPoint, data: ?*anyopaque) callconv(.c) c_int;
     const KMOD_SHIFT: u16 = 0x0003;
@@ -102,6 +106,12 @@ const c = struct {
     extern fn SDL_GetPointerProperty(props: u32, name: [*:0]const u8, default: ?*anyopaque) ?*anyopaque;
     extern fn SDL_SetWindowHitTest(w: *SdlWindow, cb: ?HitTest, data: ?*anyopaque) bool;
     extern fn SDL_GetWindowSize(w: *SdlWindow, width: *c_int, height: *c_int) bool;
+    extern fn SDL_GetWindowSizeInPixels(w: *SdlWindow, width: *c_int, height: *c_int) bool;
+    extern fn SDL_SetWindowSize(w: *SdlWindow, width: c_int, height: c_int) bool;
+    extern fn SDL_AddEventWatch(filter: EventWatch, userdata: ?*anyopaque) bool;
+    extern fn SDL_RemoveEventWatch(filter: EventWatch, userdata: ?*anyopaque) void;
+    extern fn SDL_GetCurrentThreadID() u64;
+    extern fn SDL_PushEvent(e: *SdlEvent) bool;
     extern fn SDL_SetWindowMinimumSize(w: *SdlWindow, min_w: c_int, min_h: c_int) bool;
     extern fn SDL_IOFromConstMem(mem: *const anyopaque, size: usize) ?*IOStream;
     extern fn TTF_OpenFontIO(src: *IOStream, closeio: bool, ptsize: f32) ?*Font;
@@ -603,6 +613,8 @@ pub fn ticks() u64 {
     return c.SDL_GetTicks();
 }
 
+const LiveFrame = struct { ctx: ?*anyopaque, func: *const fn (ctx: ?*anyopaque) void, window_id: u32, thread: u64 };
+
 pub const Window = struct {
     gpa: std.mem.Allocator,
     win: *c.SdlWindow,
@@ -624,6 +636,12 @@ pub const Window = struct {
     svgs: std.AutoHashMapUnmanaged(u32, SvgEntry) = .empty,
     /// Rasterised icons per (icon, pixel size); a null texture marks a size that failed.
     svg_cache: svg_cache.Cache(?*c.Texture) = .{},
+    /// See `setFrameCallback`. The watcher holds a pointer to this `Window`.
+    live: ?LiveFrame = null,
+    /// Window size (points and pixels) of the last frame drawn, to skip redundant live frames.
+    drawn_key: [4]c_int = .{ 0, 0, 0, 0 },
+    in_render: bool = false,
+    live_busy: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, opts: WindowOptions) !Window {
         if (live_windows == 0) {
@@ -654,6 +672,7 @@ pub const Window = struct {
     }
 
     pub fn deinit(w: *Window) void {
+        w.setFrameCallback(null, null);
         var it = w.texts.valueIterator();
         while (it.next()) |t| c.SDL_DestroyTexture(t.tex);
         w.texts.deinit(w.gpa);
@@ -689,6 +708,78 @@ pub const Window = struct {
         var ih: c_int = 0;
         _ = c.SDL_GetWindowSize(w.win, &iw, &ih);
         return .{ .w = @floatFromInt(iw), .h = @floatFromInt(ih) };
+    }
+
+    /// Registers `func` to draw one frame while the OS is live-resizing the
+    /// window, or clears it with a null `func`. Required for a resizable window
+    /// to reflow during a drag: on macOS the system runs its own loop while an
+    /// edge is dragged, so the app's `while (running)` loop is blocked inside
+    /// `pollEvent` and nothing is drawn; the OS then stretches the last frame
+    /// until the mouse is released.
+    ///
+    /// `func(ctx)` is called synchronously from inside SDL's event pump, on the
+    /// thread that called `setFrameCallback` (the main thread), when this
+    /// window is exposed, resized or its pixel size changes (about 60 times a
+    /// second during a drag, at most once per distinct size). It must do
+    /// exactly what one iteration of the app's loop does after reading events:
+    /// build the UI at `logicalSize()` and `render`. Feed it an idle `Input`
+    /// (`Input.idle`) so a click or key is not seen twice, and do not advance
+    /// the app's own timers. Before it runs the window's scale factor is
+    /// refreshed, and `logicalSize()` is already the new size.
+    ///
+    /// It is never called re-entrantly, while `render` is running, or from
+    /// another thread (SDL may call watchers from any thread; those events are
+    /// ignored). The window must not move in memory while a callback is set
+    /// (SDL holds a pointer to it): register after the `Window` has its final
+    /// address. `deinit` clears it. Events for other windows are ignored.
+    pub fn setFrameCallback(w: *Window, ctx: ?*anyopaque, func: ?*const fn (ctx: ?*anyopaque) void) void {
+        if (w.live != null) c.SDL_RemoveEventWatch(liveWatch, w);
+        w.live = null;
+        const f = func orelse return;
+        w.live = .{ .ctx = ctx, .func = f, .window_id = w.id(), .thread = c.SDL_GetCurrentThreadID() };
+        if (!c.SDL_AddEventWatch(liveWatch, w)) w.live = null;
+    }
+
+    fn liveWatch(ud: ?*anyopaque, e: *c.SdlEvent) callconv(.c) bool {
+        const w: *Window = @ptrCast(@alignCast(ud.?));
+        switch (e.type) {
+            c.EVENT_WINDOW_EXPOSED, c.EVENT_WINDOW_RESIZED, c.EVENT_WINDOW_PIXEL_SIZE_CHANGED => {},
+            else => return true,
+        }
+        const live = w.live orelse return true;
+        if (std.mem.readInt(u32, e.raw[16..20], .little) != live.window_id) return true;
+        w.liveFrame(live, e.type == c.EVENT_WINDOW_EXPOSED);
+        return true;
+    }
+
+    fn liveFrame(w: *Window, live: LiveFrame, exposed: bool) void {
+        // SDL may call watchers from any thread; only the registering thread may draw.
+        if (c.SDL_GetCurrentThreadID() != live.thread) return;
+        if (w.live_busy or w.in_render) return;
+        w.live_busy = true;
+        defer w.live_busy = false;
+        w.syncMetrics();
+        // A size we already drew needs no new frame, except an expose (it may have
+        // been uncovered); SDL's own resize timer is an expose too, hence the check.
+        const key = w.sizeKey();
+        if (!exposed and std.mem.eql(c_int, &key, &w.drawn_key)) return;
+        live.func(live.ctx);
+    }
+
+    fn sizeKey(w: *const Window) [4]c_int {
+        var k: [4]c_int = .{ 0, 0, 0, 0 };
+        _ = c.SDL_GetWindowSize(w.win, &k[0], &k[1]);
+        _ = c.SDL_GetWindowSizeInPixels(w.win, &k[2], &k[3]);
+        return k;
+    }
+
+    /// Re-reads the pixel density (it changes when the window moves between
+    /// a Retina and a normal display) and updates the render scale.
+    fn syncMetrics(w: *Window) void {
+        const d = @max(1.0, c.SDL_GetWindowPixelDensity(w.win));
+        if (d == w.density) return;
+        w.density = d;
+        _ = c.SDL_SetRenderScale(w.ren, d, d);
     }
 
     /// Makes the strip `region` (window points) drag the window, except where
@@ -1048,6 +1139,11 @@ pub const Window = struct {
 
     /// Draws the display list and presents the frame.
     pub fn render(w: *Window, list: *const gfx.DisplayList, clear: Color) void {
+        if (w.in_render) return;
+        w.in_render = true;
+        defer w.in_render = false;
+        w.syncMetrics();
+        w.drawn_key = w.sizeKey();
         w.frame += 1;
         _ = c.SDL_SetRenderDrawColor(w.ren, clear.r, clear.g, clear.b, clear.a);
         _ = c.SDL_RenderClear(w.ren);
@@ -1445,4 +1541,96 @@ test "svgPixelSize: contain-fits into whole device pixels" {
     try std.testing.expect(Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 16, .h = 16 }, std.math.nan(f32), 2) == null);
     const big = Window.svgPixelSize(.{ .x = 0, .y = 0, .w = 5000, .h = 5000 }, 1, 2).?;
     try std.testing.expectEqual(max_svg_side, big.w);
+}
+
+const LiveTest = struct {
+    win: *Window,
+    calls: u32 = 0,
+    last_w: f32 = 0,
+    last_h: f32 = 0,
+    nested_calls: u32 = 0,
+    pump_inside: bool = false,
+
+    fn cb(ctx: ?*anyopaque) void {
+        const t: *LiveTest = @ptrCast(@alignCast(ctx.?));
+        t.calls += 1;
+        const sz = t.win.logicalSize();
+        t.last_w = sz.w;
+        t.last_h = sz.h;
+        if (t.pump_inside) {
+            // An event arriving while a frame is being drawn must not re-enter the callback.
+            const before = t.calls;
+            pushWindowEvent(c.EVENT_WINDOW_EXPOSED, t.win.id());
+            t.nested_calls += t.calls - before;
+        }
+    }
+};
+
+fn pushWindowEvent(ev_type: u32, window_id: u32) void {
+    var e: c.SdlEvent = undefined;
+    @memset(&e.raw, 0);
+    e.type = ev_type;
+    std.mem.writeInt(u32, e.raw[16..20], window_id, .little);
+    _ = c.SDL_PushEvent(&e);
+}
+
+fn pushFromThread(window_id: u32) void {
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, window_id);
+}
+
+test "frame callback: runs for this window's expose/resize events with the new size, guarded" {
+    // SDL's dummy video driver: a real SDL window and software renderer, no display needed.
+    _ = c.SDL_SetHint("SDL_VIDEO_DRIVER", "dummy");
+    var win = Window.init(std.testing.allocator, .{ .title = "t", .width = 200, .height = 100, .resizable = true }) catch return error.SkipZigTest;
+    defer win.deinit();
+    var t: LiveTest = .{ .win = &win };
+    win.setFrameCallback(&t, LiveTest.cb);
+
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, win.id());
+    try std.testing.expectEqual(@as(u32, 1), t.calls);
+    try std.testing.expectEqual(@as(f32, 200), t.last_w);
+
+    // Another window's event is ignored.
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, win.id() + 1000);
+    try std.testing.expectEqual(@as(u32, 1), t.calls);
+
+    // Unrelated event types are ignored.
+    pushWindowEvent(c.EVENT_KEY_DOWN, win.id());
+    try std.testing.expectEqual(@as(u32, 1), t.calls);
+
+    // A real size change reaches the callback with the new logical size.
+    _ = c.SDL_SetWindowSize(win.win, 320, 180);
+    pushWindowEvent(c.EVENT_WINDOW_RESIZED, win.id());
+    try std.testing.expect(t.calls >= 2);
+    try std.testing.expectEqual(@as(f32, 320), t.last_w);
+    try std.testing.expectEqual(@as(f32, 180), t.last_h);
+
+    // An unchanged size is not redrawn for a resize event (no duplicate frame per step).
+    win.drawn_key = win.sizeKey();
+    const before = t.calls;
+    pushWindowEvent(c.EVENT_WINDOW_RESIZED, win.id());
+    try std.testing.expectEqual(before, t.calls);
+
+    // Not re-entrant: an expose pushed from inside the callback is dropped.
+    t.pump_inside = true;
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, win.id());
+    try std.testing.expectEqual(before + 1, t.calls);
+    try std.testing.expectEqual(@as(u32, 0), t.nested_calls);
+    t.pump_inside = false;
+
+    // Not while render() is running.
+    win.in_render = true;
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, win.id());
+    win.in_render = false;
+    try std.testing.expectEqual(before + 1, t.calls);
+
+    // Events from another thread never draw.
+    const th = try std.Thread.spawn(.{}, pushFromThread, .{win.id()});
+    th.join();
+    try std.testing.expectEqual(before + 1, t.calls);
+
+    // Cleared: no more calls.
+    win.setFrameCallback(null, null);
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, win.id());
+    try std.testing.expectEqual(before + 1, t.calls);
 }

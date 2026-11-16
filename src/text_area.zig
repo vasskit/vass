@@ -6,7 +6,8 @@
 //! Like the single-line `textField`, state is caller-owned (`TextAreaState`,
 //! whose address is its focus identity) and the editing keys follow macOS:
 //! arrows, alt = by word, cmd+left/right = line edges (visual lines), cmd+up/down
-//! = start/end of the text, shift extends the selection, cmd+a/c/x/v.
+//! = start/end of the text, shift extends the selection, cmd+a/c/x/v, cmd+z undo,
+//! cmd+shift+z redo (see `TextEdit` for how typing runs coalesce).
 const std = @import("std");
 const geom = @import("geom.zig");
 const keys = @import("keys.zig");
@@ -30,6 +31,8 @@ pub const TextAreaState = struct {
     /// scrolled into view when they change, so the wheel can scroll it away.
     seen_cursor: usize = std.math.maxInt(usize),
     seen_len: usize = std.math.maxInt(usize),
+    /// `edit.undo_serial` as of last frame: an undo or redo scrolls the caret into view.
+    seen_serial: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator) TextAreaState {
         return .{ .edit = .{ .gpa = gpa, .multiline = true } };
@@ -39,7 +42,31 @@ pub const TextAreaState = struct {
         s.edit.deinit();
     }
 
-    /// Empties the text and scrolls back to the top.
+    /// Reverts the newest edit (see `TextEdit.undo`); returns false if there is none.
+    /// The caret is scrolled into view next frame.
+    pub fn undo(s: *TextAreaState) bool {
+        s.want_x = null;
+        return s.edit.undo();
+    }
+
+    pub fn redo(s: *TextAreaState) bool {
+        s.want_x = null;
+        return s.edit.redo();
+    }
+
+    pub fn canUndo(s: *const TextAreaState) bool {
+        return s.edit.canUndo();
+    }
+
+    pub fn canRedo(s: *const TextAreaState) bool {
+        return s.edit.canRedo();
+    }
+
+    pub fn clearHistory(s: *TextAreaState) void {
+        s.edit.clearHistory();
+    }
+
+    /// Empties the text, scrolls back to the top and clears the undo history.
     pub fn clear(s: *TextAreaState) void {
         s.edit.clear();
         s.scroll_y = 0;
@@ -123,11 +150,28 @@ fn lineCount(ui: *const Ui, text: []const u8, size: f32, w: f32) usize {
     return n;
 }
 
-/// Inserts `str` without carriage returns (pasted CRLF text becomes LF).
-fn insertClean(st: *TextAreaState, str: []const u8) void {
-    var parts = std.mem.splitScalar(u8, str, '\r');
-    while (parts.next()) |p| {
-        if (p.len > 0) st.edit.insert(p) catch {};
+/// Inserts `str` without carriage returns (pasted CRLF text becomes LF), as one edit of `kind`.
+fn insertClean(st: *TextAreaState, str: []const u8, kind: text_edit.EditKind) void {
+    if (std.mem.indexOfScalar(u8, str, '\r') == null) {
+        st.edit.insertAs(str, kind) catch {};
+        return;
+    }
+    const gpa = st.edit.gpa;
+    if (gpa.alloc(u8, str.len)) |clean| {
+        defer gpa.free(clean);
+        var n: usize = 0;
+        for (str) |b| {
+            if (b != '\r') {
+                clean[n] = b;
+                n += 1;
+            }
+        }
+        st.edit.insertAs(clean[0..n], kind) catch {};
+    } else |_| {
+        var parts = std.mem.splitScalar(u8, str, '\r');
+        while (parts.next()) |p| {
+            if (p.len > 0) st.edit.insertAs(p, kind) catch {};
+        }
     }
 }
 
@@ -155,7 +199,7 @@ fn handleKey(ui: *Ui, st: *TextAreaState, code: u32, m: keys.Mods, opts: TextAre
         if (opts.submit_on_enter and !m.shift) {
             res.submitted = true;
         } else {
-            insertClean(st, "\n");
+            insertClean(st, "\n", .typing);
             res.changed = true;
         }
         return;
@@ -185,7 +229,7 @@ fn handleKey(ui: *Ui, st: *TextAreaState, code: u32, m: keys.Mods, opts: TextAre
         },
         .paste => if (ui.clipboard.get) |get| if (get(ed.gpa)) |str| {
             defer ed.gpa.free(str);
-            insertClean(st, str);
+            insertClean(st, str, .paste);
             res.changed = true;
         },
         .cancel => {
@@ -264,13 +308,14 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
 
     if (focused) {
         const s = ui.state.?;
+        st.edit.now = in.time;
         for (ui.events()) |ev| {
             if (!focused) break;
             st.blink_origin = in.time;
             switch (ev) {
                 .text => |chunk| if (chunk.len > 0) {
                     st.want_x = null;
-                    insertClean(st, chunk.slice());
+                    insertClean(st, chunk.slice(), .typing);
                     res.changed = true;
                 },
                 .key => |k| handleKey(ui, st, k.code, k.mods, opts, size, box.w, &res, s, &focused),
@@ -288,7 +333,7 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
         st.scroll_y -= in.wheel_y * t.scroll_step;
         in.wheel_y = 0; // consumed, so an enclosing scroll area doesn't also move
     }
-    if (focused and (dragging or st.edit.cursor != st.seen_cursor or text.len != st.seen_len)) {
+    if (focused and (dragging or st.edit.cursor != st.seen_cursor or text.len != st.seen_len or st.edit.undo_serial != st.seen_serial)) {
         if (caret_top < st.scroll_y) {
             st.scroll_y = caret_top;
         } else if (caret_top + lh > st.scroll_y + box.h) {
@@ -297,6 +342,7 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
     }
     st.seen_cursor = st.edit.cursor;
     st.seen_len = text.len;
+    st.seen_serial = st.edit.undo_serial;
     const max_scroll = @max(0, content_h - box.h);
     st.scroll_y = std.math.clamp(st.scroll_y, 0, max_scroll);
 
@@ -794,4 +840,97 @@ test "textArea: placeholder shows only while empty; framed area draws a focus ri
         .text => |tx| try std.testing.expectEqualStrings("x", tx.str),
         else => {},
     };
+}
+
+test "textArea: Cmd+Z / Cmd+Shift+Z through the Ui report changed and restore the caret" {
+    var f: Fixture = undefined;
+    try f.setup("");
+    defer f.deinit();
+    var in: Input = .{ .time = 1 };
+    in.pushText("one two");
+    try std.testing.expect(f.frame(in).changed);
+    var res = f.key(keys.@"return", .{});
+    try std.testing.expect(res.changed);
+    in = .{ .time = 1 };
+    in.pushText("three");
+    _ = f.frame(in);
+    try std.testing.expectEqualStrings("one two\nthree", f.st.edit.text());
+    // Steps: "one", " two", "\n", "three" (newline is its own step).
+    res = f.key(keys.z, .{ .cmd = true });
+    try std.testing.expect(res.changed);
+    try std.testing.expectEqualStrings("one two\n", f.st.edit.text());
+    res = f.key(keys.z, .{ .cmd = true });
+    try std.testing.expect(res.changed);
+    try std.testing.expectEqualStrings("one two", f.st.edit.text());
+    try std.testing.expectEqual(@as(usize, 7), f.st.edit.cursor);
+    res = f.key(keys.z, .{ .cmd = true, .shift = true });
+    try std.testing.expect(res.changed);
+    try std.testing.expectEqualStrings("one two\n", f.st.edit.text());
+    res = f.key(keys.z, .{ .cmd = true, .shift = true });
+    try std.testing.expectEqualStrings("one two\nthree", f.st.edit.text());
+    res = f.key(keys.z, .{ .cmd = true, .shift = true }); // nothing to redo
+    try std.testing.expect(!res.changed);
+    try std.testing.expect(f.st.canUndo() and !f.st.canRedo());
+}
+
+test "textArea: pasted CRLF text is a single undo step" {
+    var f: Fixture = undefined;
+    try f.setup("x");
+    defer f.deinit();
+    f.st.clearHistory();
+    fakeClipSet(std.testing.allocator, "a\r\nb\r\nc");
+    _ = f.key(keys.v, .{ .cmd = true });
+    try std.testing.expectEqualStrings("xa\nb\nc", f.st.edit.text());
+    try std.testing.expectEqual(@as(usize, 1), f.st.edit.history.undo_stack.items.len);
+    try std.testing.expect(f.key(keys.z, .{ .cmd = true }).changed);
+    try std.testing.expectEqualStrings("x", f.st.edit.text());
+}
+
+test "textArea: undo and redo scroll the caret into view" {
+    var f: Fixture = undefined;
+    try f.setup("");
+    defer f.deinit();
+    // 30 lines: far taller than the 100 point area (line height 14).
+    var in: Input = .{};
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        in = .{};
+        in.pushText("line");
+        _ = f.frame(in);
+        _ = f.key(keys.@"return", .{});
+    }
+    try std.testing.expect(f.st.scroll_y > 0);
+    const bottom = f.st.scroll_y;
+    // Go to the top and type there.
+    _ = f.key(keys.up, .{ .cmd = true });
+    try std.testing.expectEqual(@as(f32, 0), f.st.scroll_y);
+    in = .{};
+    in.pushText("TOP");
+    _ = f.frame(in);
+    // Jump to the end, then undo the "TOP" typing: the caret goes back up and the view follows.
+    _ = f.key(keys.down, .{ .cmd = true });
+    try std.testing.expectEqual(bottom + 0, @as(f32, bottom));
+    try std.testing.expect(f.st.scroll_y > 0);
+    try std.testing.expect(f.key(keys.z, .{ .cmd = true }).changed);
+    try std.testing.expectEqual(@as(usize, 0), f.st.edit.cursor);
+    try std.testing.expectEqual(@as(f32, 0), f.st.scroll_y);
+    // Redo puts the caret after "TOP", still near the top.
+    try std.testing.expect(f.key(keys.z, .{ .cmd = true, .shift = true }).changed);
+    try std.testing.expectEqual(@as(usize, 3), f.st.edit.cursor);
+    try std.testing.expectEqual(@as(f32, 0), f.st.scroll_y);
+
+    // Same caret and length before and after (a same-size replacement): the serial still scrolls.
+    f.st.edit.moveTo(f.st.edit.text().len - 1, false);
+    f.st.edit.moveTo(f.st.edit.text().len, true); // forward selection of the last character
+    f.st.edit.cursor = f.st.edit.text().len;
+    in = .{};
+    in.pushText("Z");
+    _ = f.frame(in);
+    f.st.scroll_y = 0;
+    const len = f.st.edit.text().len;
+    f.st.seen_cursor = f.st.edit.cursor;
+    f.st.seen_len = len;
+    try std.testing.expect(f.key(keys.z, .{ .cmd = true }).changed);
+    try std.testing.expectEqual(len, f.st.edit.text().len);
+    try std.testing.expect(f.st.scroll_y > 0);
 }

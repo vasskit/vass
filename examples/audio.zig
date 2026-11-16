@@ -323,6 +323,8 @@ pub fn main(init: std.process.Init) !void {
     defer list.deinit();
     const theme: vass.ui.Theme = .{ .card_radius = 12 };
     var input: ui_mod.Input = .{};
+    var live: Live = .{ .app = &app, .win = &win, .gpa = gpa, .list = &list, .input = &input, .theme = theme };
+    win.setFrameCallback(&live, Live.onResize);
     var n: u32 = 0;
     var running = true;
     while (running) : (n += 1) {
@@ -334,17 +336,38 @@ pub fn main(init: std.process.Init) !void {
             if (snapshot_dir == null) input.feed(ev, win.id());
         }
         input.time = if (snapshot_dir != null) 0 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-        list.reset();
-        var ui = Ui.init(&list, &win, input, theme);
-        ui.state = &app.state;
-        frame(&app, &ui, gpa);
 
         const snap = if (snapshot_dir) |dir| n == 3 and dir.len > 0 else false;
         if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/audio.bmp", .{snapshot_dir.?}, 0);
-        win.render(&list, theme.bg);
+        live.draw(input);
         if (snap) running = false;
         input.endFrame();
         // The loop already redraws every frame, so progress and meters move without input.
         vass.platform.sleepMs(16);
     }
 }
+
+/// Draws one frame. The main loop and the window's resize callback both call it, so the
+/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
+const Live = struct {
+    app: *App,
+    win: *vass.platform.Window,
+    gpa: std.mem.Allocator,
+    list: *vass.DisplayList,
+    input: *ui_mod.Input,
+    theme: vass.ui.Theme,
+
+    fn draw(l: *Live, in: ui_mod.Input) void {
+        l.list.reset();
+        var ui = Ui.init(l.list, l.win, in, l.theme);
+        ui.state = &l.app.state;
+        frame(l.app, &ui, l.gpa);
+        l.win.render(l.list, l.theme.bg);
+    }
+
+    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
+    fn onResize(ctx: ?*anyopaque) void {
+        const l: *Live = @ptrCast(@alignCast(ctx.?));
+        l.draw(l.input.idle());
+    }
+};

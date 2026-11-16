@@ -1601,3 +1601,46 @@ test "the wheel does not scroll an area under a popup" {
     try testing.expectEqual(@as(f32, 0), sc.offset);
     rig.end(&u);
 }
+
+test "undo and redo work in a text field hosted by a popup" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var pst: PopupState = .{ .open = true, .fresh = true };
+    var field = ui_mod.TextFieldState.init(testing.allocator);
+    defer field.deinit();
+    const anchor: Rect = .{ .x = 10, .y = 10, .w = 40, .h = 20 };
+    const fr: Rect = .{ .x = 20, .y = 40, .w = 120, .h = 28 };
+    rig.state.focus = &field;
+    // The first frames open the popup (its layer takes input from the frame after).
+    for (0..2) |_| {
+        var u = rig.ui();
+        if (u.beginPopup(&pst, anchor, .{ 160, 100 }, .{})) |_| {
+            _ = u.textField(fr, &field, .{});
+            u.endPopup();
+        }
+        rig.end(&u);
+    }
+    try testing.expect(pst.open);
+    const frame = struct {
+        fn run(r: *Rig, p: *PopupState, anc: Rect, rect: Rect, fld: *ui_mod.TextFieldState) bool {
+            var u = r.ui();
+            var changed = false;
+            if (u.beginPopup(p, anc, .{ 160, 100 }, .{})) |_| {
+                changed = u.textField(rect, fld, .{}).changed;
+                u.endPopup();
+            }
+            r.end(&u);
+            return changed;
+        }
+    }.run;
+    rig.in.pushText("abc");
+    try testing.expect(frame(&rig, &pst, anchor, fr, &field));
+    try testing.expectEqualStrings("abc", field.edit.text());
+    rig.in.pushKey(keys.z, .{ .cmd = true });
+    try testing.expect(frame(&rig, &pst, anchor, fr, &field));
+    try testing.expectEqualStrings("", field.edit.text());
+    rig.in.pushKey(keys.z, .{ .cmd = true, .shift = true });
+    try testing.expect(frame(&rig, &pst, anchor, fr, &field));
+    try testing.expectEqualStrings("abc", field.edit.text());
+    try testing.expect(pst.open);
+}

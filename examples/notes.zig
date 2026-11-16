@@ -242,7 +242,9 @@ pub fn main(init: std.process.Init) !void {
 
     const theme: vass.ui.Theme = .{ .card_radius = 12 };
     var input: ui_mod.Input = .{};
-    const lay = Layout.of(win_w, win_h);
+    var live: Live = .{ .app = &app, .win = &win, .list = &list, .input = &input, .theme = theme, .lay = Layout.of(win_w, win_h) };
+    // Redraw while the OS live-resizes the window (the loop below is blocked then).
+    win.setFrameCallback(&live, Live.onResize);
 
     var n: u32 = 0;
     var running = true;
@@ -261,21 +263,10 @@ pub fn main(init: std.process.Init) !void {
             },
         };
         input.time = if (scripted) @as(f64, @floatFromInt(n)) * 0.016 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-        list.reset();
-        var ui = Ui.init(&list, &win, input, theme);
-        if (scripted) {
-            // The script needs the Ui's text measuring to aim at a card.
-            const pts = pickSelection(&app, &ui, lay);
-            script(&input, n, lay, pts[0], pts[1]);
-            ui.input = input;
-        }
-        ui.state = &app.state;
-        try frame(&app, &ui, lay);
-        if (app.state.focus != null) win.setTextInputArea(lay.field, 0);
 
         const snap = if (snapshot_dir) |dir| n == snap_frame and dir.len > 0 else false;
         if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/notes.bmp", .{snapshot_dir.?}, 0);
-        win.render(&list, theme.bg);
+        try live.draw(input, if (scripted) n else null);
         if (snap) running = false;
 
         // The Ui worked on a copy of the input; keep what it consumed.
@@ -283,3 +274,37 @@ pub fn main(init: std.process.Init) !void {
         vass.platform.sleepMs(16);
     }
 }
+
+/// Everything one frame needs, so the main loop and the resize callback draw the same way.
+const Live = struct {
+    app: *App,
+    win: *vass.platform.Window,
+    list: *vass.DisplayList,
+    input: *ui_mod.Input,
+    theme: vass.ui.Theme,
+    lay: Layout,
+
+    /// One frame: build the UI from `in` and render it. `script_n` is the frame number of a
+    /// scripted run, which injects its own input.
+    fn draw(l: *Live, in: ui_mod.Input, script_n: ?u32) !void {
+        l.list.reset();
+        var ui = Ui.init(l.list, l.win, in, l.theme);
+        if (script_n) |n| {
+            // The script needs the Ui's text measuring to aim at a card.
+            const pts = pickSelection(l.app, &ui, l.lay);
+            script(l.input, n, l.lay, pts[0], pts[1]);
+            ui.input = l.input.*;
+        }
+        ui.state = &l.app.state;
+        try frame(l.app, &ui, l.lay);
+        if (l.app.state.focus != null) l.win.setTextInputArea(l.lay.field, 0);
+        l.win.render(l.list, l.theme.bg);
+    }
+
+    /// Called by the window while it is being resized: an idle frame, so no click or key is
+    /// replayed and `input.time` (hence animations) stays where the last real frame left it.
+    fn onResize(ctx: ?*anyopaque) void {
+        const l: *Live = @ptrCast(@alignCast(ctx.?));
+        l.draw(l.input.idle(), null) catch |e| std.log.warn("resize frame failed: {s}", .{@errorName(e)});
+    }
+};

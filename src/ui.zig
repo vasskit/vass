@@ -193,6 +193,16 @@ pub const Input = struct {
         in.queue_len = 0;
         in.drops_len = 0;
     }
+
+    /// A copy with this frame's one-shot state cleared (no click, release, scroll, keys or
+    /// drops) that keeps the pointer position and held button. For a frame drawn outside the
+    /// event loop, e.g. from `Window.setFrameCallback` while the window is being resized:
+    /// the real `Input` is untouched, so nothing it holds is consumed or replayed.
+    pub fn idle(in: Input) Input {
+        var copy = in;
+        copy.endFrame();
+        return copy;
+    }
 };
 
 /// What outlives a frame in the Ui itself: which widget has keyboard focus
@@ -946,8 +956,8 @@ pub const Ui = struct {
     ///
     /// Clicking focuses it (needs `ui.state`), clicking elsewhere or Escape
     /// blurs it. While focused it consumes this frame's typed text and keys:
-    /// arrows, home/end, alt = by word, shift = select, cmd+a/c/x/v, backspace,
-    /// delete. Return sets `submitted` (the text stays; clear it yourself).
+    /// arrows, home/end, alt = by word, shift = select, cmd+a/c/x/v, cmd+z undo,
+    /// cmd+shift+z redo, backspace, delete. Return sets `submitted` (the text stays; clear it yourself).
     /// Click and drag select; shift-click extends. The text scrolls
     /// horizontally to keep the caret visible. The caret blinks off
     /// `Input.time`. The content is `state.edit.text()`.
@@ -983,6 +993,7 @@ pub const Ui = struct {
 
         if (focused) {
             const s = ui.state.?;
+            st.edit.now = in.time;
             for (ui.events()) |ev| {
                 st.blink_origin = in.time;
                 switch (ev) {
@@ -1002,7 +1013,7 @@ pub const Ui = struct {
                         },
                         .paste => if (ui.clipboard.get) |get| if (get(st.edit.gpa)) |str| {
                             defer st.edit.gpa.free(str);
-                            st.edit.insert(str) catch {};
+                            st.edit.insertAs(str, .paste) catch {};
                             res.changed = true;
                         },
                         .submit => res.submitted = true,
@@ -1337,6 +1348,27 @@ pub const TextFieldState = struct {
 
     pub fn deinit(s: *TextFieldState) void {
         s.edit.deinit();
+    }
+
+    /// Reverts the newest edit (see `TextEdit.undo`); returns false if there is none.
+    pub fn undo(s: *TextFieldState) bool {
+        return s.edit.undo();
+    }
+
+    pub fn redo(s: *TextFieldState) bool {
+        return s.edit.redo();
+    }
+
+    pub fn canUndo(s: *const TextFieldState) bool {
+        return s.edit.canUndo();
+    }
+
+    pub fn canRedo(s: *const TextFieldState) bool {
+        return s.edit.canRedo();
+    }
+
+    pub fn clearHistory(s: *TextFieldState) void {
+        s.edit.clearHistory();
     }
 };
 
@@ -1905,6 +1937,43 @@ test "scroll: wheel scrolls when hovered, clamps, content rect follows" {
     ui.endScroll();
     try std.testing.expectEqual(@as(f32, 0), ss.offset);
     try std.testing.expectEqual(@as(usize, 2), list.cmds.items.len); // push_clip, pop_clip
+}
+
+test "scroll: stays clamped as the viewport or content change size, never jumps to the top" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ss: ScrollState = .{ .offset = 150 };
+    var r: Rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    // The window grows during a resize: the viewport gets taller, so the maximum offset drops.
+    const heights = [_]f32{ 100, 120, 150, 200, 260, 320 };
+    for (heights) |h| {
+        r.h = h;
+        list.reset();
+        var ui = Ui.initHeadless(&list, .{}, .{}, null);
+        _ = ui.beginScroll(r, &ss, 300);
+        ui.endScroll();
+        try std.testing.expectEqual(@min(150, @max(0, 300 - h)), ss.offset);
+    }
+    // Shrinking again does not scroll back up, and an offset past the end is pulled in.
+    r.h = 100;
+    ss.offset = 500;
+    var ui = Ui.initHeadless(&list, .{}, .{}, null);
+    _ = ui.beginScroll(r, &ss, 300);
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 200), ss.offset);
+}
+
+test "Input.idle keeps the pointer and held button but no one-shot state" {
+    var in: Input = .{ .mouse_x = 5, .mouse_y = 6, .pressed = true, .down = true, .released = true, .wheel_y = 2 };
+    in.pushText("a");
+    const idle = in.idle();
+    try std.testing.expect(!idle.pressed and !idle.released and idle.down);
+    try std.testing.expectEqual(@as(f32, 0), idle.wheel_y);
+    try std.testing.expectEqual(@as(usize, 0), idle.events().len);
+    try std.testing.expectEqual(@as(f32, 5), idle.mouse_x);
+    // The original still holds its click and key for the next real frame.
+    try std.testing.expect(in.pressed);
+    try std.testing.expectEqual(@as(usize, 1), in.events().len);
 }
 
 test "scroll: thumb is drawn at the right edge and tracks the offset; children are clipped for hits" {
@@ -2512,3 +2581,89 @@ test "icon widgets accept built-ins, Icon values, SvgIcon and Source" {
 }
 
 const SvgIcon_none: gfx.SvgIcon = .none;
+
+test "textField: Cmd+Z / Cmd+Shift+Z undo and redo through the Ui and report changed" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st = TextFieldState.init(std.testing.allocator);
+    defer st.deinit();
+    state.focusOn(&st);
+    const r: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 30 };
+
+    var in: Input = .{ .time = 1 };
+    in.pushText("hello");
+    try std.testing.expect(fieldFrame(&list, &state, in, &st, r).changed);
+    in = .{ .time = 1.2 };
+    in.pushText(" world");
+    _ = fieldFrame(&list, &state, in, &st, r);
+    try std.testing.expect(st.canUndo() and !st.canRedo());
+
+    in = .{ .time = 1.4 };
+    in.pushKey(keys.z, .{ .cmd = true });
+    try std.testing.expect(fieldFrame(&list, &state, in, &st, r).changed);
+    try std.testing.expectEqualStrings("hello", st.edit.text());
+    try std.testing.expect(st.canRedo());
+    in = .{ .time = 1.5 };
+    in.pushKey(keys.z, .{ .cmd = true, .shift = true });
+    try std.testing.expect(fieldFrame(&list, &state, in, &st, r).changed);
+    try std.testing.expectEqualStrings("hello world", st.edit.text());
+    // Nothing more to redo: consumed, not changed.
+    in = .{ .time = 1.6 };
+    in.pushKey(keys.z, .{ .cmd = true, .shift = true });
+    try std.testing.expect(!fieldFrame(&list, &state, in, &st, r).changed);
+    // Undo twice reaches the empty field; the caret was restored.
+    in = .{ .time = 1.7 };
+    in.pushKey(keys.z, .{ .cmd = true });
+    in.pushKey(keys.z, .{ .cmd = true });
+    try std.testing.expect(fieldFrame(&list, &state, in, &st, r).changed);
+    try std.testing.expectEqualStrings("", st.edit.text());
+    try std.testing.expectEqual(@as(usize, 0), st.edit.cursor);
+    // A pause between keystrokes (Input.time) splits the run.
+    in = .{ .time = 5 };
+    in.pushText("a");
+    _ = fieldFrame(&list, &state, in, &st, r);
+    in = .{ .time = 7 };
+    in.pushText("b");
+    _ = fieldFrame(&list, &state, in, &st, r);
+    in = .{ .time = 7.1 };
+    in.pushKey(keys.z, .{ .cmd = true });
+    _ = fieldFrame(&list, &state, in, &st, r);
+    try std.testing.expectEqualStrings("a", st.edit.text());
+    // Pasting is one step, undone as a whole, and the caret returns.
+    fake_clip_len = 0;
+    fakeClipSet(std.testing.allocator, "pasted text");
+    in = .{ .time = 8 };
+    in.pushKey(keys.v, .{ .cmd = true });
+    _ = fieldFrame(&list, &state, in, &st, r);
+    try std.testing.expectEqualStrings("apasted text", st.edit.text());
+    in = .{ .time = 8.1 };
+    in.pushKey(keys.z, .{ .cmd = true });
+    _ = fieldFrame(&list, &state, in, &st, r);
+    try std.testing.expectEqualStrings("a", st.edit.text());
+    try std.testing.expectEqual(@as(usize, 1), st.edit.cursor);
+}
+
+test "textField: undo keeps the caret visible" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var st = TextFieldState.init(std.testing.allocator);
+    defer st.deinit();
+    state.focusOn(&st);
+    const r: Rect = .{ .x = 0, .y = 0, .w = 30, .h = 30 }; // 10 wide inside, one unit per char
+    var in: Input = .{};
+    in.pushText("0123456789abcdefghijklmnopqrstuvwxyz");
+    _ = fieldFrame(&list, &state, in, &st, r);
+    try std.testing.expect(st.scroll_x > 0);
+    // Undo the whole typing: the text is empty, the caret and scroll are back at the start.
+    in = .{};
+    in.pushKey(keys.z, .{ .cmd = true });
+    _ = fieldFrame(&list, &state, in, &st, r);
+    try std.testing.expectEqual(@as(f32, 0), st.scroll_x);
+    in = .{};
+    in.pushKey(keys.z, .{ .cmd = true, .shift = true });
+    _ = fieldFrame(&list, &state, in, &st, r);
+    try std.testing.expectEqual(@as(usize, 36), st.edit.cursor);
+    try std.testing.expect(st.scroll_x > 0);
+}
