@@ -6,6 +6,7 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 ## Layout
 
 - `src/geom.zig` — rectangles and colours. Depends on nothing.
+- `src/layout.zig` — flex-style layout (`vass.Layout`): a per-frame tree solved to rectangles. Depends only on `geom`.
 - `src/gfx.zig` — display list: drawing recorded as plain data. Depends only on `geom`.
 - `src/ui.zig` — immediate-mode widgets (`vass.Ui`) and the pointer `Input`. Depends on
   `gfx` and, for text measuring and event types, the backend.
@@ -37,7 +38,7 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 - `build/deps.zig` — build helpers compiling FreeType and SDL_ttf from source (SDL3 comes
   from the castholm/SDL package).
 
-Layering rule: `geom`, `gfx`, `image`, `png`, `svg`, `raster` and `svg_cache` know nothing about the platform; only the backend
+Layering rule: `geom`, `layout`, `gfx`, `image`, `png`, `svg`, `raster` and `svg_cache` know nothing about the platform; only the backend
 and `macos` do. (`audio_pcm` and `audio_mixer` are pure too; only `audio.zig` talks to SDL.)
 
 ## Using it
@@ -118,6 +119,51 @@ return the strip, and `inset`, `column`, `row`, `center` derive sub-rectangles.
 Widgets: `label`, `card`, `pill`, `tabs`, `button`, `meter`, `bar`, `hit`, `fitText`.
 `Input.pressed` is true only on the frame a left click arrived, and widgets do not
 occlude each other (except under an open popup, see below). `Ui.initHeadless` builds a Ui without a window, for tests.
+
+## Flex layout
+
+Rect cutting (above) is fine for a handful of boxes. When a screen has many boxes that wrap,
+share space or depend on text size, declare them instead and let `vass.Layout` produce the
+rects. Widgets are still called with a `Rect`; the layout is declared, solved and used in the
+same frame, so nothing lags a frame behind.
+
+    var lay = vass.Layout.init(arena);                // arena reset every frame
+    _ = lay.begin(.{ .dir = .col, .padding = .all(16), .gap = 12 });
+    _ = lay.begin(.{ .dir = .row, .h = .fixed(44), .gap = 8, .cross = .center });
+    const back  = lay.leaf(.{ .w = .fixed(32), .h = .fixed(32) });
+    const title = ui.layText(&lay, "Inbox", 15, .{ .w = .grow(1) });
+    lay.end();
+    const body = ui.layWrapped(&lay, long_text, 13, .{});   // height follows the width
+    lay.end();
+    lay.solve(ui.bounds);
+    _ = ui.iconButton(lay.rect(back), .arrow_left, .{});
+    ui.label(lay.rect(title), "Inbox", .{ .size = 15 });
+    _ = ui.labelWrapped(lay.rect(body), long_text, .{ .size = 13 });
+
+- **Sizes** per axis: `.fixed(px)`, `.grow(weight)` (shares leftover main-axis space; stretches on
+  the cross axis), `.hug` (children plus padding; 0 for a leaf), `.percent(f)` of the parent's content
+  box, `.measured(ctx, fn)` (a leaf whose extent comes from a callback at the width it is given).
+  Plus `min_w/max_w/min_h/max_h`, `aspect` (w/h) and `shrink` (children never shrink unless asked).
+- **Containers**: `dir` (`.row`/`.col`), `gap`, `padding` (`.all`, `.xy`), `main` (`.start .center .end
+  .space_between`), `cross` (`.start .center .end .stretch`, per child `align_self`), `wrap` with
+  `line_gap` (rows only), `scroll` (`.y`/`.x`/`.both`), and `position = .absolute` with `inset` for
+  out-of-flow badges and overlays. Sizes are border-box.
+- **Queries after `solve`**: `rect`, `contentSize`, `overflow`, `scrollTo`. For a scrolling node:
+  `ui.beginScroll(lay.rect(n), &st, lay.contentSize(n).h); lay.scrollTo(n, 0, st.offset);`
+  then draw the children with their `rect`s.
+- **Rounding**: every edge is snapped to a whole point (`floor(v + 0.5)`), so neighbours share an
+  edge and never overlap or leave a gap, and children stay inside their parent.
+- **One level, no tree**: `layout.row(area, .{ .gap = 8 }, &.{ .fixed(32), .grow(1) }, &rects)`
+  (`col` likewise; `rects.len` must equal the sizes), or by name:
+  `const r = layout.rowNamed(area, .{}, .{ .icon = layout.fixed(32), .title = layout.grow(1) });`
+  gives `r.icon`, `r.title`. (Write `layout.fixed(..)`, not a bare `.fixed(..)`: an anonymous
+  struct gives Zig no type to resolve it against.)
+- Misuse (unbalanced `begin`/`end`, nesting past 64) asserts in Debug and is ignored otherwise;
+  every input is sanitised, so NaN or negative sizes cannot produce NaN rects.
+
+Use rect cutting for a fixed strip or two; use `Layout` for forms, rows that adapt to the window
+size, wrapping chips, text-driven heights and scrolling columns. They mix freely: any `Rect` from a
+layout can be cut further. `zig build layout` is a resizable demo (`-- --snapshot DIR` for images).
 
 ## Text input, scrolling, wrapping
 

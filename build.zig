@@ -174,6 +174,21 @@ pub fn build(b: *std.Build) void {
     run_popups.addPassthruArgs();
     b.step("popups", "Run the popups showcase").dependOn(&run_popups.step);
     test_step.dependOn(&popups_ex.step);
+
+    // Example: the layout system. `zig build layout -- --snapshot DIR`.
+    const layout_ex = b.addExecutable(.{
+        .name = "layout",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/layout.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_layout = b.addRunArtifact(layout_ex);
+    run_layout.addPassthruArgs();
+    b.step("layout", "Run the layout showcase").dependOn(&run_layout.step);
+    test_step.dependOn(&layout_ex.step);
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

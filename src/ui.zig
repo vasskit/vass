@@ -27,6 +27,7 @@ const text_edit = @import("text_edit.zig");
 const controls = @import("controls.zig");
 const text_area = @import("text_area.zig");
 const popup = @import("popup.zig");
+const layout = @import("layout.zig");
 pub const TextEdit = text_edit.TextEdit;
 pub const mixColor = controls.mix;
 const Rect = geom.Rect;
@@ -772,6 +773,64 @@ pub const Ui = struct {
             if (line.len > 0) ui.labelAt(x, y, line, opts);
         }
         return y - r.y;
+    }
+
+    // ---- layout leaves for text ---------------------------------------
+
+    const TextLeaf = struct {
+        ui: *const Ui,
+        str: []const u8,
+        size: f32,
+        weight: gfx.Weight,
+
+        fn single(ctx: ?*anyopaque, max_w: f32) layout.Extent {
+            _ = max_w;
+            const t: *const TextLeaf = @ptrCast(@alignCast(ctx.?));
+            return .{ .w = t.ui.measureWeighted(t.str, t.size, t.weight), .h = t.ui.lineHeight(t.size) };
+        }
+
+        fn wrapped(ctx: ?*anyopaque, max_w: f32) layout.Extent {
+            const t: *const TextLeaf = @ptrCast(@alignCast(ctx.?));
+            const lh = t.ui.lineHeight(t.size);
+            if (!std.math.isFinite(max_w)) return .{ .w = t.ui.measure(t.str, t.size), .h = if (t.str.len == 0) 0 else lh };
+            var it = t.ui.wrapText(t.str, t.size, @max(0, max_w));
+            var lines: f32 = 0;
+            var widest: f32 = 0;
+            while (it.next()) |line| {
+                lines += 1;
+                widest = @max(widest, t.ui.measure(line, t.size));
+            }
+            return .{ .w = widest, .h = lines * lh };
+        }
+    };
+
+    /// A single-line text leaf for `lay`: hug width (the text's width) and one line high.
+    /// `opts` is used as given except `w` and `h`, which stay as the caller set them unless
+    /// they are the default `.hug`. Draw it with `ui.label(lay.rect(node), str, .{ .size = size })`.
+    pub fn layText(ui: *const Ui, lay: *layout.Layout, str: []const u8, size: f32, opts: layout.Opts) layout.Node {
+        return ui.layTextWeighted(lay, str, size, .regular, opts);
+    }
+
+    /// `layText` for a font weight.
+    pub fn layTextWeighted(ui: *const Ui, lay: *layout.Layout, str: []const u8, size: f32, weight: gfx.Weight, opts: layout.Opts) layout.Node {
+        var o = opts;
+        if (lay.create(TextLeaf, .{ .ui = ui, .str = str, .size = size, .weight = weight })) |t| {
+            if (o.w.kind == .hug) o.w = .measured(t, TextLeaf.single);
+            if (o.h.kind == .hug) o.h = .measured(t, TextLeaf.single);
+        }
+        return lay.leaf(o);
+    }
+
+    /// A wrapped-text leaf for `lay`: its height comes from `measureWrapped` at the width it
+    /// is given (the same wrapping `labelWrapped` draws). Width defaults to `.grow(1)`.
+    /// Draw it with `ui.labelWrapped(lay.rect(node), str, .{ .size = size })`.
+    pub fn layWrapped(ui: *const Ui, lay: *layout.Layout, str: []const u8, size: f32, opts: layout.Opts) layout.Node {
+        var o = opts;
+        if (o.w.kind == .hug) o.w = .grow(1);
+        if (lay.create(TextLeaf, .{ .ui = ui, .str = str, .size = size, .weight = .regular })) |t| {
+            if (o.h.kind == .hug) o.h = .measured(t, TextLeaf.wrapped);
+        }
+        return lay.leaf(o);
     }
 
     // ---- selectable text ----------------------------------------------
@@ -1579,6 +1638,27 @@ test "wrapText: greedy word wrap" {
     // Runs of spaces at a break vanish; elsewhere they stay.
     try expectLines(&ui, "aa   bb", 4, &.{ "aa", "bb" });
     try expectLines(&ui, "a  b", 10, &.{"a  b"});
+}
+
+test "layout leaves for text measure single lines and wrapped height" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ui = wrapUi(&list); // cpMeasure: one point per code point at size 1
+    var lay = layout.Layout.init(arena.allocator());
+    _ = lay.begin(.{ .dir = .col, .w = .fixed(10), .h = .fixed(100), .cross = .start });
+    const one = ui.layText(&lay, "hello", 1, .{});
+    const para = ui.layWrapped(&lay, "the quick brown fox", 1, .{});
+    lay.end();
+    lay.solve(.{ .x = 0, .y = 0, .w = 50, .h = 100 });
+    const lh = ui.lineHeight(1);
+    try std.testing.expectEqual(@as(f32, 5), lay.rect(one).w);
+    try std.testing.expectEqual(lh, lay.rect(one).h);
+    // Ten points wide: "the quick" / "brown fox".
+    try std.testing.expectEqual(@as(f32, 10), lay.rect(para).w);
+    try std.testing.expectEqual(2 * lh, lay.rect(para).h);
+    try std.testing.expectEqual(ui.measureWrapped("the quick brown fox", 1, 10), lay.rect(para).h);
 }
 
 test "wrapText: newlines, blank lines, empty input" {

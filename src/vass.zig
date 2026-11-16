@@ -4,6 +4,7 @@
 //! Layering rule: `geom` depends on nothing, `gfx` depends only on `geom`,
 //! and only the backend knows about the windowing/rendering library.
 pub const geom = @import("geom.zig");
+pub const layout = @import("layout.zig");
 pub const gfx = @import("gfx.zig");
 pub const ui = @import("ui.zig");
 pub const popup = @import("popup.zig");
@@ -23,6 +24,7 @@ pub const macos = @import("macos.zig");
 
 pub const Rect = geom.Rect;
 pub const Color = geom.Color;
+pub const Layout = layout.Layout;
 pub const DisplayList = gfx.DisplayList;
 pub const Audio = audio.Audio;
 pub const Image = image.Image;
@@ -50,6 +52,7 @@ test {
     _ = svg_cache;
     _ = gfx;
     _ = geom;
+    _ = layout;
     _ = image;
     _ = decode;
     _ = audio;
