@@ -1,4 +1,4 @@
-//! SDL3 backend: one window, input events, and a display-list renderer.
+//! SDL3 backend: windows (any number, see `Window`), input events, and a display-list renderer.
 //! SDL is declared by hand (only what is used) so the build needs no C headers.
 const std = @import("std");
 const geom = @import("geom.zig");
@@ -49,6 +49,8 @@ const c = struct {
     const EVENT_MOUSE_BUTTON_UP: u32 = 0x402;
     const EVENT_MOUSE_WHEEL: u32 = 0x403;
     const EVENT_WINDOW_MOUSE_LEAVE: u32 = 0x20D;
+    const EVENT_WINDOW_FOCUS_GAINED: u32 = 0x20E;
+    const EVENT_WINDOW_FOCUS_LOST: u32 = 0x20F;
     const EVENT_WINDOW_EXPOSED: u32 = 0x204;
     const EVENT_WINDOW_RESIZED: u32 = 0x206;
     const EVENT_WINDOW_PIXEL_SIZE_CHANGED: u32 = 0x207;
@@ -86,6 +88,11 @@ const c = struct {
     extern fn SDL_DestroyWindow(w: *SdlWindow) void;
     extern fn SDL_GetWindowPixelDensity(w: *SdlWindow) f32;
     extern fn SDL_SetWindowAlwaysOnTop(w: *SdlWindow, on_top: bool) bool;
+    extern fn SDL_SetWindowTitle(w: *SdlWindow, title: [*:0]const u8) bool;
+    extern fn SDL_GetWindowPosition(w: *SdlWindow, x: *c_int, y: *c_int) bool;
+    extern fn SDL_GetMouseFocus() ?*SdlWindow;
+    extern fn SDL_GetKeyboardFocus() ?*SdlWindow;
+    extern fn SDL_TextInputActive(w: *SdlWindow) bool;
     extern fn SDL_CreateRenderer(w: *SdlWindow, name: ?[*:0]const u8) ?*Renderer;
     extern fn SDL_DestroyRenderer(r: *Renderer) void;
     extern fn SDL_SetRenderVSync(r: *Renderer, vsync: c_int) bool;
@@ -197,7 +204,9 @@ pub const Key = struct {
 pub const Event = union(enum) {
     /// The application was asked to quit (Cmd+Q, or the last window closed).
     quit,
-    /// A window's close button was pressed; payload is the window id.
+    /// A window's close button (or Cmd+W where the app maps it) was pressed; payload is the
+    /// window id. Nothing is closed by it: the app decides which window to destroy. Distinct
+    /// from `quit` (the whole app was asked to quit, or the last window was closed).
     close_requested: u32,
     /// `button` is 1 for left, 2 for middle, 3 for right. `mods` are the
     /// modifiers held at that moment (for shift-click).
@@ -217,6 +226,11 @@ pub const Event = union(enum) {
     text_input: struct { window: u32, text: TextChunk },
     /// Input-method composition changed; an empty string means it ended.
     text_editing: struct { window: u32, comp: Composition },
+    /// The window gained keyboard focus; payload is the window id.
+    focus_gained: u32,
+    /// The window lost keyboard focus (another window or app was activated); payload is the window id.
+    /// A button that was held may never report its release to this window.
+    focus_lost: u32,
     /// A drag from another app entered the window (a new set of drops begins).
     drop_begin: u32,
     /// The dragged items moved over the window (window points).
@@ -305,6 +319,10 @@ var dialog_lock: std.atomic.Value(bool) = .init(false);
 var dialog_pending: bool = false; // a dialog is open (guarded by the lock)
 var dialog_done: ?RawDialog = null; // its result, until taken (guarded by the lock)
 var dialog_filters: [8]c.DialogFilter = undefined;
+/// The window (id) that opened the open dialog; only it can take the result. Main thread only.
+var dialog_owner: u32 = 0;
+/// The owner went away while the dialog was open: its result is dropped when it arrives (guarded by the lock).
+var dialog_orphaned: bool = false;
 
 fn lockDialog() void {
     while (dialog_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
@@ -337,8 +355,29 @@ fn dialogCallback(_: ?*anyopaque, list: ?[*:null]const ?[*:0]const u8, _: c_int)
     }
     lockDialog();
     dialog_pending = false;
+    if (dialog_orphaned) {
+        dialog_orphaned = false;
+        unlockDialog();
+        if (raw.data.len > 0) std.heap.c_allocator.free(raw.data);
+        return;
+    }
     dialog_done = raw;
     unlockDialog();
+}
+
+/// A window is going away: its dialog result (finished or still to come) must not stay behind,
+/// or no window could ever open another dialog.
+fn discardDialogOf(window_id: u32) void {
+    lockDialog();
+    defer unlockDialog();
+    if (dialog_owner != window_id) return;
+    dialog_owner = 0;
+    if (dialog_done) |raw| {
+        dialog_done = null;
+        if (raw.data.len > 0) std.heap.c_allocator.free(raw.data);
+    } else if (dialog_pending) {
+        dialog_orphaned = true;
+    }
 }
 
 /// Moves a finished dialog's result out of the shared slot (without touching SDL).
@@ -413,9 +452,41 @@ pub const WindowOptions = struct {
     /// Smallest size a resizable window can be dragged to (points; 0 = none).
     min_width: u32 = 0,
     min_height: u32 = 0,
+    /// Where the window's top-left corner goes (screen points) before it is first shown; null
+    /// leaves the placement to the OS, which stacks new windows on the same spot. See `cascadeIn`.
+    position: ?[2]f32 = null,
 };
 
+/// How far each window of a cascade is offset from the previous one, in points.
+pub const cascade_step: f32 = 28;
+
+/// Where window number `index` (0, 1, 2, ...) of size `width` x `height` goes so that windows
+/// opened one after another do not hide each other: stepped down and right by `cascade_step` from
+/// 40 points inside `area` (use `usableBounds`), wrapping back to the first spot before one would
+/// leave the area. Pure.
+pub fn cascadeIn(area: geom.Rect, index: u32, width: f32, height: f32) [2]f32 {
+    const margin: f32 = 40;
+    const room = @min(area.w - width - margin, area.h - height - margin);
+    if (room < 0) return .{ area.x, area.y }; // does not fit: top-left corner
+    const steps: u32 = @as(u32, @intFromFloat(room / cascade_step)) + 1;
+    const k: f32 = @floatFromInt(index % steps);
+    return .{ area.x + margin + k * cascade_step, area.y + margin + k * cascade_step };
+}
+
+/// `cascadeIn` on the primary display's usable area.
+pub fn cascadePosition(index: u32, width: f32, height: f32) [2]f32 {
+    return cascadeIn(usableBounds(), index, width, height);
+}
+
 var live_windows: usize = 0;
+
+/// The last window is gone: free what is process-wide and shut SDL down.
+fn shutdownVideo() void {
+    freeCursors();
+    c.TTF_Quit();
+    // Only video: an `Audio` may still be using SDL (it quits its own subsystem).
+    c.SDL_QuitSubSystem(c.INIT_VIDEO);
+}
 
 /// Primary display in points, including the menu bar and Dock areas.
 pub fn displayBounds() geom.Rect {
@@ -442,17 +513,53 @@ pub fn globalMouse() Mouse {
     return .{ .x = x, .y = y, .left_down = buttons & 1 != 0 };
 }
 
-var drag_region: ?geom.Rect = null;
-var drag_exclude: [16]geom.Rect = undefined;
-var drag_exclude_n: usize = 0;
+/// Window drag regions (`Window.setDragRegion`), one per window. SDL's hit-test callback gets
+/// the SDL window, so the entry is found by it; the table is process-wide but keyed per window.
+const max_drag_windows = 8;
+const DragEntry = struct {
+    win: *c.SdlWindow,
+    region: geom.Rect,
+    exclude: [16]geom.Rect = undefined,
+    n: usize = 0,
+};
+var drag_table: [max_drag_windows]?DragEntry = @splat(null);
 
-fn hitTest(_: *c.SdlWindow, area: *const c.SdlPoint, _: ?*anyopaque) callconv(.c) c_int {
-    const x: f32 = @floatFromInt(area.x);
-    const y: f32 = @floatFromInt(area.y);
-    const r = drag_region orelse return 0;
-    if (!r.contains(x, y)) return 0;
-    for (drag_exclude[0..drag_exclude_n]) |e| if (e.contains(x, y)) return 0;
-    return 1; // SDL_HITTEST_DRAGGABLE
+fn dragEntry(win: *c.SdlWindow) ?*const DragEntry {
+    for (&drag_table) |*slot| if (slot.*) |*e| if (e.win == win) return e;
+    return null;
+}
+
+fn dragHit(e: *const DragEntry, x: f32, y: f32) bool {
+    if (!e.region.contains(x, y)) return false;
+    for (e.exclude[0..e.n]) |ex| if (ex.contains(x, y)) return false;
+    return true;
+}
+
+fn hitTest(win: *c.SdlWindow, area: *const c.SdlPoint, _: ?*anyopaque) callconv(.c) c_int {
+    const e = dragEntry(win) orelse return 0;
+    return if (dragHit(e, @floatFromInt(area.x), @floatFromInt(area.y))) 1 else 0; // 1 = SDL_HITTEST_DRAGGABLE
+}
+
+/// Sets, replaces (`region` non-null) or removes (null) the drag region of `win`. False if the
+/// table is full.
+fn setDrag(win: *c.SdlWindow, region: ?geom.Rect, exclude: []const geom.Rect) bool {
+    var slot_i: ?usize = null;
+    var free_i: ?usize = null;
+    for (drag_table, 0..) |slot, i| {
+        if (slot) |e| {
+            if (e.win == win) slot_i = i;
+        } else if (free_i == null) free_i = i;
+    }
+    const r = region orelse {
+        if (slot_i) |i| drag_table[i] = null;
+        return true;
+    };
+    const i = slot_i orelse free_i orelse return false;
+    var e: DragEntry = .{ .win = win, .region = r };
+    e.n = @min(exclude.len, e.exclude.len);
+    @memcpy(e.exclude[0..e.n], exclude[0..e.n]);
+    drag_table[i] = e;
+    return true;
 }
 
 var pending_text: [256]u8 = undefined;
@@ -502,54 +609,57 @@ fn nextPendingChunk() ?Event {
     return .{ .text_input = .{ .window = pending_window, .text = chunk } };
 }
 
+/// Turns one raw SDL event (`SDL_Event` layout: type at 0, window id at 16) into an `Event`, or
+/// null for the ones the toolkit ignores. Every event that belongs to a window carries its id.
+/// Text events are queued in `pending_text` and come out in chunks (see `nextPendingChunk`).
+fn decodeRaw(ev_type: u32, raw: []const u8) ?Event {
+    const window = std.mem.readInt(u32, raw[16..20], .little);
+    switch (ev_type) {
+        c.EVENT_QUIT => return .quit,
+        c.EVENT_WINDOW_CLOSE_REQUESTED => return .{ .close_requested = window },
+        c.EVENT_KEY_DOWN => return .{ .key_down = keyFrom(raw) },
+        c.EVENT_KEY_UP => return .{ .key_up = keyFrom(raw) },
+        c.EVENT_TEXT_INPUT => {
+            const str = eventString(raw, 24);
+            // Anything beyond the buffer (256 bytes in one event) is dropped.
+            const n = @min(str.len, pending_text.len);
+            @memcpy(pending_text[0..n], str[0..n]);
+            pending_len = n;
+            pending_pos = 0;
+            pending_window = window;
+            return nextPendingChunk();
+        },
+        c.EVENT_TEXT_EDITING => {
+            const str = eventString(raw, 24);
+            var comp: Composition = .{
+                .start = std.mem.readInt(i32, raw[32..36], .little),
+                .length = std.mem.readInt(i32, raw[36..40], .little),
+            };
+            var n = @min(str.len, comp.buf.len);
+            while (n > 0 and n < str.len and str[n] & 0xC0 == 0x80) n -= 1;
+            @memcpy(comp.buf[0..n], str[0..n]);
+            comp.len = @intCast(n);
+            return .{ .text_editing = .{ .window = window, .comp = comp } };
+        },
+        c.EVENT_WINDOW_MOUSE_LEAVE => return .{ .mouse_leave = window },
+        c.EVENT_WINDOW_FOCUS_GAINED => return .{ .focus_gained = window },
+        c.EVENT_WINDOW_FOCUS_LOST => return .{ .focus_lost = window },
+        // The path lives in SDL's event memory until the next poll; decodeDropEvent copies it.
+        c.EVENT_DROP_FILE, c.EVENT_DROP_BEGIN, c.EVENT_DROP_COMPLETE, c.EVENT_DROP_POSITION => return decodeDropEvent(ev_type, raw),
+        c.EVENT_MOUSE_WHEEL => return .{ .mouse_wheel = .{ .window = window, .dx = readF32(raw, 24), .dy = readF32(raw, 28) } },
+        c.EVENT_MOUSE_MOTION => return .{ .mouse_move = .{ .window = window, .x = readF32(raw, 28), .y = readF32(raw, 32) } },
+        c.EVENT_MOUSE_BUTTON_UP => return .{ .mouse_up = .{ .window = window, .x = readF32(raw, 28), .y = readF32(raw, 32), .button = raw[24] } },
+        c.EVENT_MOUSE_BUTTON_DOWN => return .{ .mouse_down = .{ .window = window, .x = readF32(raw, 28), .y = readF32(raw, 32), .button = raw[24], .mods = modState(), .clicks = raw[26] } },
+        else => return null,
+    }
+}
+
 /// Returns the next pending event for any window, or null when the queue is empty.
 pub fn pollEvent() ?Event {
     if (nextPendingChunk()) |ev| return ev;
     var e: c.SdlEvent = undefined;
     while (c.SDL_PollEvent(&e)) {
-        const window = std.mem.readInt(u32, e.raw[16..20], .little);
-        switch (e.type) {
-            c.EVENT_QUIT => return .quit,
-            c.EVENT_WINDOW_CLOSE_REQUESTED => return .{ .close_requested = window },
-            c.EVENT_KEY_DOWN => return .{ .key_down = keyFrom(&e.raw) },
-            c.EVENT_KEY_UP => return .{ .key_up = keyFrom(&e.raw) },
-            c.EVENT_TEXT_INPUT => {
-                const str = eventString(&e.raw, 24);
-                // Anything beyond the buffer (256 bytes in one event) is dropped.
-                const n = @min(str.len, pending_text.len);
-                @memcpy(pending_text[0..n], str[0..n]);
-                pending_len = n;
-                pending_pos = 0;
-                pending_window = window;
-                if (nextPendingChunk()) |ev| return ev;
-            },
-            c.EVENT_TEXT_EDITING => {
-                const str = eventString(&e.raw, 24);
-                var comp: Composition = .{
-                    .start = std.mem.readInt(i32, e.raw[32..36], .little),
-                    .length = std.mem.readInt(i32, e.raw[36..40], .little),
-                };
-                var n = @min(str.len, comp.buf.len);
-                while (n > 0 and n < str.len and str[n] & 0xC0 == 0x80) n -= 1;
-                @memcpy(comp.buf[0..n], str[0..n]);
-                comp.len = @intCast(n);
-                return .{ .text_editing = .{ .window = window, .comp = comp } };
-            },
-            c.EVENT_WINDOW_MOUSE_LEAVE => return .{ .mouse_leave = window },
-            c.EVENT_DROP_FILE, c.EVENT_DROP_BEGIN, c.EVENT_DROP_COMPLETE, c.EVENT_DROP_POSITION => {
-                // The path lives in SDL's event memory until the next poll; decodeDropEvent copies it.
-                if (decodeDropEvent(e.type, &e.raw)) |ev| return ev;
-            },
-            c.EVENT_MOUSE_WHEEL => return .{ .mouse_wheel = .{ .window = window, .dx = readF32(&e.raw, 24), .dy = readF32(&e.raw, 28) } },
-            c.EVENT_MOUSE_BUTTON_DOWN, c.EVENT_MOUSE_BUTTON_UP, c.EVENT_MOUSE_MOTION => {
-                const x = readF32(&e.raw, 28);
-                const y = readF32(&e.raw, 32);
-                if (e.type == c.EVENT_MOUSE_MOTION) return .{ .mouse_move = .{ .window = window, .x = x, .y = y } };
-                if (e.type == c.EVENT_MOUSE_BUTTON_UP) return .{ .mouse_up = .{ .window = window, .x = x, .y = y, .button = e.raw[24] } };
-                return .{ .mouse_down = .{ .window = window, .x = x, .y = y, .button = e.raw[24], .mods = modState(), .clicks = e.raw[26] } };
-            },
-            else => {},
-        }
+        if (decodeRaw(e.type, &e.raw)) |ev| return ev;
     }
     return null;
 }
@@ -652,6 +762,17 @@ pub const Cursor = enum {
 
 /// Created system cursors, one per `Cursor`; SDL cursors are process-wide, not per window.
 var cursor_cache: [std.enums.values(Cursor).len]?*c.SdlCursor = @splat(null);
+/// The cursor SDL was last told to show, and for which window (null: none yet), to skip redundant calls.
+var cursor_applied: ?Cursor = null;
+var cursor_applied_for: ?*c.SdlWindow = null;
+
+/// A window may set the process-wide cursor only while the pointer is over it: otherwise the
+/// window drawn last (which wants the arrow) would reset the cursor a window under the pointer
+/// asked for. With the pointer over none of our windows the cursor is not visible, so anyone may.
+fn cursorOwner(mouse_focus: ?*c.SdlWindow, mine: *c.SdlWindow) bool {
+    const f = mouse_focus orelse return true;
+    return f == mine;
+}
 
 fn systemCursor(cur: Cursor) ?*c.SdlCursor {
     const i = @intFromEnum(cur);
@@ -664,6 +785,8 @@ fn freeCursors() void {
         if (slot.*) |cur| c.SDL_DestroyCursor(cur);
         slot.* = null;
     }
+    cursor_applied = null;
+    cursor_applied_for = null;
 }
 
 /// Milliseconds since the platform was initialised.
@@ -702,25 +825,37 @@ pub const Window = struct {
     live_busy: bool = false,
     /// The cursor the app asked for this frame (`setCursor`); `render` applies it and goes back to arrow.
     cursor_wanted: Cursor = .arrow,
-    /// The cursor SDL was last told to show (null: none yet), to skip redundant calls.
-    cursor_applied: ?Cursor = null,
 
+    /// Opens a window. SDL and SDL_ttf are started by the first window and shut down with the last
+    /// one (each is initialised once and quit once, however many windows come and go in
+    /// between); a failed `init` leaves nothing started that it started. The returned `Window`
+    /// is a value: keep it at one address while a frame callback is registered or a `Ui` holds
+    /// it. For a window that is opened and closed at run time use `create` and `destroy`.
     pub fn init(gpa: std.mem.Allocator, opts: WindowOptions) !Window {
-        if (live_windows == 0) {
+        const first = live_windows == 0;
+        if (first) {
             // Let the first click on an unfocused window count as a click.
             _ = c.SDL_SetHint("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
             if (!c.SDL_Init(c.INIT_VIDEO)) return fail("SDL_Init");
-            if (!c.TTF_Init()) return fail("TTF_Init");
+            if (!c.TTF_Init()) {
+                const err = fail("TTF_Init");
+                c.SDL_QuitSubSystem(c.INIT_VIDEO);
+                return err;
+            }
         }
+        errdefer if (first) shutdownVideo();
         var flags: u64 = c.WINDOW_HIGH_PIXEL_DENSITY;
         if (opts.always_on_top) flags |= c.WINDOW_ALWAYS_ON_TOP;
         if (opts.borderless) flags |= c.WINDOW_BORDERLESS;
         if (opts.transparent) flags |= c.WINDOW_TRANSPARENT;
-        if (opts.hidden) flags |= c.WINDOW_HIDDEN;
+        // A window with a position is created hidden, moved, then shown, so it never flashes at the OS's spot.
+        const show_after = opts.position != null and !opts.hidden;
+        if (opts.hidden or show_after) flags |= c.WINDOW_HIDDEN;
         if (opts.resizable) flags |= c.WINDOW_RESIZABLE;
         if (!opts.focusable) flags |= c.WINDOW_NOT_FOCUSABLE;
         const win = c.SDL_CreateWindow(opts.title, @intCast(opts.width), @intCast(opts.height), flags) orelse
             return fail("SDL_CreateWindow");
+        errdefer c.SDL_DestroyWindow(win);
         const ren = c.SDL_CreateRenderer(win, null) orelse return fail("SDL_CreateRenderer");
         // No vsync: with several windows each present would block in turn.
         // The app paces its own frames.
@@ -730,11 +865,21 @@ pub const Window = struct {
         _ = c.SDL_SetRenderDrawBlendMode(ren, c.BLENDMODE_BLEND);
         const density = @max(1.0, c.SDL_GetWindowPixelDensity(win));
         _ = c.SDL_SetRenderScale(ren, density, density);
+        if (opts.position) |p| _ = c.SDL_SetWindowPosition(win, @intFromFloat(@round(p[0])), @intFromFloat(@round(p[1])));
+        if (show_after) _ = c.SDL_ShowWindow(win);
         return .{ .gpa = gpa, .win = win, .ren = ren, .density = density, .font_set = opts.fonts };
     }
 
+    /// Destroys the window and everything loaded into it (images, icons, fonts, text textures; a
+    /// handle loaded here means nothing to another window). Safe from the frame callback of
+    /// another window and between frames; not from this window's own frame callback or while it
+    /// is rendering (that would free the window under the code running on it, so it panics).
+    /// The last window to go shuts SDL down.
     pub fn deinit(w: *Window) void {
+        if (w.live_busy or w.in_render) @panic("Window.deinit from the window's own frame callback or render: destroy it after the current frame");
         w.setFrameCallback(null, null);
+        discardDialogOf(w.id());
+        _ = setDrag(w.win, null, &.{});
         var it = w.texts.valueIterator();
         while (it.next()) |t| c.SDL_DestroyTexture(t.tex);
         w.texts.deinit(w.gpa);
@@ -752,12 +897,24 @@ pub const Window = struct {
         c.SDL_DestroyRenderer(w.ren);
         c.SDL_DestroyWindow(w.win);
         live_windows -= 1;
-        if (live_windows == 0) {
-            freeCursors();
-            c.TTF_Quit();
-            // Only video: an `Audio` may still be using SDL (it quits its own subsystem).
-            c.SDL_QuitSubSystem(c.INIT_VIDEO);
-        }
+        if (live_windows == 0) shutdownVideo();
+    }
+
+    /// Heap-allocates a window with `init`, for an app whose set of windows changes at run time:
+    /// the address stays put (what `setFrameCallback` and `Ui.init` need) however the app's own
+    /// list of windows grows or shrinks. Free with `destroy`.
+    pub fn create(gpa: std.mem.Allocator, opts: WindowOptions) !*Window {
+        const w = try gpa.create(Window);
+        errdefer gpa.destroy(w);
+        w.* = try init(gpa, opts);
+        return w;
+    }
+
+    /// `deinit` and free a window made by `create`. Same restrictions as `deinit`.
+    pub fn destroy(w: *Window) void {
+        const gpa = w.gpa;
+        w.deinit();
+        gpa.destroy(w);
     }
 
     pub fn id(w: *const Window) u32 {
@@ -849,12 +1006,12 @@ pub const Window = struct {
     /// it overlaps one of `exclude` (buttons). For windows whose title bar is
     /// drawn by the app (see `macos.unifiedTitleBar`). The rectangles are
     /// copied (at most 16 exclusions); call again whenever they move. Pass a
-    /// null region to turn dragging off. Only one window can have a region.
+    /// null region to turn dragging off. Every window has its own region (up to 8
+    /// windows at once; a ninth gets none).
     pub fn setDragRegion(w: *Window, region: ?geom.Rect, exclude: []const geom.Rect) void {
-        drag_region = region;
-        drag_exclude_n = @min(exclude.len, drag_exclude.len);
-        @memcpy(drag_exclude[0..drag_exclude_n], exclude[0..drag_exclude_n]);
-        _ = c.SDL_SetWindowHitTest(w.win, if (region != null) hitTest else null, null);
+        const ok = setDrag(w.win, region, exclude);
+        if (!ok) std.log.warn("setDragRegion: too many windows with a drag region", .{});
+        _ = c.SDL_SetWindowHitTest(w.win, if (region != null and ok) hitTest else null, null);
     }
 
     pub fn show(w: *Window) void {
@@ -865,8 +1022,39 @@ pub const Window = struct {
         _ = c.SDL_HideWindow(w.win);
     }
 
+    /// Brings the window to the front and asks the OS to give it keyboard focus (the OS may
+    /// decline for a background app).
     pub fn raise(w: *Window) void {
         _ = c.SDL_RaiseWindow(w.win);
+    }
+
+    /// Changes the title bar text. `title` is copied (at most 255 bytes, cut on a character
+    /// boundary); an empty title is allowed. No allocation.
+    pub fn setTitle(w: *Window, title: []const u8) void {
+        var buf: [256]u8 = undefined;
+        var n = @min(title.len, buf.len - 1);
+        while (n > 0 and n < title.len and title[n] & 0xC0 == 0x80) n -= 1;
+        @memcpy(buf[0..n], title[0..n]);
+        buf[n] = 0;
+        _ = c.SDL_SetWindowTitle(w.win, @ptrCast(&buf));
+    }
+
+    /// True while this window has keyboard focus (the window `key_down` and `text_input` go to).
+    pub fn hasFocus(w: *const Window) bool {
+        return c.SDL_GetKeyboardFocus() == w.win;
+    }
+
+    /// True while the pointer is over this window.
+    pub fn hasMouseFocus(w: *const Window) bool {
+        return c.SDL_GetMouseFocus() == w.win;
+    }
+
+    /// Top-left corner in screen points.
+    pub fn position(w: *const Window) [2]f32 {
+        var x: c_int = 0;
+        var y: c_int = 0;
+        _ = c.SDL_GetWindowPosition(w.win, &x, &y);
+        return .{ @floatFromInt(x), @floatFromInt(y) };
     }
 
     /// Top-left corner in screen points.
@@ -888,6 +1076,13 @@ pub const Window = struct {
 
     pub fn stopTextInput(w: *Window) void {
         _ = c.SDL_StopTextInput(w.win);
+    }
+
+    /// Whether `startTextInput` is in effect for this window. Text input is per window: starting it
+    /// in one window does not start it in the others, and events only come from the window that
+    /// has keyboard focus.
+    pub fn textInputActive(w: *const Window) bool {
+        return c.SDL_TextInputActive(w.win);
     }
 
     /// Tells the input method where the text being edited is (window points),
@@ -1174,8 +1369,9 @@ pub const Window = struct {
     // ---- files --------------------------------------------------------
 
     /// Shows the system open-file dialog (asynchronous; it may finish on another thread).
-    /// Poll `takeDialogResult` each frame for the outcome. Only one dialog at a time:
-    /// `error.DialogBusy` while one is open or its result has not been taken.
+    /// Poll `takeDialogResult` each frame for the outcome. Only one dialog at a time in the whole
+    /// app: `error.DialogBusy` while one is open or its result has not been taken, whichever
+    /// window opened it. The result goes to this window only.
     pub fn openFileDialog(w: *Window, opts: FileDialogOptions) error{DialogBusy}!void {
         lockDialog();
         if (dialog_pending or dialog_done != null) {
@@ -1183,6 +1379,8 @@ pub const Window = struct {
             return error.DialogBusy;
         }
         dialog_pending = true;
+        dialog_orphaned = false;
+        dialog_owner = w.id();
         unlockDialog();
         const n = @min(opts.filters.len, dialog_filters.len);
         for (opts.filters[0..n], 0..) |flt, i| dialog_filters[i] = .{ .name = flt.name, .pattern = flt.pattern };
@@ -1190,9 +1388,10 @@ pub const Window = struct {
     }
 
     /// The finished dialog's outcome, once, or null while it is still open (or none was
-    /// shown). Paths are copied into `gpa`; free with `ChosenFiles.deinit(gpa)`.
+    /// shown by this window; a window destroyed with a dialog open drops its result). Paths are copied into `gpa`; free with `ChosenFiles.deinit(gpa)`.
     pub fn takeDialogResult(w: *Window, gpa: std.mem.Allocator) error{OutOfMemory}!?DialogResult {
-        _ = w;
+        // Another window's dialog is not ours to take.
+        if (dialog_owner != w.id()) return null;
         return takeRawDialog(gpa);
     }
 
@@ -1209,8 +1408,11 @@ pub const Window = struct {
     fn applyCursor(w: *Window) void {
         const want = w.cursor_wanted;
         w.cursor_wanted = .arrow;
-        if (w.cursor_applied == want) return;
-        w.cursor_applied = want;
+        if (!cursorOwner(c.SDL_GetMouseFocus(), w.win)) return;
+        // Same cursor again is skipped, but not when the pointer just came from another window.
+        if (cursor_applied == want and cursor_applied_for == w.win) return;
+        cursor_applied = want;
+        cursor_applied_for = w.win;
         if (systemCursor(want)) |cur| _ = c.SDL_SetCursor(cur);
     }
 
@@ -1711,4 +1913,294 @@ test "frame callback: runs for this window's expose/resize events with the new s
     win.setFrameCallback(null, null);
     pushWindowEvent(c.EVENT_WINDOW_EXPOSED, win.id());
     try std.testing.expectEqual(before + 1, t.calls);
+}
+
+// ---- several windows --------------------------------------------------------------------------
+
+fn dummyWindow(opts: WindowOptions) error{SkipZigTest}!*Window {
+    // SDL's dummy video driver: real SDL windows and software renderers, no display needed.
+    _ = c.SDL_SetHint("SDL_VIDEO_DRIVER", "dummy");
+    return Window.create(std.testing.allocator, opts) catch error.SkipZigTest;
+}
+
+fn pushRaw(raw: [128]u8) void {
+    var e: c.SdlEvent = undefined;
+    e.raw = raw;
+    _ = c.SDL_PushEvent(&e);
+}
+
+test "every event that belongs to a window carries that window's id" {
+    const wid: u32 = 7;
+    var raw: [128]u8 = @splat(0);
+    std.mem.writeInt(u32, raw[16..20], wid, .little);
+    std.mem.writeInt(u32, raw[28..32], 'q', .little); // key code
+    // Mouse: button at 24, position at 28 and 32.
+    std.mem.writeInt(u32, raw[28..32], @bitCast(@as(f32, 3.5)), .little);
+    std.mem.writeInt(u32, raw[32..36], @bitCast(@as(f32, 4.5)), .little);
+    raw[24] = 1;
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_MOUSE_MOTION, &raw).?.mouse_move.window);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_MOUSE_BUTTON_DOWN, &raw).?.mouse_down.window);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_MOUSE_BUTTON_UP, &raw).?.mouse_up.window);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_MOUSE_WHEEL, &raw).?.mouse_wheel.window);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_KEY_DOWN, &raw).?.key_down.window);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_KEY_UP, &raw).?.key_up.window);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_WINDOW_MOUSE_LEAVE, &raw).?.mouse_leave);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_WINDOW_FOCUS_GAINED, &raw).?.focus_gained);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_WINDOW_FOCUS_LOST, &raw).?.focus_lost);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_WINDOW_CLOSE_REQUESTED, &raw).?.close_requested);
+    try std.testing.expect(decodeRaw(c.EVENT_QUIT, &raw).? == .quit);
+    // Text input and composition: the string pointer sits at 24.
+    var traw = testRaw(c.EVENT_TEXT_INPUT, wid, 0, 0, null);
+    const hello: [*:0]const u8 = "hello";
+    std.mem.writeInt(usize, traw[24..][0..@sizeOf(usize)], @intFromPtr(hello), .little);
+    const ti = decodeRaw(c.EVENT_TEXT_INPUT, &traw).?.text_input;
+    try std.testing.expectEqual(wid, ti.window);
+    try std.testing.expectEqualStrings("hello", ti.text.slice());
+    const te = decodeRaw(c.EVENT_TEXT_EDITING, &traw).?.text_editing;
+    try std.testing.expectEqual(wid, te.window);
+    try std.testing.expectEqualStrings("hello", te.comp.slice());
+    // Drops (decoded in decodeDropEvent) and events the toolkit ignores.
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_DROP_BEGIN, &raw).?.drop_begin);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_DROP_COMPLETE, &raw).?.drop_complete);
+    try std.testing.expectEqual(wid, decodeRaw(c.EVENT_DROP_POSITION, &raw).?.drop_position.window);
+    try std.testing.expect(decodeRaw(c.EVENT_WINDOW_EXPOSED, &raw) == null);
+}
+
+test "pollEvent: close requests and focus changes arrive per window, apart from quit" {
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60 });
+    defer a.destroy();
+    const b = try dummyWindow(.{ .title = "b", .width = 80, .height = 60 });
+    defer b.destroy();
+    while (pollEvent()) |_| {} // whatever SDL queued while opening them
+    pushRaw(testRaw(c.EVENT_WINDOW_CLOSE_REQUESTED, b.id(), 0, 0, null));
+    pushRaw(testRaw(c.EVENT_WINDOW_FOCUS_LOST, a.id(), 0, 0, null));
+    pushRaw(testRaw(c.EVENT_WINDOW_FOCUS_GAINED, b.id(), 0, 0, null));
+    var got: [3]Event = undefined;
+    var n: usize = 0;
+    while (pollEvent()) |ev| {
+        if (n < got.len) got[n] = ev;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(b.id(), got[0].close_requested);
+    try std.testing.expectEqual(a.id(), got[1].focus_lost);
+    try std.testing.expectEqual(b.id(), got[2].focus_gained);
+}
+
+test "windows come and go in any order; SDL starts once and stops with the last window" {
+    const before = live_windows;
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60 });
+    const b = try dummyWindow(.{ .title = "b", .width = 80, .height = 60 });
+    const d = try dummyWindow(.{ .title = "c", .width = 80, .height = 60 });
+    try std.testing.expectEqual(before + 3, live_windows);
+    try std.testing.expect(a.id() != b.id() and b.id() != d.id());
+    // Closing one does not touch the others: they still draw and measure.
+    b.destroy();
+    var list = gfx.DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    list.rect(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, .{ .r = 255, .g = 0, .b = 0, .a = 255 });
+    list.text(2, 2, 12, .{ .r = 255, .g = 255, .b = 255, .a = 255 }, .left, "still here");
+    a.render(&list, .{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    d.render(&list, .{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    _ = d.measureText("x", 12);
+    a.destroy();
+    try std.testing.expectEqual(before + 1, live_windows);
+    d.destroy();
+    try std.testing.expectEqual(before, live_windows);
+    try std.testing.expectEqual(@as(usize, 0), live_windows);
+    // Everything process-wide went with the last window (cursors), and a new window starts it again.
+    for (cursor_cache) |slot| try std.testing.expect(slot == null);
+    try std.testing.expect(cursor_applied == null);
+    const e = try dummyWindow(.{ .title = "again", .width = 80, .height = 60 });
+    _ = systemCursor(.text); // create, then...
+    e.destroy(); // ...destroy with the window
+    for (cursor_cache) |slot| try std.testing.expect(slot == null);
+    const f = try dummyWindow(.{ .title = "and again", .width = 80, .height = 60 });
+    defer f.destroy();
+    f.render(&list, .{ .r = 0, .g = 0, .b = 0, .a = 255 });
+}
+
+test "images and icons belong to the window that loaded them" {
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60 });
+    defer a.destroy();
+    const b = try dummyWindow(.{ .title = "b", .width = 80, .height = 60 });
+    defer b.destroy();
+    const px = [16]u8{ 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255 };
+    const img = try a.loadImagePixels(&px, 2, 2);
+    const img_b = try b.loadImagePixels(&px, 2, 2);
+    try std.testing.expect(img.id != img_b.id); // ids are never shared, so a handle can only miss
+    try std.testing.expect(a.hasImage(img) and !b.hasImage(img));
+    try std.testing.expect(b.imageSize(img) == null);
+    const icon = try a.loadSvg("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\"/></svg>");
+    try std.testing.expect(a.hasSvg(icon) and !b.hasSvg(icon));
+    // Drawing a foreign handle draws nothing and creates no texture.
+    var list = gfx.DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    list.image(.{ .x = 0, .y = 0, .w = 20, .h = 20 }, img, .{});
+    list.svgIcon(.{ .x = 0, .y = 0, .w = 20, .h = 20 }, icon, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    b.render(&list, .{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    try std.testing.expectEqual(@as(usize, 0), b.svgTextureCount());
+    a.render(&list, .{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    try std.testing.expect(a.svgTextureCount() > 0);
+    // Unloading it on the wrong window changes nothing.
+    b.unloadImage(img);
+    try std.testing.expect(a.hasImage(img));
+}
+
+const Probe = struct {
+    win: *Window,
+    calls: u32 = 0,
+    /// Destroyed from inside this probe's callback (another window's frame).
+    kill: ?*Window = null,
+
+    fn cb(ctx: ?*anyopaque) void {
+        const p: *Probe = @ptrCast(@alignCast(ctx.?));
+        p.calls += 1;
+        if (p.kill) |victim| {
+            p.kill = null;
+            victim.destroy();
+        }
+    }
+};
+
+test "frame callbacks of several windows: each fires for its own events, and a window can be destroyed from another's" {
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60, .resizable = true });
+    const b = try dummyWindow(.{ .title = "b", .width = 80, .height = 60, .resizable = true });
+    const d = try dummyWindow(.{ .title = "c", .width = 80, .height = 60, .resizable = true });
+    var pa: Probe = .{ .win = a };
+    var pb: Probe = .{ .win = b };
+    var pd: Probe = .{ .win = d };
+    a.setFrameCallback(&pa, Probe.cb);
+    b.setFrameCallback(&pb, Probe.cb);
+    d.setFrameCallback(&pd, Probe.cb);
+    const b_id = b.id();
+
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, a.id());
+    try std.testing.expectEqual([3]u32{ 1, 0, 0 }, [3]u32{ pa.calls, pb.calls, pd.calls });
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, b_id);
+    try std.testing.expectEqual([3]u32{ 1, 1, 0 }, [3]u32{ pa.calls, pb.calls, pd.calls });
+
+    // a's frame destroys b (callback registered, window heap-allocated): safe, and its id is dead.
+    pa.kill = b;
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, a.id());
+    try std.testing.expectEqual(@as(u32, 2), pa.calls);
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, b_id);
+    try std.testing.expectEqual(@as(u32, 2), pa.calls);
+    try std.testing.expectEqual(@as(u32, 0), pd.calls);
+    // The survivors still get their own events.
+    pushWindowEvent(c.EVENT_WINDOW_EXPOSED, d.id());
+    try std.testing.expectEqual(@as(u32, 1), pd.calls);
+    // Destroying the others from the loop (between frames) is fine too.
+    d.destroy();
+    a.destroy();
+}
+
+test "text input is per window" {
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60 });
+    defer a.destroy();
+    const b = try dummyWindow(.{ .title = "b", .width = 80, .height = 60 });
+    defer b.destroy();
+    a.stopTextInput();
+    b.stopTextInput();
+    a.startTextInput();
+    try std.testing.expect(a.textInputActive());
+    try std.testing.expect(!b.textInputActive());
+    b.startTextInput();
+    a.stopTextInput();
+    try std.testing.expect(!a.textInputActive() and b.textInputActive());
+}
+
+test "a window can be titled and placed; windows cascade" {
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60, .position = .{ 120, 90 }, .hidden = true });
+    defer a.destroy();
+    a.setTitle("Renamed \u{e9}");
+    a.setTitle("");
+    const long: [400]u8 = @splat('x');
+    a.setTitle(&long); // longer than the copy buffer: cut, not overflowed
+    try std.testing.expectEqual(@as([2]f32, .{ 120, 90 }), a.position());
+    a.setPosition(200, 150);
+    try std.testing.expectEqual(@as([2]f32, .{ 200, 150 }), a.position());
+    try std.testing.expect(!a.hasFocus() and !a.hasMouseFocus()); // hidden, nobody is pointing at it
+
+    const area: geom.Rect = .{ .x = 0, .y = 25, .w = 1000, .h = 700 };
+    const p0 = cascadeIn(area, 0, 400, 300);
+    const p1 = cascadeIn(area, 1, 400, 300);
+    try std.testing.expectEqual(@as(f32, 40), p0[0]);
+    try std.testing.expectEqual(@as(f32, 65), p0[1]);
+    try std.testing.expectEqual(p0[0] + cascade_step, p1[0]);
+    try std.testing.expectEqual(p0[1] + cascade_step, p1[1]);
+    // Room for 12 steps (360 / 28), then it wraps instead of walking off the area.
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        const p = cascadeIn(area, i, 400, 300);
+        try std.testing.expect(p[0] + 400 <= area.x + area.w and p[1] + 300 <= area.y + area.h);
+    }
+    try std.testing.expectEqual(p0, cascadeIn(area, 13, 400, 300));
+    // A window as big as the area still gets a spot.
+    try std.testing.expectEqual(@as([2]f32, .{ 0, 25 }), cascadeIn(area, 5, 1000, 700));
+}
+
+test "the cursor is only set by the window under the pointer" {
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60 });
+    defer a.destroy();
+    const b = try dummyWindow(.{ .title = "b", .width = 80, .height = 60 });
+    defer b.destroy();
+    try std.testing.expect(cursorOwner(a.win, a.win));
+    try std.testing.expect(!cursorOwner(a.win, b.win)); // pointer over a: b (drawn last, wants the arrow) must not reset it
+    try std.testing.expect(cursorOwner(null, b.win)); // over none of ours: harmless
+}
+
+test "drag regions are kept per window" {
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60 });
+    defer a.destroy();
+    const b = try dummyWindow(.{ .title = "b", .width = 80, .height = 60 });
+    defer b.destroy();
+    a.setDragRegion(.{ .x = 0, .y = 0, .w = 80, .h = 20 }, &.{.{ .x = 60, .y = 0, .w = 20, .h = 20 }});
+    b.setDragRegion(.{ .x = 0, .y = 40, .w = 80, .h = 20 }, &.{});
+    const pa: c.SdlPoint = .{ .x = 10, .y = 10 };
+    const pb: c.SdlPoint = .{ .x = 10, .y = 50 };
+    const pex: c.SdlPoint = .{ .x = 70, .y = 10 };
+    try std.testing.expectEqual(@as(c_int, 1), hitTest(a.win, &pa, null));
+    try std.testing.expectEqual(@as(c_int, 0), hitTest(a.win, &pb, null)); // b's strip is not a's
+    try std.testing.expectEqual(@as(c_int, 0), hitTest(a.win, &pex, null)); // excluded (a button)
+    try std.testing.expectEqual(@as(c_int, 1), hitTest(b.win, &pb, null));
+    try std.testing.expectEqual(@as(c_int, 0), hitTest(b.win, &pa, null));
+    a.setDragRegion(null, &.{});
+    try std.testing.expectEqual(@as(c_int, 0), hitTest(a.win, &pa, null));
+    try std.testing.expectEqual(@as(c_int, 1), hitTest(b.win, &pb, null)); // still there
+}
+
+test "an open-file dialog result belongs to the window that opened it" {
+    const gpa = std.testing.allocator;
+    const a = try dummyWindow(.{ .title = "a", .width = 80, .height = 60 });
+    defer a.destroy();
+    const b = try dummyWindow(.{ .title = "b", .width = 80, .height = 60 });
+    defer b.destroy();
+    const picked = [_:null]?[*:0]const u8{"/x/one.png"};
+
+    // a's result is invisible to b, and a gets it once.
+    dialog_owner = a.id();
+    deliverDialogForTest(&picked);
+    try std.testing.expect((try b.takeDialogResult(gpa)) == null);
+    const r = (try a.takeDialogResult(gpa)).?;
+    r.files.deinit(gpa);
+    try std.testing.expect((try a.takeDialogResult(gpa)) == null);
+
+    // A window closed with its result waiting does not block the next dialog.
+    const tmp = try dummyWindow(.{ .title = "tmp", .width = 80, .height = 60 });
+    dialog_owner = tmp.id();
+    deliverDialogForTest(&picked);
+    tmp.destroy();
+    try std.testing.expect(dialog_done == null and !dialog_pending);
+
+    // A window closed while the dialog is still open: the late result is dropped.
+    const tmp2 = try dummyWindow(.{ .title = "tmp2", .width = 80, .height = 60 });
+    dialog_owner = tmp2.id();
+    lockDialog();
+    dialog_pending = true;
+    unlockDialog();
+    tmp2.destroy();
+    try std.testing.expect(dialog_orphaned);
+    dialogCallback(null, &picked, 0);
+    try std.testing.expect(dialog_done == null and !dialog_pending and !dialog_orphaned);
 }

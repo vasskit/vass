@@ -270,7 +270,8 @@ The last request of the frame wins (widgets are drawn bottom to top, so the topm
 request made while the pointer is over a popup above the layer being drawn is ignored. Nothing is
 set at the time of the call: the window applies the request in `Window.render` and then falls back
 to the arrow, so a widget only has to keep asking, and apps that never call `ui.finish()` get cursors
-too. A headless Ui (`initHeadless`) records the request in `ui.cursor` (null when nobody asked)
+too. With several windows only the window the pointer is over changes the cursor (a window drawn last
+cannot reset what another asked for). A headless Ui (`initHeadless`) records the request in `ui.cursor` (null when nobody asked)
 without touching SDL, which is what the tests read. Text fields and text areas ask for `text` while
 hovered, splitters for `resize_h` / `resize_v` while hovered and for the whole drag. Custom widgets
 call `ui.setCursor` themselves; `Window.setCursor` does the same without a Ui.
@@ -356,6 +357,13 @@ per-widget state. Keyboard focus lives in a caller-owned `vass.ui.State`:
 `split-dragged.bmp`, `split-collapsed.bmp`, `split-hover.bmp`, `split-inspector-hidden.bmp` and
 `split-narrow.bmp` from a hidden window). See "Split panes" above.
 
+## Example: several windows
+
+`examples/windows.zig`: `zig build windows` (`-- --snapshot DIR` saves `windows-1-open-main.bmp`,
+`-doc1`, `-doc2` and `-inspector`, then the same four after typing (`windows-2-typed-*.bmp`) and
+the three that remain after a document window is closed (`windows-3-closed-*.bmp`), all windows
+hidden). See "Several windows" above.
+
 ## Example: notes
 
 `examples/notes.zig` is a small notes app (scrolling wrapped cards, a text field, Return
@@ -366,6 +374,96 @@ adds a note; in memory only).
     zig build notes -- --snapshot DIR --script       # same after scripted input: click the
                                                      # field, type, select all, scroll,
                                                      # drag-select across two lines of a card
+
+## Several windows
+
+`examples/windows.zig` (`zig build windows`) is the reference: a main window with a list of
+documents, a window per document (title field, text area with undo, dropdown, counter, tooltip)
+and an always-on-top inspector that reports on whichever document window has focus. Windows are
+opened and closed at run time, in any order. `zig build windows -- --snapshot DIR` writes
+`windows-1-open-*.bmp`, `windows-2-typed-*.bmp` and `windows-3-closed-*.bmp` (one BMP per window,
+all windows hidden). Claude Buddy runs three windows the same way.
+
+**The pattern.** One record per window, holding what that window needs and nothing shared:
+
+    const Win = struct {
+        win: *vass.platform.Window,   // from Window.create
+        list: vass.DisplayList,
+        input: vass.ui.Input = .{},
+        state: vass.ui.State = .{},   // focus, popups, tooltip, splitter drags, click count
+        // plus the state of the widgets that need one (DropdownState, TextAreaState, ...)
+    };
+
+Each loop turn: `while (pollEvent()) |ev|` feed the event to every window's `Input`
+(`w.input.feed(ev, w.win.id())` keeps only the events of that window; fed to all of them it
+reaches the right one), draw every window (`Ui.init(&w.list, w.win, w.input, theme)`, widgets,
+`ui.finish()`, `w.win.render`, `w.input.endFrame()`), then do the things that need a window
+created or destroyed. Shared app data (the document list) is plain app state that every window's
+frame function reads, so an edit in one window shows in the others on the next frame.
+
+**What is per window.** `Window` (renderer, fonts, text, image and icon textures, frame callback,
+text input on or off, cursor request, drag region, title, position), `Input` (pointer, held
+button, keys, text, composition, drops, `window_focused`), `ui.State` (keyboard focus, drag
+state, popup rectangles, tooltip timer, focus ring, splitter grabs, click counter) and the widget
+states you keep. Nothing in `ui`, `popup`, `focus` or `split` is global: a popup open in one
+window does not block, close or take keys from another, and Escape typed into one window reaches
+only that window's popups.
+
+**What is shared.** The process-wide parts of the platform, which the backend keeps balanced for
+you: SDL video and SDL_ttf start with the first window and stop with the last (closing one window
+never tears down video for the rest; a failed `Window.init` leaves nothing started), the system
+cursors (created lazily, freed with the last window; the cursor is only changed by the window the
+pointer is over, so a window drawn last cannot reset the cursor another one asked for), the
+clipboard, the modifier state and the single open-file dialog (`DialogBusy` while one is open, in
+whichever window opened it; its result is delivered to the window that opened it only, and is
+dropped if that window is destroyed first). Fonts are opened per window.
+
+**Lifetime rules.**
+- A `Window` must not move in memory while a frame callback is registered or a `Ui` holds it. For
+  a window that comes and goes use `Window.create(gpa, opts)` (heap-allocated, stable address) and
+  `w.destroy()`; `Window.init` / `deinit` are the by-value form.
+- Open a window at any time; destroy it between frames or from another window's frame or frame
+  callback (its callback is unregistered by `deinit`, other windows' callbacks keep working).
+  Never destroy a window from inside its own frame callback or while it is rendering: that frees
+  it under the running code, so `deinit` panics instead. The example records a close request and
+  destroys the window after the frame.
+- Closing: `Event.close_requested` carries the id of the window whose close button was pressed;
+  nothing is closed for you, so destroy that window (or ignore the request). `Event.quit` is the
+  whole app (Cmd+Q, or the last window closed). Cmd+W is an ordinary `key_down` with `mods.cmd`
+  and `code == 'w'` and a `window` id (SDL has no default binding for it).
+- Destroy in any order; the last window to go shuts SDL down, and a window opened afterwards
+  starts it again.
+
+**Handles are per window.** Textures belong to one renderer. `Image` and `SvgIcon` handles carry
+ids that are unique across windows and never reused, so a handle loaded in window A and drawn
+(or passed to `hasImage`, `unloadImage`, ...) in window B simply is not found there: nothing is
+drawn and nothing is shared. Load what each window needs into that window.
+
+**Input and focus.**
+- Events carry the window id: mouse (`mouse_down`, `mouse_up`, `mouse_move`, `mouse_wheel`),
+  `mouse_leave`, `focus_gained`, `focus_lost`, `close_requested`, keys (`Key.window`), `text_input`,
+  `text_editing`, and the drop events. Window resize and expose are not events: read
+  `logicalSize()` each frame, and register `setFrameCallback` per window for live resize (each
+  callback fires only for its own window's events).
+- `Input.feed` ignores other windows' events. `mouse_leave` clears hover; `focus_lost` ends a
+  held button (as a release, so a drag finishes cleanly), drops an input-method composition and
+  an unfinished drop highlight, and clears `Input.window_focused` (set again by `focus_gained`).
+- Text input is per window: call `startTextInput` for each window that has a text field (the
+  example does it when a document window opens). Typed text goes to the window with keyboard
+  focus only, so a text field focused in window A cannot see keys typed in B. `setTextInputArea`
+  is per window too (the example sets it for the window's own focused field).
+  `Window.hasFocus()`, `hasMouseFocus()` and `textInputActive()` query the state.
+- `Window.setTitle`, `position`, `raise`, `WindowOptions.position` (the window is created hidden,
+  placed and then shown, so it never flashes at the OS's spot) and `cascadeIn(area, index, w, h)`
+  / `cascadePosition` (stagger new windows by 28 points, wrapping before leaving the screen).
+- `Window.setDragRegion` is per window (up to 8 windows at once).
+
+Frame time. Each renderer is created with vsync off (`SDL_SetRenderVSync(ren, 0)`), so presenting
+N windows is not N waits for the display. Measured on this machine (hidden windows, 200 frames
+drawn back to back, no sleeping): 8.3 ms per frame with one window and the same 8.3 ms with four,
+about one refresh of a 120 Hz display; the cost does not multiply with the window count. Only
+hidden windows were measured (a real, visible window may be paced differently by the OS), and the
+app still sleeps between frames itself; redraw-on-demand is on the roadmap.
 
 ## Not there yet
 
@@ -388,9 +486,7 @@ adds a note; in memory only).
   and `Ui.measureWeighted` / `Window.measureTextWeighted` honour it.
 - `WindowOptions.resizable` / `min_width` / `min_height`, and `Window.logicalSize()` to lay out
   each frame (no resize event is needed).
-- Several windows: call `Window.init` once per window. Events carry the window's id, so give each
-  window its own `Input` and feed it with `input.feed(ev, window.id())`. There is no example in
-  this repository yet; Claude Buddy runs three windows this way.
+- Several windows: see "Several windows" below.
 - **Live resize needs a frame callback.** While the user drags a window edge, macOS runs its
   own loop and your `while (running)` loop is blocked inside `pollEvent`, so nothing is drawn
   and the OS stretches the last frame until the mouse is released. Put one frame of work in a

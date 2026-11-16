@@ -1667,3 +1667,45 @@ test "undo and redo work in a text field hosted by a popup" {
     try testing.expectEqualStrings("abc", field.edit.text());
     try testing.expect(pst.open);
 }
+
+test "two windows: a popup open in one does not block, close or steal input from the other" {
+    // Each window keeps its own State and Input (nothing here is global): rig a and rig b.
+    var a = Rig.init();
+    defer a.deinit();
+    var b = Rig.init();
+    defer b.deinit();
+    var pst: PopupState = .{ .open = true, .fresh = true };
+    const btn: Rect = .{ .x = 20, .y = 20, .w = 100, .h = 30 };
+    const under: Rect = .{ .x = 20, .y = 70, .w = 100, .h = 30 }; // covered by a's popup, same place in b
+    {
+        var u = a.ui();
+        _ = u.beginPopup(&pst, btn, .{ 160, 120 }, .{ .padding = 8 }).?;
+        u.endPopup();
+        a.end(&u);
+    }
+    try testing.expect(a.state.popups.prev_n > 0);
+    try testing.expectEqual(@as(u8, 0), b.state.popups.prev_n);
+    // A press at the covered spot: swallowed in a, a normal click in b.
+    a.click(40, 80);
+    b.click(40, 80);
+    {
+        var ua = a.ui();
+        try testing.expect(!ua.hit(under).clicked);
+        _ = ua.beginPopup(&pst, btn, .{ 160, 120 }, .{ .padding = 8 }).?;
+        ua.endPopup();
+        a.end(&ua);
+        var ub = b.ui();
+        try testing.expect(ub.hit(under).hovered and ub.hit(under).clicked);
+        try testing.expect(!ub.popupOpen());
+        b.end(&ub);
+    }
+    // Escape typed into b (the focused window) does not close the popup of a.
+    try testing.expect(pst.open);
+    b.key(keys.escape);
+    {
+        var ub = b.ui();
+        try testing.expect(ub.events().len == 1);
+        b.end(&ub);
+    }
+    try testing.expect(pst.open);
+}

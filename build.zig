@@ -204,6 +204,21 @@ pub fn build(b: *std.Build) void {
     run_split.addPassthruArgs();
     b.step("split", "Run the split panes example").dependOn(&run_split.step);
     test_step.dependOn(&split_ex.step);
+
+    // Example: several windows (documents, an inspector). `zig build windows -- --snapshot DIR`.
+    const windows_ex = b.addExecutable(.{
+        .name = "windows",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/windows.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_windows = b.addRunArtifact(windows_ex);
+    run_windows.addPassthruArgs();
+    b.step("windows", "Run the several-windows example").dependOn(&run_windows.step);
+    test_step.dependOn(&windows_ex.step);
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

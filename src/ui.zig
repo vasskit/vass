@@ -89,6 +89,10 @@ pub const Input = struct {
     drop_y: f32 = -1e9,
     drops: [max_drops]backend.DropPath = undefined,
     drops_len: usize = 0,
+    /// False between a `focus_lost` and the next `focus_gained` of this window (it starts true:
+    /// a window that was never told anything is assumed focused, as in headless tests). The
+    /// toolkit does not read it; apps use it, e.g. to dim a tool panel.
+    window_focused: bool = true,
 
     /// Files dropped on the window this frame, in arrival order. Valid until `endFrame`.
     pub fn droppedFiles(in: *const Input) []const backend.DropPath {
@@ -164,9 +168,26 @@ pub const Input = struct {
             .key_down => |k| if (k.window == window_id) in.push(.{ .key = k }),
             .text_input => |t| if (t.window == window_id) in.push(.{ .text = t.text }),
             .mouse_leave => |wid| if (wid == window_id) {
-                // Nothing is hovered once the pointer has left the window.
+                // Nothing is hovered once the pointer has left the window. A held button is kept:
+                // the OS keeps delivering motion and the release to the window that was pressed
+                // (mouse capture), so a drag may leave the window and still end properly.
                 in.mouse_x = -1e9;
                 in.mouse_y = -1e9;
+            },
+            .focus_gained => |wid| if (wid == window_id) {
+                in.window_focused = true;
+            },
+            .focus_lost => |wid| if (wid == window_id) {
+                // Another window or app took the keyboard: a release may never reach this one, so
+                // a held button ends here (as a release, so a drag finishes cleanly), and an
+                // input-method composition or a drag from another app in progress is abandoned.
+                in.window_focused = false;
+                if (in.down) {
+                    in.down = false;
+                    in.released = true;
+                }
+                in.composition = .{};
+                in.drop_active = false;
             },
             .text_editing => |t| if (t.window == window_id) {
                 in.composition = t.comp;
@@ -3100,4 +3121,51 @@ test "textField: undo keeps the caret visible" {
     _ = fieldFrame(&list, &state, in, &st, r);
     try std.testing.expectEqual(@as(usize, 36), st.edit.cursor);
     try std.testing.expect(st.scroll_x > 0);
+}
+
+test "Input.feed: events of other windows change nothing, whatever their type" {
+    var in: Input = .{ .mouse_x = 5, .mouse_y = 6 };
+    const other: u32 = 9;
+    in.feed(.{ .mouse_move = .{ .window = other, .x = 50, .y = 60 } }, 1);
+    in.feed(.{ .mouse_down = .{ .window = other, .x = 1, .y = 1, .button = 1 } }, 1);
+    in.feed(.{ .mouse_down = .{ .window = other, .x = 1, .y = 1, .button = 3 } }, 1);
+    in.feed(.{ .mouse_up = .{ .window = other, .x = 1, .y = 1, .button = 1 } }, 1);
+    in.feed(.{ .mouse_wheel = .{ .window = other, .dx = 1, .dy = 2 } }, 1);
+    in.feed(.{ .key_down = .{ .code = 'a', .window = other } }, 1);
+    in.feed(.{ .text_input = .{ .window = other, .text = backend.TextChunk.from("x") } }, 1);
+    in.feed(.{ .text_editing = .{ .window = other, .comp = .{} } }, 1);
+    in.feed(.{ .mouse_leave = other }, 1);
+    in.feed(.{ .focus_lost = other }, 1);
+    in.feed(.{ .focus_gained = other }, 1);
+    in.feed(.{ .drop_begin = other }, 1);
+    in.feed(.{ .drop_position = .{ .window = other, .x = 1, .y = 1 } }, 1);
+    in.feed(.{ .drop_complete = other }, 1);
+    in.feed(.{ .close_requested = 1 }, 1); // not input: the app handles it
+    try std.testing.expectEqual(@as(f32, 5), in.mouse_x);
+    try std.testing.expectEqual(@as(f32, 6), in.mouse_y);
+    try std.testing.expect(!in.pressed and !in.down and !in.released and !in.right_pressed and !in.drop_active and in.window_focused);
+    try std.testing.expectEqual(@as(f32, 0), in.wheel_y);
+    try std.testing.expectEqual(@as(usize, 0), in.events().len);
+}
+
+test "Input.feed: losing focus ends a held button and a composition; leaving the window keeps the drag" {
+    var in: Input = .{};
+    in.feed(.{ .mouse_down = .{ .window = 1, .x = 10, .y = 10, .button = 1 } }, 1);
+    try std.testing.expect(in.down);
+    // The pointer leaves (the OS captures the mouse during a drag): hover is gone, the drag is not.
+    in.feed(.{ .mouse_leave = 1 }, 1);
+    try std.testing.expect(in.mouse_x < -1e8 and in.down);
+    in.endFrame();
+    in.composition = .{ .len = 2, .start = 0, .length = 2 };
+    in.drop_active = true;
+    in.feed(.{ .focus_lost = 1 }, 1);
+    // No release will arrive from the OS: the press ends now, as a release.
+    try std.testing.expect(!in.down and in.released);
+    try std.testing.expect(!in.window_focused and in.composition.len == 0 and !in.drop_active);
+    in.feed(.{ .focus_gained = 1 }, 1);
+    try std.testing.expect(in.window_focused);
+    // Focus lost with nothing held is not a release.
+    in.endFrame();
+    in.feed(.{ .focus_lost = 1 }, 1);
+    try std.testing.expect(!in.released);
 }
