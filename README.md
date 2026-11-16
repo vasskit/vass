@@ -372,10 +372,11 @@ adds a note; in memory only).
 - IME composition display: the backend delivers `text_editing` and `Input.composition`, but
   `textField` does not draw the pre-edit text yet. Committed IME text does work.
 - Double/triple-click word and line selection inside `textField` (only
-  `textSelectable` has them), word-wise drag extension after a double click,
+  `textSelectable` and `textArea` have them), word-wise drag extension after a double click,
   grapheme-cluster-aware caret movement (combining marks and ZWJ emoji take several presses),
   Selecting across several separate texts is not possible (one text at a time).
-- Scrollbar dragging and keyboard scrolling; horizontal scrolling.
+- Scrollbar dragging; horizontal scrolling in `beginScroll`. (Keyboard scrolling exists:
+  PageUp/PageDown, arrows and Home/End through `ScrollState.key_scroll` and `arrow_keys`.)
 - Accessibility (no screen-reader tree: the focus list carries roles and labels, nothing calls the
   OS yet), hover styling, retained widgets, and any platform other than macOS.
 
@@ -387,6 +388,9 @@ adds a note; in memory only).
   and `Ui.measureWeighted` / `Window.measureTextWeighted` honour it.
 - `WindowOptions.resizable` / `min_width` / `min_height`, and `Window.logicalSize()` to lay out
   each frame (no resize event is needed).
+- Several windows: call `Window.init` once per window. Events carry the window's id, so give each
+  window its own `Input` and feed it with `input.feed(ev, window.id())`. There is no example in
+  this repository yet; Claude Buddy runs three windows this way.
 - **Live resize needs a frame callback.** While the user drags a window edge, macOS runs its
   own loop and your `while (running)` loop is blocked inside `pollEvent`, so nothing is drawn
   and the OS stretches the last frame until the mouse is released. Put one frame of work in a
