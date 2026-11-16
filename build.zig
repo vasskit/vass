@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("stb", .{})) |stb_dep| {
         vass.addIncludePath(stb_dep.path("."));
         vass.addCSourceFile(.{
-            .file = b.path("src/stb_impl.c"),
+            .file = b.path("src/image/stb_impl.c"),
             .flags = &.{ "-fno-sanitize=undefined", "-fno-strict-aliasing" },
         });
     }
@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
         if (b.lazyDependency("dr_libs", .{})) |dr_dep| {
             vass.addIncludePath(dr_dep.path("."));
             vass.addCSourceFile(.{
-                .file = b.path("src/audio_impl.c"),
+                .file = b.path("src/audio/audio_impl.c"),
                 .flags = &.{ "-fno-sanitize=undefined", "-fno-strict-aliasing" },
             });
             _ = stb_dep;
@@ -88,141 +88,57 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
-    // Example: a notes app. `zig build notes -- --snapshot DIR [--script]`.
-    const notes = b.addExecutable(.{
-        .name = "notes",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/notes.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_notes = b.addRunArtifact(notes);
-    run_notes.addPassthruArgs();
-    b.step("notes", "Run the notes example").dependOn(&run_notes.step);
-    // Keep the example compiling as part of `zig build test`.
-    test_step.dependOn(&notes.step);
+    addExamples(b, vass, target, optimize, test_step);
+}
 
-    // Example: the form controls. `zig build controls -- --snapshot DIR`.
-    const controls = b.addExecutable(.{
-        .name = "controls",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/controls.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_controls = b.addRunArtifact(controls);
-    run_controls.addPassthruArgs();
-    b.step("controls", "Run the controls showcase").dependOn(&run_controls.step);
-    test_step.dependOn(&controls.step);
+/// Examples are discovered, not listed: every `examples/*.zig` is a program, and gets an
+/// executable and a `zig build <name> -- <args>` step that runs it. Subfolders (`common/`, the
+/// `assets/` the examples `@embedFile`) are never examples. All of them are built by
+/// `zig build examples` and, to keep them compiling, by `zig build test`.
+fn addExamples(
+    b: *std.Build,
+    vass: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+) void {
+    const io = b.graph.io;
+    var dir = b.root.openDir(io, "examples", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return, // a package without its examples
+        else => std.debug.panic("cannot open the examples directory: {t}", .{err}),
+    };
+    defer dir.close(io);
 
-    // Example: images. `zig build images -- --snapshot DIR`.
-    const images = b.addExecutable(.{
-        .name = "images",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/images.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_images = b.addRunArtifact(images);
-    run_images.addPassthruArgs();
-    b.step("images", "Run the images showcase").dependOn(&run_images.step);
-    test_step.dependOn(&images.step);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch |err| std.debug.panic("cannot read the examples directory: {t}", .{err})) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        names.append(b.allocator, b.dupe(entry.name[0 .. entry.name.len - ".zig".len])) catch @panic("OOM");
+    }
+    // The directory order is the file system's; sort so `zig build -l` is stable.
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
 
-    // Example: SVG icons. `zig build icons -- --snapshot DIR`.
-    const icons_ex = b.addExecutable(.{
-        .name = "icons",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/icons.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_icons = b.addRunArtifact(icons_ex);
-    run_icons.addPassthruArgs();
-    b.step("icons", "Run the SVG icons showcase").dependOn(&run_icons.step);
-    test_step.dependOn(&icons_ex.step);
-
-    // Example: audio. `zig build audio -- --snapshot DIR`.
-    const audio_ex = b.addExecutable(.{
-        .name = "audio",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/audio.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_audio = b.addRunArtifact(audio_ex);
-    run_audio.addPassthruArgs();
-    b.step("audio", "Run the audio showcase").dependOn(&run_audio.step);
-    test_step.dependOn(&audio_ex.step);
-
-    // Example: popups, menus, dropdowns, tooltips. `zig build popups -- --snapshot DIR`.
-    const popups_ex = b.addExecutable(.{
-        .name = "popups",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/popups.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_popups = b.addRunArtifact(popups_ex);
-    run_popups.addPassthruArgs();
-    b.step("popups", "Run the popups showcase").dependOn(&run_popups.step);
-    test_step.dependOn(&popups_ex.step);
-
-    // Example: the layout system. `zig build layout -- --snapshot DIR`.
-    const layout_ex = b.addExecutable(.{
-        .name = "layout",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/layout.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_layout = b.addRunArtifact(layout_ex);
-    run_layout.addPassthruArgs();
-    b.step("layout", "Run the layout showcase").dependOn(&run_layout.step);
-    test_step.dependOn(&layout_ex.step);
-
-    // Example: resizable split panes. `zig build split -- --snapshot DIR`.
-    const split_ex = b.addExecutable(.{
-        .name = "split",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/split.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_split = b.addRunArtifact(split_ex);
-    run_split.addPassthruArgs();
-    b.step("split", "Run the split panes example").dependOn(&run_split.step);
-    test_step.dependOn(&split_ex.step);
-
-    // Example: several windows (documents, an inspector). `zig build windows -- --snapshot DIR`.
-    const windows_ex = b.addExecutable(.{
-        .name = "windows",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/windows.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "vass", .module = vass }},
-        }),
-    });
-    const run_windows = b.addRunArtifact(windows_ex);
-    run_windows.addPassthruArgs();
-    b.step("windows", "Run the several-windows example").dependOn(&run_windows.step);
-    test_step.dependOn(&windows_ex.step);
+    const all = b.step("examples", "Build all the examples");
+    for (names.items) |name| {
+        const exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "vass", .module = vass }},
+            }),
+        });
+        const run = b.addRunArtifact(exe);
+        run.addPassthruArgs();
+        b.step(name, b.fmt("Run the {s} example (examples/{s}.zig)", .{ name, name })).dependOn(&run.step);
+        all.dependOn(&exe.step);
+        test_step.dependOn(&exe.step);
+    }
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

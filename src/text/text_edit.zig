@@ -21,7 +21,7 @@
 //! history; `replaceAll` is the undoable way to swap the whole text.
 const std = @import("std");
 const builtin = @import("builtin");
-const keys = @import("keys.zig");
+const keys = @import("../core/keys.zig");
 const undo_mod = @import("undo.zig");
 const grapheme = @import("grapheme.zig");
 

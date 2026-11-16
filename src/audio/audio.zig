@@ -34,7 +34,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pcm_mod = @import("audio_pcm.zig");
 const mixer_mod = @import("audio_mixer.zig");
-const macos = @import("macos.zig");
+const macos = @import("../platform/macos.zig");
 
 pub const Pcm = pcm_mod.Pcm;
 pub const DecodeError = pcm_mod.Error;

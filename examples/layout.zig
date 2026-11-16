@@ -9,6 +9,7 @@
 //!                                           layout-outlines.bmp (narrow, outlines on, scrolled), exit
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Ui = vass.Ui;
@@ -47,9 +48,12 @@ const App = struct {
     mode: usize = 0,
     outlines: bool = false,
     show_sidebar: bool = true,
+    /// The layout trees of one frame; reset at the start of the next.
+    frame_arena: std.heap.ArenaAllocator,
 
     fn deinit(app: *App) void {
         app.name.deinit();
+        app.frame_arena.deinit();
     }
 };
 
@@ -74,7 +78,10 @@ fn outlines(ui: *Ui, lay: *const vass.Layout, from: usize, to: usize) void {
     }
 }
 
-fn frame(app: *App, ui: *Ui, arena: std.mem.Allocator) void {
+pub fn frame(app: *App, ui: *Ui) void {
+    defer ui.finish();
+    _ = app.frame_arena.reset(.retain_capacity);
+    const arena = app.frame_arena.allocator();
     const t = ui.theme;
     const wide = ui.bounds.w >= 720;
     var lay = vass.Layout.init(arena);
@@ -246,91 +253,27 @@ const snapshots = [_]Size{
 };
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-
-    var snapshot_dir: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else {
-            std.debug.print("usage: layout [--snapshot DIR]\n", .{});
-            return;
-        }
-    }
-
-    var app: App = .{ .name = ui_mod.TextFieldState.init(gpa) };
+    const env = try harness.start(init, "layout", .{}) orelse return;
+    var app: App = .{ .name = ui_mod.TextFieldState.init(env.gpa), .frame_arena = std.heap.ArenaAllocator.init(env.gpa) };
     defer app.deinit();
     try app.name.edit.setText("Aurora");
 
-    if (snapshot_dir) |dir| {
+    if (env.cli.snapshot()) {
         // One window per size, so the same app state is drawn at several sizes.
         for (snapshots) |s| {
             app.outlines = s.outlines;
             app.content_scroll.offset = s.scroll;
-            try run(gpa, arena, &app, s.w, s.h, dir, s.name);
+            try showWindow(env, &app, s.w, s.h, try std.fmt.allocPrint(env.arena, "layout-{s}", .{s.name}));
         }
         return;
     }
-    try run(gpa, arena, &app, 980, 700, null, "");
+    try showWindow(env, &app, 980, 700, "layout");
 }
 
-fn run(gpa: std.mem.Allocator, arena: std.mem.Allocator, app: *App, w: u32, h: u32, snapshot_dir: ?[]const u8, name: []const u8) !void {
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Layout", .width = w, .height = h, .resizable = true, .hidden = snapshot_dir != null, .min_width = 360, .min_height = 360 });
-    defer win.deinit();
-    win.startTextInput();
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-
-    const theme: vass.ui.Theme = .{ .card_radius = 12 };
-    var input: ui_mod.Input = .{};
-    var live: Live = .{ .app = app, .win = &win, .list = &list, .input = &input, .theme = theme, .frame_arena = std.heap.ArenaAllocator.init(gpa) };
-    defer live.frame_arena.deinit();
-    win.setFrameCallback(&live, Live.onResize);
-
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        while (vass.platform.pollEvent()) |ev| switch (ev) {
-            .quit, .close_requested => running = false,
-            else => if (snapshot_dir == null) input.feed(ev, win.id()),
-        };
-        input.time = if (snapshot_dir != null) 0 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-        const snap = snapshot_dir != null and n == 3;
-        if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/layout-{s}.bmp", .{ snapshot_dir.?, name }, 0);
-        live.draw(input);
-        if (snap) running = false;
-        input.endFrame();
-        vass.platform.sleepMs(16);
-    }
+fn showWindow(env: harness.Env, app: *App, w: u32, h: u32, snapshot_name: []const u8) !void {
+    try harness.run(@This(), env, .{
+        .window = .{ .title = "Layout", .width = w, .height = h, .resizable = true, .min_width = 360, .min_height = 360 },
+        .text_input = true,
+        .snapshot_name = snapshot_name,
+    }, app);
 }
-
-/// Draws one frame. The main loop and the window's resize callback both call it, so the
-/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
-const Live = struct {
-    app: *App,
-    win: *vass.platform.Window,
-    list: *vass.DisplayList,
-    input: *ui_mod.Input,
-    theme: vass.ui.Theme,
-    frame_arena: std.heap.ArenaAllocator,
-
-    fn draw(l: *Live, in: ui_mod.Input) void {
-        l.list.reset();
-        _ = l.frame_arena.reset(.retain_capacity);
-        var ui = Ui.init(l.list, l.win, in, l.theme);
-        ui.state = &l.app.state;
-        frame(l.app, &ui, l.frame_arena.allocator());
-        ui.finish();
-        l.win.render(l.list, l.theme.bg);
-    }
-
-    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
-    fn onResize(ctx: ?*anyopaque) void {
-        const l: *Live = @ptrCast(@alignCast(ctx.?));
-        l.draw(l.input.idle());
-    }
-};

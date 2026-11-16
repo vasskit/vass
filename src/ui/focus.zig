@@ -39,10 +39,10 @@
 //! focused widget wants a key. Text widgets claim every key without Cmd (and the editing keys with it).
 //! Typed text is never claimed by anything but text widgets.
 const std = @import("std");
-const geom = @import("geom.zig");
+const geom = @import("../core/geom.zig");
 const icons = @import("icons.zig");
-const keys = @import("keys.zig");
-const backend = @import("backend_sdl.zig");
+const keys = @import("../core/keys.zig");
+const backend = @import("../platform/backend_sdl.zig");
 const ui_mod = @import("ui.zig");
 const Rect = geom.Rect;
 const Ui = ui_mod.Ui;

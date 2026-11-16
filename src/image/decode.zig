@@ -96,7 +96,7 @@ pub fn prepareTexture(gpa: std.mem.Allocator, rgba: []const u8, w: u32, h: u32, 
 }
 
 const testing = std.testing;
-const png = @import("png.zig");
+const png = @import("../core/png.zig");
 
 test "decodes a PNG with straight alpha" {
     const px = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 10, 20, 30, 255 };

@@ -8,6 +8,7 @@
 //!                                          draw a few frames, save DIR/audio.bmp, exit
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Color = vass.Color;
@@ -28,8 +29,11 @@ const note_names = [_][]const u8{ "C4", "E4", "G4", "C5" };
 const note_hz = [_]f32{ 261.63, 329.63, 392.0, 523.25 };
 
 const App = struct {
+    gpa: std.mem.Allocator,
+    /// A snapshot run: the silent dummy driver and synthetic data.
+    snapshot: bool,
     state: ui_mod.State = .{},
-    audio: audio_mod.Audio,
+    audio: audio_mod.Audio = undefined, // created in `setup`
     icons: struct { mic: vass.SvgIcon = .none, play: vass.SvgIcon = .none, pause: vass.SvgIcon = .none, stop: vass.SvgIcon = .none } = .{},
     notes: [4]Sound = @splat(.none),
     chime: Sound = .none,
@@ -148,7 +152,7 @@ fn playNote(app: *App, s: Sound) void {
     _ = app.audio.play(s, .{ .volume = 0.9 }) catch |e| app.setStatus("Could not play: {s}", .{@errorName(e)});
 }
 
-fn frame(app: *App, ui: *Ui, gpa: std.mem.Allocator) void {
+pub fn frame(app: *App, ui: *Ui) void {
     const t = ui.theme;
     const audio = &app.audio;
     audio.update();
@@ -220,7 +224,7 @@ fn frame(app: *App, ui: *Ui, gpa: std.mem.Allocator) void {
     if (ui.iconButton(rbtn, if (recording) app.icons.stop else app.icons.mic, .{ .icon_size = 20, .color = if (recording) t.bad else null, .active = recording }).clicked) {
         if (recording) {
             if (audio.stopRecording()) |clip| {
-                setClip(app, gpa, clip) catch {};
+                setClip(app, app.gpa, clip) catch {};
                 app.setStatus("Recorded {d:.1} s", .{audio.soundDuration(clip)});
             } else |e| app.setStatus("Nothing recorded ({s})", .{@errorName(e)});
         } else if (audio.startRecording(.{ .sample_rate = 22050 })) {
@@ -281,35 +285,23 @@ fn frame(app: *App, ui: *Ui, gpa: std.mem.Allocator) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
+    const env = try harness.start(init, "audio", .{}) orelse return;
+    var app: App = .{ .gpa = env.gpa, .snapshot = env.cli.snapshot() };
+    try harness.run(@This(), env, .{ .window = .{ .title = "Audio", .width = win_w, .height = win_h } }, &app);
+}
 
-    var snapshot_dir: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else {
-            std.debug.print("usage: audio [--snapshot DIR]\n", .{});
-            return;
-        }
-    }
-
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Audio", .width = win_w, .height = win_h });
-    defer win.deinit();
+pub fn setup(app: *App, win: *vass.platform.Window) !void {
+    const gpa = app.gpa;
     // The silent dummy driver in snapshot mode: nothing is ever played or recorded.
-    var app: App = .{ .audio = audio_mod.Audio.init(gpa, .{ .driver = if (snapshot_dir != null) "dummy" else null }) };
-    defer app.audio.deinit();
-    defer if (app.clip.id != 0) gpa.free(app.clip_peaks);
-    try loadSounds(&app, &win, gpa);
+    app.audio = audio_mod.Audio.init(gpa, .{ .driver = if (app.snapshot) "dummy" else null });
+    errdefer teardown(app, win);
+    try loadSounds(app, win, gpa);
 
-    if (snapshot_dir != null) {
+    if (app.snapshot) {
         app.synthetic = true;
         const speech = try makeSpeechish(gpa, 6.5, 22050);
         defer gpa.free(speech);
-        try setClip(&app, gpa, try app.audio.soundFromSamples(speech, 22050, 1));
+        try setClip(app, gpa, try app.audio.soundFromSamples(speech, 22050, 1));
         // Part-way through, paused there. The pad is "playing" too.
         app.clip_voice = try app.audio.play(app.clip, .{ .start = 0.4 * 6.5, .volume = 0 });
         app.audio.pause(app.clip_voice);
@@ -318,56 +310,9 @@ pub fn main(init: std.process.Init) !void {
         app.master = 0.8;
         app.setStatus("Recorded 6.5 s (synthetic data on the silent dummy driver)", .{});
     }
-
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-    const theme: vass.ui.Theme = .{ .card_radius = 12 };
-    var input: ui_mod.Input = .{};
-    var live: Live = .{ .app = &app, .win = &win, .gpa = gpa, .list = &list, .input = &input, .theme = theme };
-    win.setFrameCallback(&live, Live.onResize);
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        while (vass.platform.pollEvent()) |ev| {
-            switch (ev) {
-                .quit, .close_requested => running = false,
-                else => {},
-            }
-            if (snapshot_dir == null) input.feed(ev, win.id());
-        }
-        input.time = if (snapshot_dir != null) 0 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-
-        const snap = if (snapshot_dir) |dir| n == 3 and dir.len > 0 else false;
-        if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/audio.bmp", .{snapshot_dir.?}, 0);
-        live.draw(input);
-        if (snap) running = false;
-        input.endFrame();
-        // The loop already redraws every frame, so progress and meters move without input.
-        vass.platform.sleepMs(16);
-    }
 }
 
-/// Draws one frame. The main loop and the window's resize callback both call it, so the
-/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
-const Live = struct {
-    app: *App,
-    win: *vass.platform.Window,
-    gpa: std.mem.Allocator,
-    list: *vass.DisplayList,
-    input: *ui_mod.Input,
-    theme: vass.ui.Theme,
-
-    fn draw(l: *Live, in: ui_mod.Input) void {
-        l.list.reset();
-        var ui = Ui.init(l.list, l.win, in, l.theme);
-        ui.state = &l.app.state;
-        frame(l.app, &ui, l.gpa);
-        l.win.render(l.list, l.theme.bg);
-    }
-
-    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
-    fn onResize(ctx: ?*anyopaque) void {
-        const l: *Live = @ptrCast(@alignCast(ctx.?));
-        l.draw(l.input.idle());
-    }
-};
+pub fn teardown(app: *App, _: *vass.platform.Window) void {
+    if (app.clip.id != 0) app.gpa.free(app.clip_peaks);
+    app.audio.deinit();
+}

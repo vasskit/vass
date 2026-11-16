@@ -12,6 +12,7 @@
 //!                                           after scripted input (hidden window), then exit
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Ui = vass.Ui;
@@ -40,6 +41,8 @@ const App = struct {
     left_btn: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     right_btn: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     bottom_btn: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// The second window of a snapshot run: the narrow one, no script.
+    narrow: bool = false,
 };
 
 fn sizeText(buf: []u8, r: Rect) []const u8 {
@@ -59,7 +62,8 @@ fn pane(ui: *Ui, r: Rect, title: []const u8, hint: []const u8) void {
     ui.label(.{ .x = r.x + 14, .y = r.y + 56, .w = r.w - 28, .h = 18 }, hint, .{ .size = 11.5, .color = t.dim });
 }
 
-fn frame(app: *App, ui: *Ui) void {
+pub fn frame(app: *App, ui: *Ui) void {
+    defer ui.finish();
     const t = ui.theme;
     var area = (Rect{ .x = 0, .y = 0, .w = ui.bounds.w, .h = ui.bounds.h }).inset(12);
 
@@ -126,7 +130,7 @@ fn frame(app: *App, ui: *Ui) void {
 
 // ---- scripted run -----------------------------------------------------------------------------
 
-const Step = struct { in: ui_mod.Input, snap: ?[]const u8 = null };
+const Beat = struct { in: ui_mod.Input, snap: ?[]const u8 = null };
 
 fn center(r: Rect) [2]f32 {
     return .{ r.x + r.w / 2, r.y + r.h / 2 };
@@ -149,7 +153,7 @@ fn liftAt(x: f32, y: f32) ui_mod.Input {
 }
 
 /// The input of scripted frame `n`, aimed at where things were drawn the frame before.
-fn script(app: *App, n: u32) ?Step {
+fn script(app: *App, n: u32) ?Beat {
     switch (n) {
         4, 11, 15 => app.anchor = center(if (n == 4 or n == 15) app.left_div else app.right_div),
         else => {},
@@ -198,88 +202,39 @@ fn script(app: *App, n: u32) ?Step {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-
-    var snapshot_dir: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else {
-            std.debug.print("usage: split [--snapshot DIR]\n", .{});
-            return;
-        }
-    }
-
+    const env = try harness.start(init, "split", .{}) orelse return;
     var app: App = .{};
     // The scripted run draws the full script in a wide window, then the same state (the sizes the
     // script left) squeezed into a narrow one: the panes shrink, the stored sizes do not.
-    try run(gpa, arena, &app, 1100, 660, snapshot_dir, false);
-    if (snapshot_dir != null) try run(gpa, arena, &app, 520, 560, snapshot_dir, true);
-}
-
-fn run(gpa: std.mem.Allocator, arena: std.mem.Allocator, app: *App, w: u32, h: u32, snapshot_dir: ?[]const u8, narrow: bool) !void {
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Split panes", .width = w, .height = h, .resizable = true, .hidden = snapshot_dir != null, .min_width = 360, .min_height = 300 });
-    defer win.deinit();
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-
-    const theme: vass.ui.Theme = .{ .card_radius = 12 };
-    var input: ui_mod.Input = .{};
-    var live: Live = .{ .app = app, .win = &win, .list = &list, .input = &input, .theme = theme };
-    win.setFrameCallback(&live, Live.onResize);
-
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        while (vass.platform.pollEvent()) |ev| switch (ev) {
-            .quit, .close_requested => running = false,
-            else => if (snapshot_dir == null) input.feed(ev, win.id()),
-        };
-        var snap: ?[]const u8 = null;
-        if (snapshot_dir != null) {
-            const time = @as(f64, @floatFromInt(n)) * 0.016;
-            if (narrow) {
-                input = pointer(-1e9, -1e9);
-                if (n == 3) snap = "narrow";
-                if (n >= 3) running = false;
-            } else if (script(app, n)) |st| {
-                input = st.in;
-                snap = st.snap;
-            } else running = false;
-            input.time = time;
-        } else input.time = @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-        if (snap) |name| win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/split-{s}.bmp", .{ snapshot_dir.?, name }, 0);
-        if (running or snap != null) live.draw(input);
-        input.endFrame();
-        vass.platform.sleepMs(if (snapshot_dir != null) 4 else 16);
+    try showWindow(env, &app, 1100, 660);
+    if (env.cli.snapshot()) {
+        app.narrow = true;
+        try showWindow(env, &app, 520, 560);
     }
 }
 
-/// Draws one frame. The main loop and the window's resize callback both call it, so the
-/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
-const Live = struct {
-    app: *App,
-    win: *vass.platform.Window,
-    list: *vass.DisplayList,
-    input: *ui_mod.Input,
-    theme: vass.ui.Theme,
+fn showWindow(env: harness.Env, app: *App, w: u32, h: u32) !void {
+    try harness.run(@This(), env, .{
+        .window = .{ .title = "Split panes", .width = w, .height = h, .resizable = true, .min_width = 360, .min_height = 300 },
+        .snapshot_frame = null, // `step` runs the script and names the snapshots
+        .snapshot_clock_step = 0.016,
+        .snapshot_sleep_ms = 4,
+    }, app);
+}
 
-    fn draw(l: *Live, in: ui_mod.Input) void {
-        l.list.reset();
-        var ui = Ui.init(l.list, l.win, in, l.theme);
-        ui.state = &l.app.state;
-        frame(l.app, &ui);
-        ui.finish();
-        l.win.render(l.list, l.theme.bg);
-    }
-
-    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
-    fn onResize(ctx: ?*anyopaque) void {
-        const l: *Live = @ptrCast(@alignCast(ctx.?));
-        l.draw(l.input.idle());
-    }
-};
+pub fn step(app: *App, s: *harness.Step) !void {
+    if (!s.env.cli.snapshot()) return;
+    var snap: ?[]const u8 = null;
+    if (app.narrow) {
+        s.input.* = pointer(-1e9, -1e9);
+        if (s.n == 3) {
+            snap = "narrow";
+            s.done();
+        }
+    } else if (script(app, s.n)) |beat| {
+        s.input.* = beat.in;
+        snap = beat.snap;
+    } else return s.stop();
+    s.input.time = s.time;
+    if (snap) |name| try s.save("split-{s}", .{name});
+}

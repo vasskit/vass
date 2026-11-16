@@ -26,10 +26,10 @@
 //! The app's own copy of the `Input` is not changed: an app with global shortcuts should check
 //! `ui.popupOpen()` before acting on Escape or the arrow keys.
 const std = @import("std");
-const geom = @import("geom.zig");
-const gfx = @import("gfx.zig");
+const geom = @import("../core/geom.zig");
+const gfx = @import("../core/gfx.zig");
 const icons = @import("icons.zig");
-const keys = @import("keys.zig");
+const keys = @import("../core/keys.zig");
 const ui_mod = @import("ui.zig");
 const focus = @import("focus.zig");
 const Rect = geom.Rect;

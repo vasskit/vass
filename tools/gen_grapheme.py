@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generates src/grapheme_data.zig (extended grapheme cluster properties) and
-src/testdata/GraphemeBreakTest.txt for src/grapheme.zig.
+"""Generates src/text/grapheme_data.zig (extended grapheme cluster properties) and
+src/text/testdata/GraphemeBreakTest.txt for src/text/grapheme.zig.
 
 Re-run (Python 3, no dependencies) after downloading the Unicode data files into
 a scratch directory of your choice:
@@ -45,7 +45,7 @@ def rng(field):
 
 def main():
     d = sys.argv[1]
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "text")
     with open(os.path.join(d, "GraphemeBreakProperty.txt"), encoding="utf-8") as f:
         m = re.search(r"GraphemeBreakProperty-(\d+\.\d+\.\d+)\.txt", f.readline())
     version = m.group(1)

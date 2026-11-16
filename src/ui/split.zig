@@ -26,8 +26,8 @@
 //! difference is far smaller than the area. Needs `ui.state` and `ui.finish()` (the same as
 //! popups); without them the splitter draws and reports hover but cannot drag and blocks nothing.
 const std = @import("std");
-const geom = @import("geom.zig");
-const keys = @import("keys.zig");
+const geom = @import("../core/geom.zig");
+const keys = @import("../core/keys.zig");
 const ui_mod = @import("ui.zig");
 const focus = @import("focus.zig");
 const popup = @import("popup.zig");
@@ -443,7 +443,7 @@ pub fn three(area: Rect, left_size: f32, right_size: f32, opts: ThreeOpts) Three
 
 // ---- tests ------------------------------------------------------------------------------------------
 
-const gfx = @import("gfx.zig");
+const gfx = @import("../core/gfx.zig");
 const State = ui_mod.State;
 const Input = ui_mod.Input;
 const DisplayList = gfx.DisplayList;
@@ -1077,7 +1077,7 @@ test "early call without tab stop plus late call: both agree, one line drawn, on
 }
 
 test "feeds a Layout with no lag: the splitter runs first with last frame's divider" {
-    const layout = @import("layout.zig");
+    const layout = @import("../layout/layout.zig");
     var rig = try Rig.init();
     defer rig.deinit();
     var side_w: f32 = 270;

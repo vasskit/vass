@@ -3,28 +3,34 @@
 //!
 //! Layering rule: `geom` depends on nothing, `gfx` depends only on `geom`,
 //! and only the backend knows about the windowing/rendering library.
-pub const geom = @import("geom.zig");
-pub const layout = @import("layout.zig");
-pub const gfx = @import("gfx.zig");
-pub const ui = @import("ui.zig");
-pub const popup = @import("popup.zig");
-pub const focus = @import("focus.zig");
-pub const split = @import("split.zig");
-pub const keys = @import("keys.zig");
-pub const text_edit = @import("text_edit.zig");
-pub const grapheme = @import("grapheme.zig");
-pub const emoji = @import("emoji.zig");
-pub const png = @import("png.zig");
-pub const image = @import("image.zig");
-pub const decode = @import("decode.zig");
-pub const icons = @import("icons.zig");
-pub const svg = @import("svg.zig");
-pub const raster = @import("raster.zig");
-pub const svg_cache = @import("svg_cache.zig");
-pub const audio = @import("audio.zig");
-pub const platform = @import("backend_sdl.zig");
+//!
+//! The source tree is grouped by the package each folder would become: `core/` (geometry, display
+//! list, keys, image handles, PNG writer), `platform/` (SDL3 backend, macOS extras), `text/`
+//! (grapheme/emoji tables, editing core, undo, emoji compositing), `layout/`, `image/` (decoders,
+//! SVG, rasteriser, texture cache policy), `audio/` and `ui/` (the immediate-mode widgets).
+//! The tests of every file are pulled in by the `test` block at the end of this file.
+pub const geom = @import("core/geom.zig");
+pub const layout = @import("layout/layout.zig");
+pub const gfx = @import("core/gfx.zig");
+pub const ui = @import("ui/ui.zig");
+pub const popup = @import("ui/popup.zig");
+pub const focus = @import("ui/focus.zig");
+pub const split = @import("ui/split.zig");
+pub const keys = @import("core/keys.zig");
+pub const text_edit = @import("text/text_edit.zig");
+pub const grapheme = @import("text/grapheme.zig");
+pub const emoji = @import("text/emoji.zig");
+pub const png = @import("core/png.zig");
+pub const image = @import("core/image.zig");
+pub const decode = @import("image/decode.zig");
+pub const icons = @import("ui/icons.zig");
+pub const svg = @import("image/svg.zig");
+pub const raster = @import("image/raster.zig");
+pub const svg_cache = @import("image/svg_cache.zig");
+pub const audio = @import("audio/audio.zig");
+pub const platform = @import("platform/backend_sdl.zig");
 /// macOS-only extras: menu-bar item, overlay window behaviour, notch metrics.
-pub const macos = @import("macos.zig");
+pub const macos = @import("platform/macos.zig");
 
 pub const Rect = geom.Rect;
 pub const Color = geom.Color;
@@ -56,15 +62,15 @@ test {
     _ = text_edit;
     _ = grapheme;
     _ = emoji;
-    _ = @import("text_compose.zig");
+    _ = @import("text/text_compose.zig");
     _ = ui;
-    _ = @import("controls.zig");
-    _ = @import("text_area.zig");
-    _ = @import("popup.zig");
+    _ = @import("ui/controls.zig");
+    _ = @import("ui/text_area.zig");
+    _ = @import("ui/popup.zig");
     _ = focus;
     _ = split;
-    _ = @import("focus_test.zig");
-    _ = @import("text_input_test.zig");
+    _ = @import("ui/focus_test.zig");
+    _ = @import("ui/text_input_test.zig");
     _ = icons;
     _ = svg;
     _ = raster;
@@ -75,7 +81,7 @@ test {
     _ = image;
     _ = decode;
     _ = audio;
-    _ = @import("audio_pcm.zig");
-    _ = @import("audio_mixer.zig");
+    _ = @import("audio/audio_pcm.zig");
+    _ = @import("audio/audio_mixer.zig");
     _ = platform;
 }

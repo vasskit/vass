@@ -11,6 +11,7 @@
 //! Note bodies are selectable: drag, double/triple click, cmd+C, cmd+A, Escape.
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Ui = vass.Ui;
@@ -106,7 +107,8 @@ fn cardHeight(ui: *const Ui, text: []const u8, text_w: f32) f32 {
 
 /// Draws one frame and handles its input. Returns after the field's Return,
 /// having added the note.
-fn frame(app: *App, ui: *Ui, lay: Layout) !void {
+pub fn frame(app: *App, ui: *Ui) !void {
+    const lay = Layout.of(win_w, win_h);
     const t = ui.theme;
     const total: usize = app.notes.items.len;
 
@@ -206,104 +208,42 @@ fn script(in: *ui_mod.Input, n: u32, lay: Layout, sel_from: Point, sel_to: Point
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
+    const env = try harness.start(init, "notes", .{ .script = true, .debug_input = true }) orelse return;
+    const scripted = env.cli.script;
 
-    var snapshot_dir: ?[]const u8 = null;
-    var scripted = false;
-    var debug_input = false; // print mouse events and the field's selection
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else if (std.mem.eql(u8, args[i], "--script")) {
-            scripted = true;
-        } else if (std.mem.eql(u8, args[i], "--debug-input")) {
-            debug_input = true;
-        } else {
-            std.debug.print("usage: notes [--snapshot DIR] [--script] [--debug-input]\n", .{});
-            return;
-        }
-    }
-    const snap_frame: u32 = if (scripted) 12 else 3;
-
-    var app: App = .{ .gpa = gpa, .field = ui_mod.TextFieldState.init(gpa) };
+    var app: App = .{ .gpa = env.gpa, .field = ui_mod.TextFieldState.init(env.gpa) };
     defer app.deinit();
     // The seeds are listed newest first.
     for (seed_notes) |n| try app.append(n, app.notes.items.len);
 
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Notes", .width = win_w, .height = win_h });
-    defer win.deinit();
-    win.startTextInput();
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-
-    const theme: vass.ui.Theme = .{ .card_radius = 12 };
-    var input: ui_mod.Input = .{};
-    var live: Live = .{ .app = &app, .win = &win, .list = &list, .input = &input, .theme = theme, .lay = Layout.of(win_w, win_h) };
-    // Redraw while the OS live-resizes the window (the loop below is blocked then).
-    win.setFrameCallback(&live, Live.onResize);
-
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        while (vass.platform.pollEvent()) |ev| switch (ev) {
-            .quit, .close_requested => running = false,
-            // Scripted runs ignore the real mouse and keyboard.
-            else => if (!scripted) {
-                if (debug_input) switch (ev) {
-                    .mouse_down => |m| std.debug.print("down b={d} x={d:.0} y={d:.0} win={d}/{d}\n", .{ m.button, m.x, m.y, m.window, win.id() }),
-                    .mouse_up => |m| std.debug.print("up b={d} x={d:.0}\n", .{ m.button, m.x }),
-                    .mouse_move => |m| std.debug.print("move x={d:.0} y={d:.0} down={} cur={d} anc={d} drag={}\n", .{ m.x, m.y, input.down, app.field.edit.cursor, app.field.edit.anchor, app.state.drag != null }),
-                    else => {},
-                };
-                input.feed(ev, win.id());
-            },
-        };
-        input.time = if (scripted) @as(f64, @floatFromInt(n)) * 0.016 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-
-        const snap = if (snapshot_dir) |dir| n == snap_frame and dir.len > 0 else false;
-        if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/notes.bmp", .{snapshot_dir.?}, 0);
-        try live.draw(input, if (scripted) n else null);
-        if (snap) running = false;
-
-        // The Ui worked on a copy of the input; keep what it consumed.
-        input.endFrame();
-        vass.platform.sleepMs(16);
-    }
+    try harness.run(@This(), env, .{
+        .window = .{ .title = "Notes", .width = win_w, .height = win_h },
+        .text_input = true,
+        .snapshot_frame = if (scripted) 12 else 3,
+        // A scripted run ignores the real mouse and keyboard and runs on a fake clock.
+        .feed_input = !scripted,
+        .fixed_clock = scripted,
+        .snapshot_clock_step = 0.016,
+    }, &app);
 }
 
-/// Everything one frame needs, so the main loop and the resize callback draw the same way.
-const Live = struct {
-    app: *App,
-    win: *vass.platform.Window,
-    list: *vass.DisplayList,
-    input: *ui_mod.Input,
-    theme: vass.ui.Theme,
-    lay: Layout,
+/// The script (`--script`): synthetic input aimed at where the cards are.
+pub fn step(app: *App, s: *harness.Step) !void {
+    if (!s.env.cli.script) return;
+    const lay = Layout.of(win_w, win_h);
+    // The script needs the Ui's text measuring to aim at a card.
+    var ui = s.measureUi();
+    const pts = pickSelection(app, &ui, lay);
+    script(s.input, s.n, lay, pts[0], pts[1]);
+}
 
-    /// One frame: build the UI from `in` and render it. `script_n` is the frame number of a
-    /// scripted run, which injects its own input.
-    fn draw(l: *Live, in: ui_mod.Input, script_n: ?u32) !void {
-        l.list.reset();
-        var ui = Ui.init(l.list, l.win, in, l.theme);
-        if (script_n) |n| {
-            // The script needs the Ui's text measuring to aim at a card.
-            const pts = pickSelection(l.app, &ui, l.lay);
-            script(l.input, n, l.lay, pts[0], pts[1]);
-            ui.input = l.input.*;
-        }
-        ui.state = &l.app.state;
-        try frame(l.app, &ui, l.lay);
-        l.win.render(l.list, l.theme.bg);
+/// `--debug-input`: print mouse events and the field's selection.
+pub fn event(app: *App, s: *harness.Step, ev: vass.platform.Event) void {
+    if (!s.env.cli.debug_input) return;
+    switch (ev) {
+        .mouse_down => |m| std.debug.print("down b={d} x={d:.0} y={d:.0} win={d}/{d}\n", .{ m.button, m.x, m.y, m.window, s.win.id() }),
+        .mouse_up => |m| std.debug.print("up b={d} x={d:.0}\n", .{ m.button, m.x }),
+        .mouse_move => |m| std.debug.print("move x={d:.0} y={d:.0} down={} cur={d} anc={d} drag={}\n", .{ m.x, m.y, s.input.down, app.field.edit.cursor, app.field.edit.anchor, app.state.drag != null }),
+        else => {},
     }
-
-    /// Called by the window while it is being resized: an idle frame, so no click or key is
-    /// replayed and `input.time` (hence animations) stays where the last real frame left it.
-    fn onResize(ctx: ?*anyopaque) void {
-        const l: *Live = @ptrCast(@alignCast(ctx.?));
-        l.draw(l.input.idle(), null) catch |e| std.log.warn("resize frame failed: {s}", .{@errorName(e)});
-    }
-};
+}

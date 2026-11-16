@@ -6,6 +6,7 @@
 //!     zig build icons -- --snapshot DIR    draw a few frames, save DIR/icons.bmp, exit
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Color = vass.Color;
@@ -90,7 +91,7 @@ fn small(ui: *Ui, x: f32, y: f32, w: f32, str: []const u8) void {
     ui.label(.{ .x = x, .y = y, .w = w, .h = 12 }, str, .{ .size = 9.5, .color = ui.theme.dim, .@"align" = .center });
 }
 
-fn frame(app: *App, ui: *Ui) void {
+pub fn frame(app: *App, ui: *Ui) void {
     const t = ui.theme;
     var y: f32 = 20;
     ui.labelAt(margin, y, "SVG icons", .{ .size = 24 });
@@ -198,77 +199,15 @@ fn frame(app: *App, ui: *Ui) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-
-    var snapshot_dir: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else {
-            std.debug.print("usage: icons [--snapshot DIR]\n", .{});
-            return;
-        }
-    }
-
-    var win = try vass.platform.Window.init(gpa, .{ .title = "SVG icons", .width = win_w, .height = win_h });
-    defer win.deinit();
+    const env = try harness.start(init, "icons", .{}) orelse return;
     var app: App = .{};
-    try loadAll(&app, &win);
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-
-    const theme: vass.ui.Theme = .{ .card_radius = 12 };
-    var input: ui_mod.Input = .{};
-    var live: Live = .{ .app = &app, .win = &win, .list = &list, .input = &input, .theme = theme };
-    win.setFrameCallback(&live, Live.onResize);
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        while (vass.platform.pollEvent()) |ev| {
-            switch (ev) {
-                .quit, .close_requested => running = false,
-                else => {},
-            }
-            if (snapshot_dir == null) input.feed(ev, win.id());
-        }
-        input.time = if (snapshot_dir != null) 0 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-
-        const snap = if (snapshot_dir) |dir| n == 3 and dir.len > 0 else false;
-        if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/icons.bmp", .{snapshot_dir.?}, 0);
-        live.draw(input);
-        if (snap) {
-            std.debug.print("svg textures cached: {d}\n", .{win.svgTextureCount()});
-            running = false;
-        }
-        input.endFrame();
-        vass.platform.sleepMs(16);
-    }
+    try harness.run(@This(), env, .{ .window = .{ .title = "SVG icons", .width = win_w, .height = win_h } }, &app);
 }
 
-/// Draws one frame. The main loop and the window's resize callback both call it, so the
-/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
-const Live = struct {
-    app: *App,
-    win: *vass.platform.Window,
-    list: *vass.DisplayList,
-    input: *ui_mod.Input,
-    theme: vass.ui.Theme,
+pub fn setup(app: *App, win: *vass.platform.Window) !void {
+    try loadAll(app, win);
+}
 
-    fn draw(l: *Live, in: ui_mod.Input) void {
-        l.list.reset();
-        var ui = Ui.init(l.list, l.win, in, l.theme);
-        ui.state = &l.app.state;
-        frame(l.app, &ui);
-        l.win.render(l.list, l.theme.bg);
-    }
-
-    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
-    fn onResize(ctx: ?*anyopaque) void {
-        const l: *Live = @ptrCast(@alignCast(ctx.?));
-        l.draw(l.input.idle());
-    }
-};
+pub fn after(_: *App, s: *harness.Step) !void {
+    if (s.saved) std.debug.print("svg textures cached: {d}\n", .{s.win.svgTextureCount()});
+}

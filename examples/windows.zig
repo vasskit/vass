@@ -26,6 +26,7 @@
 //!     only records what it wants (`App.want_*`) and the loop does it afterwards.
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Ui = vass.Ui;
@@ -599,27 +600,15 @@ fn runScript(app: *App, arena: std.mem.Allocator, dir: []const u8) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
+    const env = try harness.start(init, "windows", .{}) orelse return;
+    const gpa = env.gpa;
+    const arena = env.arena;
 
-    var snapshot_dir: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else {
-            std.debug.print("usage: windows [--snapshot DIR]\n", .{});
-            return;
-        }
-    }
-
-    var app: App = .{ .gpa = gpa, .hidden = snapshot_dir != null };
+    var app: App = .{ .gpa = gpa, .hidden = env.cli.snapshot() and !env.cli.hold };
     defer app.deinit();
     try app.openMain();
 
-    if (snapshot_dir) |dir| {
+    if (env.cli.snapshot_dir) |dir| {
         try runScript(&app, arena, dir);
         return;
     }

@@ -20,6 +20,7 @@
 //! the text areas take Tab out of the way (the first two keep it as focus movement).
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Ui = vass.Ui;
@@ -84,8 +85,8 @@ fn smallButton(ui: *Ui, r: Rect, label: []const u8, enabled: bool) bool {
     return false;
 }
 
-fn frame(app: *App, ui: *Ui, win: ?*vass.platform.Window) void {
-    _ = win; // the text widgets tell the input method where the caret is themselves
+pub fn frame(app: *App, ui: *Ui) void {
+    defer ui.finish();
     const t = ui.theme;
     const col_w = (win_w - 3 * margin) / 2;
     const left = margin;
@@ -210,21 +211,8 @@ fn frame(app: *App, ui: *Ui, win: ?*vass.platform.Window) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-
-    var snapshot_dir: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else {
-            std.debug.print("usage: controls [--snapshot DIR]\n", .{});
-            return;
-        }
-    }
+    const env = try harness.start(init, "controls", .{}) orelse return;
+    const gpa = env.gpa;
 
     var app: App = .{
         .notes = ui_mod.TextAreaState.init(gpa),
@@ -238,18 +226,7 @@ pub fn main(init: std.process.Init) !void {
     try app.notes.edit.setText(sample);
     try app.composer.edit.setText("First line\nSecond line");
 
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Controls", .width = win_w, .height = win_h, .hidden = snapshot_dir != null });
-    defer win.deinit();
-    win.startTextInput();
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-
-    const theme: vass.ui.Theme = .{ .card_radius = 12 };
-    var input: ui_mod.Input = .{};
-    var live: Live = .{ .app = &app, .win = &win, .list = &list, .input = &input, .theme = theme };
-    win.setFrameCallback(&live, Live.onResize);
-
-    if (snapshot_dir != null) {
+    if (env.cli.snapshot()) {
         // A selection from the middle of the first paragraph into the third.
         const text = app.notes.edit.text();
         app.notes.edit.anchor = std.mem.indexOf(u8, text, "wraps").?;
@@ -257,32 +234,24 @@ pub fn main(init: std.process.Init) !void {
         app.state.focusOn(&app.notes);
     }
 
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        while (vass.platform.pollEvent()) |ev| switch (ev) {
-            .quit, .close_requested => running = false,
-            else => if (snapshot_dir == null) input.feed(ev, win.id()),
-        };
-        input.time = if (snapshot_dir != null) 0 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
+    try harness.run(@This(), env, .{
+        .window = .{ .title = "Controls", .width = win_w, .height = win_h },
+        .text_input = true,
+        .snapshot_frame = null, // `step` below names the snapshots
+    }, &app);
+}
 
-        // Second snapshot: no focus, then nine Tabs through the controls in call order
-        // (two checkboxes, two switches, three radios, two segmented controls).
-        if (snapshot_dir != null and n == 4) {
-            app.state.blur();
-            for (0..9) |_| input.pushKey(vass.keys.tab, .{});
-        }
-        const snap = if (snapshot_dir) |dir| n == 3 and dir.len > 0 else false;
-        const snap_focus = if (snapshot_dir) |dir| n == 7 and dir.len > 0 else false;
-        if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/controls.bmp", .{snapshot_dir.?}, 0);
-        if (snap_focus) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/controls-focus.bmp", .{snapshot_dir.?}, 0);
-        if (snapshot_dir != null and n >= 8) {
-            if (script(&app, &win, &input, snapshot_dir.?, arena, n)) running = false;
-        }
-        live.draw(input);
-        input.endFrame();
-        vass.platform.sleepMs(16);
+pub fn step(app: *App, s: *harness.Step) !void {
+    if (!s.env.cli.snapshot()) return;
+    // Second snapshot: no focus, then nine Tabs through the controls in call order
+    // (two checkboxes, two switches, three radios, two segmented controls).
+    if (s.n == 4) {
+        app.state.blur();
+        for (0..9) |_| s.input.pushKey(vass.keys.tab, .{});
     }
+    if (s.n == 3) try s.save("controls", .{});
+    if (s.n == 7) try s.save("controls-focus", .{});
+    if (s.n >= 8 and try script(app, s)) s.done();
 }
 
 /// An input-method composition, as the backend would deliver it (`start` and `length` count
@@ -312,24 +281,20 @@ fn release(input: *ui_mod.Input) void {
 /// The scripted part of the snapshot run (frame `n` >= 8): synthetic mouse, keys and input-method
 /// events against the text input group. Returns true after the last snapshot. Nothing here needs
 /// a real input method: the composition is injected into `Input` the way `Input.feed` would.
-fn script(app: *App, win: *vass.platform.Window, input: *ui_mod.Input, dir: []const u8, arena: std.mem.Allocator, n: u32) bool {
-    const snap = struct {
-        fn at(w: *vass.platform.Window, a: std.mem.Allocator, d: []const u8, name: []const u8) void {
-            w.snapshot_path = std.fmt.allocPrintSentinel(a, "{s}/controls-text-{s}.bmp", .{ d, name }, 0) catch null;
-        }
-    }.at;
-    switch (n) {
+fn script(app: *App, s: *harness.Step) !bool {
+    const input = s.input;
+    switch (s.n) {
         // A double click on "cafe\u{301}": the word is selected, accent and all, as one letter.
         8 => press(input, app.marks_rect, 24, 2),
         9 => {
             release(input);
-            snap(win, arena, dir, "word");
+            try s.save("controls-text-word", .{});
         },
         // The input method starts composing after the word: "ni hao" with the first syllable
         // (the part being converted) highlighted.
         10 => app.marks.edit.moveTo(std.mem.indexOf(u8, app.marks.edit.text(), " ").? + 1, false),
         11 => input.composition = composition("ni hao", 0, 2),
-        12 => snap(win, arena, dir, "composition"),
+        12 => try s.save("controls-text-composition", .{}),
         // Cancelled; then a right click on the field opens the context menu.
         13 => {
             input.composition = .{};
@@ -337,7 +302,7 @@ fn script(app: *App, win: *vass.platform.Window, input: *ui_mod.Input, dir: []co
             input.mouse_y = app.marks_rect.y + 16;
             input.right_pressed = true;
         },
-        14 => snap(win, arena, dir, "menu"),
+        14 => try s.save("controls-text-menu", .{}),
         15 => input.pushKey(vass.keys.escape, .{}),
         // The password field: type, then select the last two characters with Shift+Left.
         16 => press(input, app.pw_rect, 40, 1),
@@ -349,35 +314,9 @@ fn script(app: *App, win: *vass.platform.Window, input: *ui_mod.Input, dir: []co
             input.pushKey(vass.keys.left, .{ .shift = true });
             input.pushKey(vass.keys.left, .{ .shift = true });
         },
-        19 => snap(win, arena, dir, "password"),
+        19 => try s.save("controls-text-password", .{}),
         20 => return true,
         else => {},
     }
     return false;
 }
-
-/// Draws one frame. The main loop and the window's resize callback both call it, so the
-/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
-const Live = struct {
-    app: *App,
-    win: *vass.platform.Window,
-    list: *vass.DisplayList,
-    input: *ui_mod.Input,
-    theme: vass.ui.Theme,
-
-    fn draw(l: *Live, in: ui_mod.Input) void {
-        l.list.reset();
-        var ui = Ui.init(l.list, l.win, in, l.theme);
-        ui.state = &l.app.state;
-        frame(l.app, &ui, l.win);
-        ui.finish();
-        l.win.render(l.list, l.theme.bg);
-    }
-
-    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
-    fn onResize(ctx: ?*anyopaque) void {
-        const l: *Live = @ptrCast(@alignCast(ctx.?));
-        l.draw(l.input.idle());
-    }
-};
-

@@ -13,10 +13,10 @@
 //! composition is cancelled the selection is still there.
 const std = @import("std");
 const builtin = @import("builtin");
-const backend = @import("backend_sdl.zig");
-const geom = @import("geom.zig");
-const text_edit = @import("text_edit.zig");
-const grapheme = @import("grapheme.zig");
+const backend = @import("../platform/backend_sdl.zig");
+const geom = @import("../core/geom.zig");
+const text_edit = @import("../text/text_edit.zig");
+const grapheme = @import("../text/grapheme.zig");
 const popup = @import("popup.zig");
 const ui_mod = @import("ui.zig");
 const Rect = geom.Rect;
@@ -233,7 +233,7 @@ pub fn imeOwnsKey(k: backend.Key) bool {
 
 /// Copy and cut (and their command-key forms) are disabled in a password field.
 pub fn isCopyOrCut(k: backend.Key) bool {
-    return k.mods.cmd and !k.mods.alt and !k.mods.ctrl and (k.code == @import("keys.zig").c or k.code == @import("keys.zig").x);
+    return k.mods.cmd and !k.mods.alt and !k.mods.ctrl and (k.code == @import("../core/keys.zig").c or k.code == @import("../core/keys.zig").x);
 }
 
 /// In a password field a word is the whole text: Alt+arrows and Alt+Backspace/Delete act as

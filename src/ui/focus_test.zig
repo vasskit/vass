@@ -1,8 +1,8 @@
 //! Headless, multi-frame tests of keyboard focus (see focus.zig).
 const std = @import("std");
-const geom = @import("geom.zig");
-const gfx = @import("gfx.zig");
-const keys = @import("keys.zig");
+const geom = @import("../core/geom.zig");
+const gfx = @import("../core/gfx.zig");
+const keys = @import("../core/keys.zig");
 const ui_mod = @import("ui.zig");
 const focus = @import("focus.zig");
 const Rect = geom.Rect;

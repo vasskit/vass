@@ -2,8 +2,8 @@
 //! and colour without image support. Each icon fits a square; `draw` centres
 //! it in a rectangle and scales it to the shorter side. Designed for 14-20 pt.
 const std = @import("std");
-const geom = @import("geom.zig");
-const gfx = @import("gfx.zig");
+const geom = @import("../core/geom.zig");
+const gfx = @import("../core/gfx.zig");
 const Rect = geom.Rect;
 const Color = geom.Color;
 

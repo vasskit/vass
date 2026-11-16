@@ -14,6 +14,7 @@
 //! popup), Space / Enter activate, Up / Down change a focused dropdown, Escape closes a popup.
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Ui = vass.Ui;
@@ -83,7 +84,8 @@ fn dangerButton(ui: *Ui, r: Rect, str: []const u8) bool {
     return hv.clicked or f.activated;
 }
 
-fn frame(app: *App, ui: *Ui) void {
+pub fn frame(app: *App, ui: *Ui) void {
+    defer ui.finish();
     const t = ui.theme;
     var y: f32 = 22;
     ui.labelAt(margin, y, "Popups", .{ .size = 24 });
@@ -187,118 +189,61 @@ fn frame(app: *App, ui: *Ui) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-
-    var snapshot_dir: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else {
-            std.debug.print("usage: popups [--snapshot DIR]\n", .{});
-            return;
-        }
-    }
-
+    const env = try harness.start(init, "popups", .{}) orelse return;
     var app: App = .{};
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Popups", .width = win_w, .height = win_h, .hidden = snapshot_dir != null });
-    defer win.deinit();
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-
-    const theme: vass.ui.Theme = .{ .card_radius = 12 };
-    var input: ui_mod.Input = .{};
-    var live: Live = .{ .app = &app, .win = &win, .list = &list, .input = &input, .theme = theme };
-    win.setFrameCallback(&live, Live.onResize);
-
-    // Snapshot script: scene 0..3, each drawn for a few frames on a fake clock so the tooltip
-    // timer runs, then saved. The scenes put the state of the popups by hand.
-    const scene_names = [_][]const u8{ "1-tooltip", "2-menus", "3-popover", "4-modal", "focus" };
-    const frames_per_scene = 5;
-
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        while (vass.platform.pollEvent()) |ev| switch (ev) {
-            .quit, .close_requested => running = false,
-            else => if (snapshot_dir == null) input.feed(ev, win.id()),
-        };
-        var scene: usize = 0;
-        var scene_frame: u32 = 0;
-        if (snapshot_dir != null) {
-            scene = n / frames_per_scene;
-            scene_frame = n % frames_per_scene;
-            if (scene >= scene_names.len) break;
-            if (scene_frame == 0) {
-                app.actions_menu = .{};
-                app.context = .{};
-                app.popover = .{};
-                app.modal = .{};
-                app.size_dd.popup = .{};
-                app.open_dd.popup = .{};
-                app.sort_dd.popup = .{};
-                app.state = .{};
-                input = .{};
-                switch (scene) {
-                    0 => {},
-                    1 => {
-                        app.open_dd.popup = .{ .open = true, .fresh = true };
-                        app.actions_menu = .{ .open = true, .highlight = 1 };
-                        app.context = .{ .open = true, .point = .{ margin + 250, 432 }, .highlight = 0 };
-                    },
-                    2 => {
-                        app.popover = .{ .open = true };
-                        app.sort_dd.popup = .{ .open = true };
-                    },
-                    // 4 is the keyboard focus scene: the modal with Tab pressed twice below.
-                    else => app.modal = .{ .open = true },
-                }
-            }
-        }
-        // The focus scene: Tab twice inside the open modal, so the ring lands on "Delete".
-        if (snapshot_dir != null and scene == 4 and scene_frame == 2) {
-            input.pushKey(vass.keys.tab, .{});
-            input.pushKey(vass.keys.tab, .{});
-        }
-        // Scene 0 rests the pointer on the second icon button once its position is known.
-        if (snapshot_dir != null and scene == 0 and scene_frame == 1) {
-            input.mouse_x = app.tip_center[0];
-            input.mouse_y = app.tip_center[1];
-        }
-        input.time = if (snapshot_dir != null) @as(f64, @floatFromInt(n)) * 0.3 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-
-        const snap = snapshot_dir != null and scene_frame == frames_per_scene - 1;
-        if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/popups-{s}.bmp", .{ snapshot_dir.?, scene_names[scene] }, 0);
-        live.draw(input);
-        input.endFrame();
-        vass.platform.sleepMs(16);
-    }
+    try harness.run(@This(), env, .{
+        .window = .{ .title = "Popups", .width = win_w, .height = win_h },
+        .snapshot_frame = null, // the script below takes the snapshots
+        .snapshot_clock_step = 0.3, // a fake clock, so the tooltip timer runs
+    }, &app);
 }
 
-/// Draws one frame. The main loop and the window's resize callback both call it, so the
-/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
-const Live = struct {
-    app: *App,
-    win: *vass.platform.Window,
-    list: *vass.DisplayList,
-    input: *ui_mod.Input,
-    theme: vass.ui.Theme,
+/// Snapshot script: scene 0..3, each drawn for a few frames, then saved. The scenes put the state
+/// of the popups by hand.
+const scene_names = [_][]const u8{ "1-tooltip", "2-menus", "3-popover", "4-modal", "focus" };
+const frames_per_scene = 5;
 
-    fn draw(l: *Live, in: ui_mod.Input) void {
-        l.list.reset();
-        var ui = Ui.init(l.list, l.win, in, l.theme);
-        ui.state = &l.app.state;
-        frame(l.app, &ui);
-        ui.finish();
-        l.win.render(l.list, l.theme.bg);
+pub fn step(app: *App, s: *harness.Step) !void {
+    if (!s.env.cli.snapshot()) return;
+    const input = s.input;
+    const scene = s.n / frames_per_scene;
+    const scene_frame = s.n % frames_per_scene;
+    if (scene >= scene_names.len) return s.stop();
+    if (scene_frame == 0) {
+        app.actions_menu = .{};
+        app.context = .{};
+        app.popover = .{};
+        app.modal = .{};
+        app.size_dd.popup = .{};
+        app.open_dd.popup = .{};
+        app.sort_dd.popup = .{};
+        app.state = .{};
+        input.* = .{};
+        input.time = s.time;
+        switch (scene) {
+            0 => {},
+            1 => {
+                app.open_dd.popup = .{ .open = true, .fresh = true };
+                app.actions_menu = .{ .open = true, .highlight = 1 };
+                app.context = .{ .open = true, .point = .{ margin + 250, 432 }, .highlight = 0 };
+            },
+            2 => {
+                app.popover = .{ .open = true };
+                app.sort_dd.popup = .{ .open = true };
+            },
+            // 4 is the keyboard focus scene: the modal with Tab pressed twice below.
+            else => app.modal = .{ .open = true },
+        }
     }
-
-    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
-    fn onResize(ctx: ?*anyopaque) void {
-        const l: *Live = @ptrCast(@alignCast(ctx.?));
-        l.draw(l.input.idle());
+    // The focus scene: Tab twice inside the open modal, so the ring lands on "Delete".
+    if (scene == 4 and scene_frame == 2) {
+        input.pushKey(vass.keys.tab, .{});
+        input.pushKey(vass.keys.tab, .{});
     }
-};
+    // Scene 0 rests the pointer on the second icon button once its position is known.
+    if (scene == 0 and scene_frame == 1) {
+        input.mouse_x = app.tip_center[0];
+        input.mouse_y = app.tip_center[1];
+    }
+    if (scene_frame == frames_per_scene - 1) try s.save("popups-{s}", .{scene_names[scene]});
+}

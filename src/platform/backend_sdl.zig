@@ -2,17 +2,17 @@
 //! SDL is declared by hand (only what is used) so the build needs no C headers.
 const std = @import("std");
 const builtin = @import("builtin");
-const geom = @import("geom.zig");
-const gfx = @import("gfx.zig");
+const geom = @import("../core/geom.zig");
+const gfx = @import("../core/gfx.zig");
 const Color = geom.Color;
-const keys = @import("keys.zig");
-const image_mod = @import("image.zig");
-const decode_mod = @import("decode.zig");
-const svg_mod = @import("svg.zig");
-const raster_mod = @import("raster.zig");
-const svg_cache = @import("svg_cache.zig");
-const emoji_mod = @import("emoji.zig");
-const compose = @import("text_compose.zig");
+const keys = @import("../core/keys.zig");
+const image_mod = @import("../core/image.zig");
+const decode_mod = @import("../image/decode.zig");
+const svg_mod = @import("../image/svg.zig");
+const raster_mod = @import("../image/raster.zig");
+const svg_cache = @import("../image/svg_cache.zig");
+const emoji_mod = @import("../text/emoji.zig");
+const compose = @import("../text/text_compose.zig");
 pub const Image = image_mod.Image;
 pub const ImageOpts = image_mod.ImageOpts;
 pub const SvgIcon = image_mod.SvgIcon;

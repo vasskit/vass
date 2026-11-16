@@ -5,6 +5,7 @@
 //!     zig build images -- --snapshot DIR    draw a few frames, save DIR/images.bmp, exit
 const std = @import("std");
 const vass = @import("vass");
+const harness = @import("common/harness.zig");
 
 const Rect = vass.Rect;
 const Ui = vass.Ui;
@@ -19,6 +20,9 @@ const sticker_png = @embedFile("assets/sticker.png");
 const gradient_jpg = @embedFile("assets/gradient.jpg");
 
 const App = struct {
+    gpa: std.mem.Allocator,
+    /// A snapshot run: the drop target is shown highlighted, with two images dropped on it.
+    snapshot: bool,
     state: ui_mod.State = .{},
     test_img: Image = .none,
     sticker: Image = .none,
@@ -105,7 +109,8 @@ fn caption(ui: *Ui, r: Rect, str: []const u8) void {
     ui.label(.{ .x = r.x, .y = r.y + r.h + 4, .w = r.w, .h = 14 }, str, .{ .size = 10.5, .color = ui.theme.dim });
 }
 
-fn frame(app: *App, ui: *Ui, win: *vass.platform.Window, gpa: std.mem.Allocator, snapshot: bool) void {
+pub fn frame(app: *App, ui: *Ui) void {
+    const win = ui.win.?;
     const t = ui.theme;
     var y: f32 = 20;
     ui.labelAt(margin, y, "Images", .{ .size = 24 });
@@ -182,7 +187,7 @@ fn frame(app: *App, ui: *Ui, win: *vass.platform.Window, gpa: std.mem.Allocator,
     }
     ui.label(.{ .x = open_r.x + 100, .y = y + 6, .w = 320, .h = 16 }, app.status[0..app.status_len], .{ .size = 11, .color = t.dim });
     const drop_r: Rect = .{ .x = margin + 330, .y = y + 38, .w = win_w - margin * 2 - 330, .h = 112 };
-    const over = ui.input.drop_active or snapshot;
+    const over = ui.input.drop_active or app.snapshot;
     ui.list.rrect(drop_r, 10, if (over) t.button_on else t.card);
     if (over) {
         // Outline: a slightly larger accent rounded rect behind, then the card on top.
@@ -198,102 +203,48 @@ fn frame(app: *App, ui: *Ui, win: *vass.platform.Window, gpa: std.mem.Allocator,
         _ = ui.image(.{ .x = tx, .y = drop_r.y + 8, .w = 96, .h = 96 }, img, .{ .fit = .cover, .radius = 8 });
         tx += 104;
     }
-    _ = gpa;
 }
 
 const Color = vass.Color;
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-
-    var snapshot_dir: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--snapshot") and i + 1 < args.len) {
-            i += 1;
-            snapshot_dir = args[i];
-        } else {
-            std.debug.print("usage: images [--snapshot DIR]\n", .{});
-            return;
-        }
-    }
-
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Images", .width = win_w, .height = win_h });
-    defer win.deinit();
-    var app: App = .{};
-    defer app.added.deinit(gpa);
-    try loadAll(&app, &win, gpa);
-    var list = vass.DisplayList.init(gpa);
-    defer list.deinit();
-
-    const theme: vass.ui.Theme = .{ .card_radius = 12 };
-    var input: ui_mod.Input = .{};
-    var live: Live = .{ .app = &app, .win = &win, .gpa = gpa, .list = &list, .input = &input, .theme = theme, .snapshot = snapshot_dir != null };
-    win.setFrameCallback(&live, Live.onResize);
-    if (snapshot_dir != null) {
-        app.scroll.offset = 46; // the first image is cut off at the top by the clip
-        app.setStatus("Added sticker.png (96x64)", .{});
-        try app.added.append(gpa, app.sticker);
-        try app.added.append(gpa, app.jpeg);
-    }
-
-    var n: u32 = 0;
-    var running = true;
-    while (running) : (n += 1) {
-        while (vass.platform.pollEvent()) |ev| {
-            switch (ev) {
-                .quit, .close_requested => running = false,
-                .file_drop => |d| if (d.window == win.id()) addFile(&app, &win, gpa, d.path.slice()),
-                else => {},
-            }
-            if (snapshot_dir == null) input.feed(ev, win.id());
-        }
-        // The dialog finishes asynchronously: poll for its result.
-        if (try win.takeDialogResult(gpa)) |res| switch (res) {
-            .files => |f| {
-                defer f.deinit(gpa);
-                for (f.paths) |p| addFile(&app, &win, gpa, p);
-            },
-            .cancelled => app.setStatus("Cancelled", .{}),
-            .failed => app.setStatus("The dialog failed", .{}),
-        };
-        input.time = if (snapshot_dir != null) 0 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
-
-        const snap = if (snapshot_dir) |dir| n == 3 and dir.len > 0 else false;
-        if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/images.bmp", .{snapshot_dir.?}, 0);
-        live.draw(input);
-        if (snap) running = false;
-        input.endFrame();
-        vass.platform.sleepMs(16);
-    }
-    // Textures are freed with the window; unload explicitly only to release memory early.
-    for (app.added.items) |img| win.unloadImage(img);
+    const env = try harness.start(init, "images", .{}) orelse return;
+    var app: App = .{ .gpa = env.gpa, .snapshot = env.cli.snapshot() };
+    try harness.run(@This(), env, .{ .window = .{ .title = "Images", .width = win_w, .height = win_h } }, &app);
 }
 
-/// Draws one frame. The main loop and the window's resize callback both call it, so the
-/// window keeps reflowing while the OS is dragging an edge (the loop is blocked then).
-const Live = struct {
-    app: *App,
-    win: *vass.platform.Window,
-    gpa: std.mem.Allocator,
-    list: *vass.DisplayList,
-    input: *ui_mod.Input,
-    theme: vass.ui.Theme,
-    snapshot: bool,
-
-    fn draw(l: *Live, in: ui_mod.Input) void {
-        l.list.reset();
-        var ui = Ui.init(l.list, l.win, in, l.theme);
-        ui.state = &l.app.state;
-        frame(l.app, &ui, l.win, l.gpa, l.snapshot);
-        l.win.render(l.list, l.theme.bg);
+pub fn setup(app: *App, win: *vass.platform.Window) !void {
+    try loadAll(app, win, app.gpa);
+    if (app.snapshot) {
+        app.scroll.offset = 46; // the first image is cut off at the top by the clip
+        app.setStatus("Added sticker.png (96x64)", .{});
+        try app.added.append(app.gpa, app.sticker);
+        try app.added.append(app.gpa, app.jpeg);
     }
+}
 
-    /// Resize callback: an idle frame (no click or key replayed, clock untouched).
-    fn onResize(ctx: ?*anyopaque) void {
-        const l: *Live = @ptrCast(@alignCast(ctx.?));
-        l.draw(l.input.idle());
+pub fn teardown(app: *App, win: *vass.platform.Window) void {
+    // Textures are freed with the window; unload explicitly only to release memory early.
+    for (app.added.items) |img| win.unloadImage(img);
+    app.added.deinit(app.gpa);
+}
+
+pub fn event(app: *App, s: *harness.Step, ev: vass.platform.Event) void {
+    switch (ev) {
+        .file_drop => |d| if (d.window == s.win.id()) addFile(app, s.win, app.gpa, d.path.slice()),
+        else => {},
     }
-};
+}
+
+/// The open-file dialog finishes asynchronously: poll for its result.
+pub fn step(app: *App, s: *harness.Step) !void {
+    const gpa = app.gpa;
+    if (try s.win.takeDialogResult(gpa)) |res| switch (res) {
+        .files => |f| {
+            defer f.deinit(gpa);
+            for (f.paths) |p| addFile(app, s.win, gpa, p);
+        },
+        .cancelled => app.setStatus("Cancelled", .{}),
+        .failed => app.setStatus("The dialog failed", .{}),
+    };
+}

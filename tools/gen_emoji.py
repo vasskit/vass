@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates src/emoji_data.zig (the Emoji_Presentation ranges of emoji-data.txt) for src/emoji.zig.
+"""Generates src/text/emoji_data.zig (the Emoji_Presentation ranges of emoji-data.txt) for src/text/emoji.zig.
 
     mkdir /tmp/ucd && cd /tmp/ucd
     curl -fO https://www.unicode.org/Public/UCD/latest/ucd/emoji/emoji-data.txt
@@ -15,7 +15,7 @@ import sys
 
 def main():
     d = sys.argv[1]
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "emoji_data.zig")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "text", "emoji_data.zig")
     ranges = []
     version = None
     with open(os.path.join(d, "emoji-data.txt"), encoding="utf-8") as f:

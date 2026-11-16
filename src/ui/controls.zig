@@ -7,9 +7,9 @@
 //! and `toggle` flip the bool they are given; `radio` only reports, because
 //! which radio of a group is selected is the app's business.
 const std = @import("std");
-const geom = @import("geom.zig");
+const geom = @import("../core/geom.zig");
 const icons = @import("icons.zig");
-const keys = @import("keys.zig");
+const keys = @import("../core/keys.zig");
 const ui_mod = @import("ui.zig");
 const focus = @import("focus.zig");
 const Rect = geom.Rect;
@@ -554,7 +554,7 @@ pub fn waveform(ui: *Ui, r: Rect, peaks: []const f32, opts: WaveformOpts) Wavefo
 
 // ---- tests ------------------------------------------------------------------------
 
-const DisplayList = @import("gfx.zig").DisplayList;
+const DisplayList = @import("../core/gfx.zig").DisplayList;
 
 fn fakeMeasure(_: ?*anyopaque, str: []const u8, size: f32) f32 {
     return @as(f32, @floatFromInt(str.len)) * size / 2;

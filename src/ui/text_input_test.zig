@@ -2,12 +2,12 @@
 //! input-method pre-edit, mouse selection by click count, password fields and the context menu
 //! (see text_input.zig). One unit of width per code point at size 1.
 const std = @import("std");
-const geom = @import("geom.zig");
-const gfx = @import("gfx.zig");
-const keys = @import("keys.zig");
-const backend = @import("backend_sdl.zig");
+const geom = @import("../core/geom.zig");
+const gfx = @import("../core/gfx.zig");
+const keys = @import("../core/keys.zig");
+const backend = @import("../platform/backend_sdl.zig");
 const ui_mod = @import("ui.zig");
-const text_edit = @import("text_edit.zig");
+const text_edit = @import("../text/text_edit.zig");
 const Rect = geom.Rect;
 const Ui = ui_mod.Ui;
 const State = ui_mod.State;
@@ -937,7 +937,7 @@ test "fitText and wrapping never split a cluster" {
         // Whatever it returns ends before a boundary of the source or is "...".
         if (std.mem.endsWith(u8, out, "...")) {
             const cut = out.len - 3;
-            try t.expect(@import("grapheme.zig").isBoundary(s, cut));
+            try t.expect(@import("../text/grapheme.zig").isBoundary(s, cut));
         }
     }
     // Over-long word: lines break between clusters.

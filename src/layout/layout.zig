@@ -51,7 +51,7 @@
 //! it. `contentSize` returns what the children need (padding included) for
 //! `ui.beginScroll`, and `scrollTo` moves the descendants by the scroll offset.
 const std = @import("std");
-const geom = @import("geom.zig");
+const geom = @import("../core/geom.zig");
 
 const Rect = geom.Rect;
 const inf = std.math.inf(f32);

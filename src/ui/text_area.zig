@@ -9,9 +9,9 @@
 //! = start/end of the text, shift extends the selection, cmd+a/c/x/v, cmd+z undo,
 //! cmd+shift+z redo (see `TextEdit` for how typing runs coalesce).
 const std = @import("std");
-const geom = @import("geom.zig");
-const keys = @import("keys.zig");
-const text_edit = @import("text_edit.zig");
+const geom = @import("../core/geom.zig");
+const keys = @import("../core/keys.zig");
+const text_edit = @import("../text/text_edit.zig");
 const ui_mod = @import("ui.zig");
 const text_input = @import("text_input.zig");
 const popup = @import("popup.zig");
@@ -508,7 +508,7 @@ pub fn measureTextArea(ui: *const Ui, st: *const TextAreaState, width: f32, opts
 
 // ---- tests ------------------------------------------------------------------------
 
-const DisplayList = @import("gfx.zig").DisplayList;
+const DisplayList = @import("../core/gfx.zig").DisplayList;
 const Input = ui_mod.Input;
 const State = ui_mod.State;
 const Theme = ui_mod.Theme;

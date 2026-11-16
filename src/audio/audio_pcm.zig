@@ -19,7 +19,7 @@ const VorbisInfo = extern struct {
     max_frame_size: c_int,
 };
 
-// dr_mp3 is reached through three small wrappers in src/audio_impl.c, so Zig never
+// dr_mp3 is reached through three small wrappers in src/audio/audio_impl.c, so Zig never
 // has to know the layout of its decoder struct.
 extern fn vass_mp3_open(data: [*]const u8, len: usize) ?*anyopaque;
 extern fn vass_mp3_info(m: *anyopaque, channels: *c_uint, sample_rate: *c_uint) void;

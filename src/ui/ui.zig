@@ -18,19 +18,19 @@
 //! a caller-owned `State`, handed to the Ui with `ui.state = &state`. There is
 //! no hidden or hashed per-widget state anywhere.
 const std = @import("std");
-const geom = @import("geom.zig");
-const gfx = @import("gfx.zig");
-const backend = @import("backend_sdl.zig");
-const keys = @import("keys.zig");
+const geom = @import("../core/geom.zig");
+const gfx = @import("../core/gfx.zig");
+const backend = @import("../platform/backend_sdl.zig");
+const keys = @import("../core/keys.zig");
 const icons = @import("icons.zig");
-const text_edit = @import("text_edit.zig");
+const text_edit = @import("../text/text_edit.zig");
 const controls = @import("controls.zig");
 const text_area = @import("text_area.zig");
 const popup = @import("popup.zig");
-const layout = @import("layout.zig");
+const layout = @import("../layout/layout.zig");
 const focus = @import("focus.zig");
 const split = @import("split.zig");
-const grapheme = @import("grapheme.zig");
+const grapheme = @import("../text/grapheme.zig");
 const text_input = @import("text_input.zig");
 pub const Cursor = backend.Cursor;
 pub const FocusId = focus.FocusId;
