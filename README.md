@@ -836,3 +836,17 @@ encode/round-trip, OGG and MP3 decoding of small real files (`src/testdata/tone.
 rate, length, pitch, truncations), peaks, levels and meter scale, the mixer (end of sound, stale
 handles, overlap and slot exhaustion, looping, resampling, pause / stop fades, seeking, volume
 ramps), slider and waveform behaviour. Device tests use the dummy driver.
+
+## Licence
+
+Vass is licensed under either of
+
+- the MIT licence ([LICENSE-MIT](LICENSE-MIT)), or
+- the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)),
+
+at your option. Unless you state otherwise, any contribution you submit for inclusion in Vass is
+licensed the same way, with no additional terms.
+
+This covers Vass's own code. The libraries it builds from source (SDL3, SDL_ttf, FreeType,
+HarfBuzz, stb, dr_libs) and the bundled icon sets keep their own licences; the icon licences are
+in `examples/assets/icons/`.
