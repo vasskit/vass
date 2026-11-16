@@ -35,10 +35,15 @@ pub const TextAreaState = struct {
     seen_len: usize = std.math.maxInt(usize),
     /// `edit.undo_serial` as of last frame: an undo or redo scrolls the caret into view.
     seen_serial: u32 = 0,
+    /// What `measureTextArea` last returned for this state (NaN: never called), to tell a box that
+    /// grows with its text from a fixed one that happens to be as tall.
+    measured_h: f32 = std.math.nan(f32),
     /// What a double or triple click selected, so a drag grows by words or lines.
     multi: text_edit.MultiClick = .{},
     /// The right-click menu (Undo, Redo, Cut, Copy, Paste, Select All); drawn as a popup.
     ctx: popup.PopupState = .{},
+    /// Whether the clipboard had text when `ctx` opened (for the Paste item).
+    paste_probe: text_input.PasteProbe = .{},
     /// The text as drawn while an input-method pre-edit is spliced in, rebuilt each frame.
     disp: std.ArrayList(u8) = .empty,
     /// Pre-edit bookkeeping (see `text_input.composingNow`).
@@ -169,8 +174,8 @@ fn lineCount(ui: *const Ui, text: []const u8, size: f32, w: f32) usize {
 }
 
 /// Inserts `str` without carriage returns (pasted CRLF text becomes LF), as one edit of `kind`.
-fn insertClean(st: *TextAreaState, str: []const u8, kind: text_edit.EditKind) void {
-    text_input.insertClean(&st.edit, str, kind);
+fn insertClean(st: *TextAreaState, str: []const u8, kind: text_edit.EditKind) bool {
+    return text_input.insertClean(&st.edit, str, kind);
 }
 
 fn moveVertical(ui: *const Ui, st: *TextAreaState, size: f32, w: f32, down: bool, extend: bool) void {
@@ -193,7 +198,7 @@ fn handleKey(ui: *Ui, st: *TextAreaState, code: u32, m: keys.Mods, opts: TextAre
         // Plain Tab only reaches a text area that asked for it (`tab_inserts`).
         if (opts.tab_inserts and !m.shift and !m.cmd and !m.ctrl and !m.alt) {
             st.want_x = null;
-            insertClean(st, "\t", .typing);
+            _ = insertClean(st, "\t", .typing);
             res.changed = true;
         }
         return;
@@ -206,7 +211,7 @@ fn handleKey(ui: *Ui, st: *TextAreaState, code: u32, m: keys.Mods, opts: TextAre
         if (opts.submit_on_enter and !m.shift) {
             res.submitted = true;
         } else {
-            insertClean(st, "\n", .typing);
+            _ = insertClean(st, "\n", .typing);
             res.changed = true;
         }
         return;
@@ -236,8 +241,7 @@ fn handleKey(ui: *Ui, st: *TextAreaState, code: u32, m: keys.Mods, opts: TextAre
         },
         .paste => if (ui.clipboard.get) |get| if (get(ed.gpa)) |str| {
             defer ed.gpa.free(str);
-            insertClean(st, str, .paste);
-            res.changed = true;
+            if (insertClean(st, str, .paste)) res.changed = true;
         },
         .cancel => {
             s.focus = null;
@@ -261,7 +265,8 @@ fn handleKey(ui: *Ui, st: *TextAreaState, code: u32, m: keys.Mods, opts: TextAre
 /// `Input.time`. The content is `state.edit.text()`.
 ///
 /// While focused it holds `State.focus`, so the arrow keys of an enclosing
-/// `beginScroll` stay still, as for `textField`.
+/// `beginScroll` stay still, as for `textField`. Drawing one `state` twice in a frame is
+/// allowed: the first call takes the keys and typed text, later ones only draw.
 pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAreaResult {
     const t = ui.theme;
     const size = opts.size orelse t.font_body;
@@ -334,6 +339,7 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
                 .has_text = st.edit.text().len > 0,
                 .can_undo = st.edit.canUndo(),
                 .can_redo = st.edit.canRedo(),
+                .can_paste = st.paste_probe.get(ui),
             };
             if (text_input.contextMenu(ui, &st.ctx, caps)) |act| {
                 s.focus = id;
@@ -344,11 +350,12 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
                 if (text_input.applyAction(ui, &st.edit, act, true)) res.changed = true;
             }
         }
+        if (!st.ctx.open) st.paste_probe.known = false; // look again next time it opens
     }
 
     const composing = text_input.composingNow(&st.was_focused, &st.ime_block, focused, in.composition.len > 0);
 
-    if (focused) {
+    if (focused and ui.takeEvents(id)) {
         const s = ui.state.?;
         st.edit.now = in.time;
         for (ui.events()) |ev| {
@@ -357,7 +364,7 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
             switch (ev) {
                 .text => |chunk| if (chunk.len > 0) {
                     st.want_x = null;
-                    insertClean(st, chunk.slice(), .typing);
+                    _ = insertClean(st, chunk.slice(), .typing);
                     res.changed = true;
                 },
                 .key => |k| {
@@ -371,14 +378,17 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
     // What is drawn: the text, with the pre-edit spliced in at the caret (replacing the selection).
     const text = st.edit.text();
     const sel = st.edit.selection();
-    const pre = if (composing and focused) text_input.preedit(&in.composition, false, text_input.roomFor(&st.edit, sel.end - sel.start)) else null;
+    const pre_in = if (composing and focused) text_input.preedit(&in.composition, false, text_input.roomFor(&st.edit, sel.end - sel.start)) else null;
     const caret_off = text_edit.snapCluster(text, st.edit.cursor);
-    const d = text_input.display(st.edit.gpa, &st.disp, text, false, pre, if (pre != null) sel else .{ .start = caret_off, .end = caret_off });
+    const d = text_input.display(st.edit.gpa, &st.disp, text, false, pre_in, if (pre_in != null) sel else .{ .start = caret_off, .end = caret_off });
+    const pre = d.pre; // null when the display could not be built
     const dtext = d.text;
     const dcur = d.caretAt(caret_off);
 
     // Layout, wheel, and keeping the caret in view.
-    const content_h = @max(lh, ui.measureWrapped(dtext, size, box.w));
+    const wrapped_h = ui.measureWrapped(dtext, size, box.w);
+    const content_h = @max(lh, wrapped_h);
+    const lines: usize = @intFromFloat(@round(wrapped_h / lh));
     const caret = locate(ui, dtext, size, box.w, dcur);
     const cx = caretX(ui, caret, size, dcur);
     const caret_top = @as(f32, @floatFromInt(caret.index)) * lh;
@@ -386,16 +396,25 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
         st.scroll_y -= in.wheel_y * t.scroll_step;
         in.wheel_y = 0; // consumed, so an enclosing scroll area doesn't also move
     }
-    if (focused and (dragging or dcur != st.seen_cursor or dtext.len != st.seen_len or st.edit.undo_serial != st.seen_serial)) {
-        if (caret_top < st.scroll_y) {
-            st.scroll_y = caret_top;
-        } else if (caret_top + lh > st.scroll_y + box.h) {
-            st.scroll_y = caret_top + lh - box.h;
+    const reveal = focused and (dragging or dcur != st.seen_cursor or dtext.len != st.seen_len or st.edit.undo_serial != st.seen_serial);
+    // A rectangle sized by `measureTextArea` from last frame's text is one line short when this
+    // frame's edit added a line; the caller gives it the room next frame. Scrolling the first
+    // line away now would show for that frame, so wait (and ask for the frame) instead.
+    const grows = reveal and @abs(r.h - st.measured_h) < 0.01 and autoHeight(opts, lh, py, lines) > r.h + 0.01;
+    if (grows) {
+        ui.requestRedraw();
+    } else {
+        if (reveal) {
+            if (caret_top < st.scroll_y) {
+                st.scroll_y = caret_top;
+            } else if (caret_top + lh > st.scroll_y + box.h) {
+                st.scroll_y = caret_top + lh - box.h;
+            }
         }
+        st.seen_cursor = dcur;
+        st.seen_len = dtext.len;
+        st.seen_serial = st.edit.undo_serial;
     }
-    st.seen_cursor = dcur;
-    st.seen_len = dtext.len;
-    st.seen_serial = st.edit.undo_serial;
     const max_scroll = @max(0, content_h - box.h);
     st.scroll_y = std.math.clamp(st.scroll_y, 0, max_scroll);
 
@@ -502,7 +521,15 @@ pub fn measureTextArea(ui: *const Ui, st: *const TextAreaState, width: f32, opts
     const lh = ui.lineHeight(size);
     const px: f32 = if (opts.bare) 0 else pad_x;
     const py: f32 = if (opts.bare) 0 else pad_y;
-    var n = @max(opts.min_lines, lineCount(ui, st.edit.text(), size, @max(0, width - 2 * px)));
+    const h = autoHeight(opts, lh, py, lineCount(ui, st.edit.text(), size, @max(0, width - 2 * px)));
+    // The state is the caller's and mutable (`textArea` takes it by pointer); this only notes the answer.
+    @constCast(st).measured_h = h;
+    return h;
+}
+
+/// The height `measureTextArea` reports for `lines` wrapped lines.
+fn autoHeight(opts: TextAreaOpts, lh: f32, py: f32, lines: usize) f32 {
+    var n = @max(opts.min_lines, lines);
     if (opts.max_lines) |m| n = @min(n, @max(m, opts.min_lines));
     return @as(f32, @floatFromInt(n)) * lh + 2 * py;
 }
@@ -1022,4 +1049,69 @@ test "textArea: undo and redo scroll the caret into view" {
     try std.testing.expect(f.key(keys.z, .{ .cmd = true }).changed);
     try std.testing.expectEqual(len, f.st.edit.text().len);
     try std.testing.expect(f.st.scroll_y > 0);
+}
+
+test "textArea: a box that grows with its text does not scroll the first line away on Return" {
+    var f: Fixture = undefined;
+    try f.setup("abc");
+    defer f.deinit();
+    const opts: TextAreaOpts = .{ .size = 10, .bare = true, .max_lines = 2 };
+    const Grow = struct {
+        fn frame(fx: *Fixture, in: Input, o: TextAreaOpts) TextAreaResult {
+            var u = Ui.initHeadless(&fx.list, .{}, .{}, cpMeasure);
+            const h = measureTextArea(&u, &fx.st, 50, o);
+            return areaFrame(&fx.list, &fx.state, in, &fx.st, .{ .x = 0, .y = 0, .w = 50, .h = h }, o);
+        }
+    };
+    _ = Grow.frame(&f, .{}, opts);
+    _ = Grow.frame(&f, keyIn(keys.@"return", .{}), opts);
+    try std.testing.expectEqualStrings("abc\n", f.st.edit.text());
+    try std.testing.expectEqual(@as(f32, 0), f.st.scroll_y); // not 14: the box is taller next frame
+    try std.testing.expect(f.state.redraw.animating_next);
+    _ = Grow.frame(&f, .{}, opts);
+    try std.testing.expectEqual(@as(f32, 0), f.st.scroll_y);
+    // At max_lines the box stops growing, and then the caret is scrolled into view as usual.
+    _ = Grow.frame(&f, keyIn(keys.@"return", .{}), opts);
+    _ = Grow.frame(&f, .{}, opts);
+    try std.testing.expectEqualStrings("abc\n\n", f.st.edit.text());
+    try std.testing.expectEqual(@as(f32, 14), f.st.scroll_y);
+}
+
+test "textArea: a fixed box still scrolls the caret into view the frame the text grows" {
+    var f: Fixture = undefined;
+    try f.setup("1\n2\n3\n4\n5\n6\n7");
+    defer f.deinit();
+    const r: Rect = .{ .x = 0, .y = 0, .w = 50, .h = 42 };
+    _ = areaFrame(&f.list, &f.state, .{}, &f.st, r, test_opts);
+    _ = areaFrame(&f.list, &f.state, keyIn(keys.@"return", .{}), &f.st, r, test_opts);
+    try std.testing.expectEqual(@as(f32, 5 * 14), f.st.scroll_y);
+}
+
+test "R4: an empty box that grows with its text does not scroll away on the first Return" {
+    var f: Fixture = undefined;
+    try f.setup("");
+    defer f.deinit();
+    const opts: TextAreaOpts = .{ .size = 10, .bare = true, .max_lines = 3 };
+    const Grow = struct {
+        fn frame(fx: *Fixture, in: Input, o: TextAreaOpts) void {
+            var u = Ui.initHeadless(&fx.list, .{}, .{}, cpMeasure);
+            const h = measureTextArea(&u, &fx.st, 50, o);
+            _ = areaFrame(&fx.list, &fx.state, in, &fx.st, .{ .x = 0, .y = 0, .w = 50, .h = h }, o);
+        }
+    };
+    Grow.frame(&f, .{}, opts);
+    Grow.frame(&f, keyIn(keys.@"return", .{}), opts);
+    try std.testing.expectEqualStrings("\n", f.st.edit.text());
+    try std.testing.expectEqual(@as(f32, 0), f.st.scroll_y);
+}
+
+test "R4: a fixed box as tall as the text reveals the caret at once" {
+    var f: Fixture = undefined;
+    try f.setup("1\n2\n3");
+    defer f.deinit();
+    const r: Rect = .{ .x = 0, .y = 0, .w = 50, .h = 42 }; // exactly three lines, but not measured
+    const o: TextAreaOpts = .{ .size = 10, .bare = true };
+    _ = areaFrame(&f.list, &f.state, .{}, &f.st, r, o);
+    _ = areaFrame(&f.list, &f.state, keyIn(keys.@"return", .{}), &f.st, r, o);
+    try std.testing.expectEqual(@as(f32, 14), f.st.scroll_y);
 }

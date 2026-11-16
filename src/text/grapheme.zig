@@ -11,8 +11,13 @@
 //! Boundaries are context dependent (a flag needs the regional indicators before
 //! it, a ZWJ sequence the pictograph before the joiner), so `isBoundary` and
 //! `prevBoundary` look backwards as far as the rules need; the cost is linear
-//! in the length of the cluster at worst, and constant for ordinary text.
+//! in the length of the cluster at worst, and constant for ordinary text. The exception is a
+//! run of regional indicators (flags), where a pair depends on the parity of the whole run:
+//! `Iterator`, `count` and `nextBoundaryCarry` carry that parity forward and stay linear, but a
+//! call that starts inside such a run (`isBoundary`, `nextBoundary`, `prevBoundary`, `snapDown`
+//! at an arbitrary offset) walks back to the start of the run, so costs O(length of the run).
 const std = @import("std");
+const builtin = @import("builtin");
 const data = @import("grapheme_data.zig");
 
 pub const unicode_version = data.unicode_version;
@@ -132,11 +137,15 @@ fn pictographBefore(text: []const u8, zwj_start: usize) bool {
     return false;
 }
 
+/// Units visited by `indicatorsEndingAt`, counted in tests only to bound the work.
+pub var test_ri_steps: usize = 0;
+
 /// How many regional indicators end with the unit starting at `a_start` (consecutive).
 fn indicatorsEndingAt(text: []const u8, a_start: usize) usize {
     var n: usize = 0;
     var s = a_start;
     while (true) {
+        if (builtin.is_test) test_ri_steps += 1;
         if (unitAt(text, s).info.prop != .regional_indicator) return n;
         n += 1;
         if (s == 0) return n;
@@ -151,6 +160,12 @@ pub fn isBoundary(text: []const u8, i: usize) bool {
     if (i == 0 or i == text.len) return true;
     if (i > text.len) return false;
     if (unitStart(text, i) != i) return false;
+    return boundaryBetween(text, i, null);
+}
+
+/// `isBoundary` for an `i` that is a unit start inside the text. `ri_before` is the number of
+/// regional indicators that end just before `i`, when the caller knows it; null: count them.
+fn boundaryBetween(text: []const u8, i: usize, ri_before: ?usize) bool {
     const a_start = unitBeforeStart(text, i);
     const a = unitAt(text, a_start).info;
     const b = unitAt(text, i).info;
@@ -173,7 +188,7 @@ pub fn isBoundary(text: []const u8, i: usize) bool {
     if (pa == .zwj and b.ext_pict and pictographBefore(text, a_start)) return false;
     // GB12, GB13: regional indicator pairs.
     if (pa == .regional_indicator and pb == .regional_indicator) {
-        return indicatorsEndingAt(text, a_start) % 2 == 0;
+        return (ri_before orelse indicatorsEndingAt(text, a_start)) % 2 == 0;
     }
     return true;
 }
@@ -182,12 +197,35 @@ pub fn isBoundary(text: []const u8, i: usize) bool {
 /// code point or a cluster this is the end of the cluster that contains it.
 pub fn nextBoundary(text: []const u8, i: usize) usize {
     if (i >= text.len) return text.len;
-    var p = unitStart(text, i);
-    p += unitAt(text, p).len;
-    while (p < text.len) : (p += unitAt(text, p).len) {
-        if (isBoundary(text, p)) return p;
+    const p = unitStart(text, i);
+    const before = if (p == 0) 0 else indicatorsEndingAt(text, unitBeforeStart(text, p));
+    var after: usize = undefined;
+    return nextBoundaryCarry(text, p, before, &after);
+}
+
+fn extendRun(run: usize, info: Info) usize {
+    return if (info.prop == .regional_indicator) run + 1 else 0;
+}
+
+/// `nextBoundary` for a caller that walks a string cluster by cluster. `i` must be a cluster
+/// boundary, `ri_before` the number of regional indicators that end just before it (0 at the
+/// start of the text); `ri_after` receives the same number for the returned boundary, to pass
+/// to the next call. Linear on any text, flags included.
+pub fn nextBoundaryCarry(text: []const u8, i: usize, ri_before: usize, ri_after: *usize) usize {
+    if (i >= text.len) {
+        ri_after.* = ri_before;
+        return text.len;
     }
-    return text.len;
+    var p = i;
+    var run = ri_before;
+    while (true) {
+        const u = unitAt(text, p);
+        run = extendRun(run, u.info);
+        p += u.len;
+        if (p >= text.len or boundaryBetween(text, p, run)) break;
+    }
+    ri_after.* = run;
+    return p;
 }
 
 /// The last boundary before `i` (`i` is clamped to the length); 0 when `i` is 0. If `i` is inside a
@@ -196,7 +234,15 @@ pub fn prevBoundary(text: []const u8, i: usize) usize {
     const end = @min(i, text.len);
     if (end == 0) return 0;
     var s = unitBeforeStart(text, end);
-    while (s > 0 and !isBoundary(text, s)) s = unitBeforeStart(text, s);
+    // `k`: regional indicators ending at `s`, once known; a pair then splits by parity, so a run
+    // of flags is walked back once, not once per indicator.
+    var k: usize = 0;
+    while (s > 0) {
+        if (k == 0 and unitAt(text, s).info.prop == .regional_indicator) k = indicatorsEndingAt(text, s);
+        if (if (k >= 2) k % 2 == 1 else isBoundary(text, s)) return s;
+        s = unitBeforeStart(text, s);
+        if (k > 0) k -= 1;
+    }
     return s;
 }
 
@@ -210,11 +256,14 @@ pub fn snapDown(text: []const u8, i: usize) usize {
 /// Iterates the clusters of a string as slices of it.
 pub const Iterator = struct {
     text: []const u8,
+    /// Always a cluster boundary: start at 0 (or at a boundary with `ri` set to the regional
+    /// indicators that end just before it).
     pos: usize = 0,
+    ri: usize = 0,
 
     pub fn next(it: *Iterator) ?[]const u8 {
         if (it.pos >= it.text.len) return null;
-        const end = nextBoundary(it.text, it.pos);
+        const end = nextBoundaryCarry(it.text, it.pos, it.ri, &it.ri);
         const s = it.text[it.pos..end];
         it.pos = end;
         return s;
@@ -308,7 +357,6 @@ test "official GraphemeBreakTest.txt" {
         }
         if (ok) passed += 1 else std.debug.print("grapheme test failed: {s}\n", .{line});
     }
-    std.debug.print("grapheme conformance (Unicode {s}): {d}/{d} lines pass\n", .{ unicode_version, passed, total });
     try t.expect(total > 800);
     try t.expectEqual(total, passed);
 }
@@ -364,4 +412,34 @@ test "a long cluster is handled in linear time" {
     while (n + 2 <= buf.len) : (n += 2) @memcpy(buf[n..][0..2], "\u{301}");
     try t.expectEqual(n, nextBoundary(buf[0..n], 0));
     try t.expectEqual(@as(usize, 0), prevBoundary(buf[0..n], n));
+}
+
+/// `n` copies of the flag of Nigeria's first regional indicator, in memory the test frees.
+fn flags(n: usize) ![]u8 {
+    const buf = try t.allocator.alloc(u8, n * 4);
+    for (0..n) |i| @memcpy(buf[i * 4 ..][0..4], "\u{1F1F3}");
+    return buf;
+}
+
+test "a long run of regional indicators is walked in linear time" {
+    const run = try flags(4000);
+    defer t.allocator.free(run);
+    test_ri_steps = 0;
+    try t.expectEqual(@as(usize, 2000), count(run));
+    try t.expect(test_ri_steps < 4 * 4000);
+    // One step back from the end walks the run once, not once per indicator.
+    test_ri_steps = 0;
+    try t.expectEqual(run.len - 8, prevBoundary(run, run.len));
+    try t.expectEqual(run.len - 8, prevBoundary(run, run.len - 3));
+    try t.expect(test_ri_steps < 4 * 4000);
+    // An odd run ends with a lone indicator; the carried parity and the random-access answer agree.
+    const odd = try flags(5);
+    defer t.allocator.free(odd);
+    try t.expectEqual(@as(usize, 3), count(odd));
+    var it = iterator(odd);
+    var at: usize = 0;
+    while (it.next()) |cl| : (at += cl.len) try t.expect(isBoundary(odd, at));
+    try t.expectEqual(@as(usize, 16), prevBoundary(odd, odd.len));
+    try t.expectEqual(@as(usize, 8), nextBoundary(odd, 4));
+    try t.expectEqual(@as(usize, 16), nextBoundary(odd, 9));
 }

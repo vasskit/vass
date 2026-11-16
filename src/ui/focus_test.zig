@@ -944,3 +944,173 @@ test "modal dialog: Tab cycles through its buttons and a text field" {
         if (f == 5) try t.expectEqualStrings("Name", rig.focusedLabel());
     }
 }
+
+// ---- audit fixes ---------------------------------------------------------------------------------------
+
+fn farRow(i: usize) Rect {
+    return .{ .x = 0, .y = @as(f32, @floatFromInt(i)) * 30, .w = 200, .h = 26 };
+}
+
+test "P2: a text field declared after max_entries other widgets keeps the focus a click gave it" {
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var field = ui_mod.TextFieldState.init(t.allocator);
+    defer field.deinit();
+    const fr = farRow(focus.max_entries + 10);
+    for (0..3) |f| {
+        var ui = rig.ui(if (f == 1) clickAt(fr.x + 10, fr.y + 10) else .{});
+        for (0..focus.max_entries) |i| _ = ui.focusable(1000 + i, farRow(i), .{});
+        _ = ui.textField(fr, &field, .{});
+        ui.finish();
+    }
+    try t.expect(rig.state.focus == @as(?*const anyopaque, &field));
+}
+
+test "P2: derived ids stay distinct past max_entries" {
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var ui = rig.ui(.{});
+    for (0..focus.max_entries) |i| _ = ui.focusable(1000 + i, farRow(i), .{});
+    const a = focus.autoId(&ui, 7, 99, null);
+    _ = ui.focusable(a, farRow(300), .{});
+    const b = focus.autoId(&ui, 7, 99, null);
+    try t.expect(a != b);
+    ui.finish();
+}
+
+test "P3: setFocus for a widget that is declared next frame, not this one, still focuses it" {
+    for ([_]bool{ false, true }) |before_widgets| {
+        var rig = try Rig.init();
+        defer rig.deinit();
+        const id: focus.FocusId = 0x1234;
+        {
+            var ui = rig.ui(.{});
+            if (before_widgets) ui.setFocus(id);
+            _ = ui.focusable(1, row(0), .{});
+            if (!before_widgets) ui.setFocus(id);
+            ui.finish();
+        }
+        {
+            var ui = rig.ui(.{});
+            _ = ui.focusable(1, row(0), .{});
+            const r = ui.focusable(id, row(1), .{});
+            try t.expect(r.focused);
+            ui.finish();
+        }
+        try t.expectEqual(@as(?focus.FocusId, id), rig.state.focusId());
+        // The grace is one frame: a widget that never shows up loses the focus.
+        const other: focus.FocusId = 0x5678;
+        for (0..3) |f| {
+            var ui = rig.ui(.{});
+            if (f == 0) ui.setFocus(other);
+            _ = ui.focusable(1, row(0), .{});
+            ui.finish();
+        }
+        try t.expect(rig.state.focus == null);
+    }
+}
+
+test "P6: closing a popup does not take focus back from a widget the app moved it to" {
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var s = PopScene.init();
+    defer s.field.deinit();
+    popFrame(&rig, &s, .{});
+    popFrame(&rig, &s, tab());
+    popFrame(&rig, &s, tab());
+    try t.expectEqualStrings("Main2", rig.focusedLabel());
+    s.open_req = true;
+    popFrame(&rig, &s, .{});
+    popFrame(&rig, &s, .{});
+    try t.expect(s.pop.open);
+    // The app puts focus on Main1, below the popup.
+    rig.state.focusOn(focus.ptrOfId(rig.state.focusEntries()[0].id));
+    popFrame(&rig, &s, .{});
+    s.close_req = true;
+    popFrame(&rig, &s, .{});
+    popFrame(&rig, &s, .{});
+    try t.expect(!s.pop.open);
+    try t.expectEqualStrings("Main1", rig.focusedLabel());
+}
+
+test "P16: focusing a text field by Tab or by code ends the selection of a read-only text" {
+    for ([_]bool{ false, true }) |by_code| {
+        var rig = try Rig.init();
+        defer rig.deinit();
+        var field = ui_mod.TextFieldState.init(t.allocator);
+        defer field.deinit();
+        var sel: ui_mod.SelectState = .{};
+        const frame = struct {
+            fn run(r: *Rig, in: Input, f: *ui_mod.TextFieldState, sl: *ui_mod.SelectState, code: bool) void {
+                var ui = r.ui(in);
+                _ = ui.textSelectable(row(0), "hello world", sl, .{});
+                if (code) ui.setFocus(focus.idOfPtr(f));
+                _ = ui.textField(row(1), f, .{});
+                ui.finish();
+            }
+        }.run;
+        frame(&rig, .{}, &field, &sel, false);
+        rig.state.select = &sel;
+        sel.anchor = 0;
+        sel.cursor = 5;
+        frame(&rig, if (by_code) Input{} else tab(), &field, &sel, by_code);
+        try t.expect(rig.state.focus == @as(?*const anyopaque, &field));
+        try t.expect(rig.state.select == null);
+    }
+}
+
+test "P17: text typed before a Tab goes to the field that had focus, text after it to the next" {
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var a = ui_mod.TextFieldState.init(t.allocator);
+    defer a.deinit();
+    var b = ui_mod.TextFieldState.init(t.allocator);
+    defer b.deinit();
+    rig.state.focusOn(&a);
+    const frame = struct {
+        fn run(r: *Rig, in: Input, fa: *ui_mod.TextFieldState, fb: *ui_mod.TextFieldState) void {
+            var ui = r.ui(in);
+            _ = ui.textField(row(0), fa, .{});
+            _ = ui.textField(row(1), fb, .{});
+            ui.finish();
+        }
+    }.run;
+    frame(&rig, .{}, &a, &b);
+    var in: Input = .{};
+    in.pushText("a");
+    in.pushKey(keys.tab, .{});
+    in.pushText("b");
+    frame(&rig, in, &a, &b);
+    try t.expectEqualStrings("a", a.edit.text());
+    // The Tab and what followed it arrive with the next frame (the loop is asked for one).
+    try t.expect(rig.state.redraw.animating);
+    frame(&rig, .{}, &a, &b);
+    try t.expectEqualStrings("a", a.edit.text());
+    try t.expectEqualStrings("b", b.edit.text());
+    try t.expect(rig.state.focus == @as(?*const anyopaque, &b));
+}
+
+test "R6: events lost when parked ones and the new frame's do not fit are counted" {
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var a = ui_mod.TextFieldState.init(t.allocator);
+    defer a.deinit();
+    rig.state.focusOn(&a);
+    var f1: Input = .{};
+    f1.pushKey(keys.left, .{});
+    f1.pushKey(keys.tab, .{});
+    for (0..100) |_| f1.pushKey(keys.right, .{});
+    {
+        var ui = rig.ui(f1);
+        _ = ui.textField(row(0), &a, .{});
+        ui.finish();
+    }
+    try t.expectEqual(@as(u8, 101), rig.state.reg.parked_n);
+    var f2: Input = .{};
+    for (0..200) |_| f2.pushKey(keys.right, .{});
+    var ui = rig.ui(f2);
+    _ = ui.textField(row(0), &a, .{});
+    // 101 parked + 200 new = 301 events for 256 slots.
+    try t.expectEqual(@as(u32, 45), ui.input.lost_events);
+    ui.finish();
+}

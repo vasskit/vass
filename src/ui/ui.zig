@@ -52,6 +52,10 @@ pub const InEvent = union(enum) {
     text: backend.TextChunk,
 };
 
+/// Most key and text events `Input` holds per frame (typed text arrives in 32 byte chunks, so
+/// this is several KB of text).
+pub const max_events = 256;
+
 /// Most dropped files `Input` remembers per frame.
 pub const max_drops = 16;
 
@@ -83,8 +87,11 @@ pub const Input = struct {
     /// Input-method composition in progress (empty when none): the pre-edit string and, in code
     /// points, its cursor and selection. The focused `textField` and `textArea` draw it inline.
     composition: backend.Composition = .{},
-    queue: [32]InEvent = undefined,
+    queue: [max_events]InEvent = undefined,
     queue_len: usize = 0,
+    /// Events that did not fit in `queue` and were thrown away since the last `endFrame`
+    /// (a flood within one frame; each is also logged).
+    lost_events: u32 = 0,
     /// True while a drag from another app is over the window (for a "drop here" highlight).
     drop_active: bool = false,
     /// Where the drag is, in window points (valid while `drop_active`, and at the drop).
@@ -128,11 +135,33 @@ pub const Input = struct {
         in.queue_len -= 1;
     }
 
+    /// Queues an event. Typed text joins the chunk before it while that has room, so a long
+    /// paste or a burst of keystrokes takes few slots. A full queue loses the event, loudly.
     fn push(in: *Input, ev: InEvent) void {
+        if (ev == .text and in.queue_len > 0) {
+            if (in.queue[in.queue_len - 1] == .text) {
+                const last = &in.queue[in.queue_len - 1].text;
+                const add = ev.text.slice();
+                if (@as(usize, last.len) + add.len <= last.buf.len) {
+                    @memcpy(last.buf[last.len..][0..add.len], add);
+                    last.len += @intCast(add.len);
+                    return;
+                }
+            }
+        }
         if (in.queue_len < in.queue.len) {
             in.queue[in.queue_len] = ev;
             in.queue_len += 1;
+        } else {
+            in.lose(1);
         }
+    }
+
+    /// Counts `n` events that did not fit the queue, and says so once per frame.
+    pub fn lose(in: *Input, n: usize) void {
+        // Silent under test: the overflow tests provoke it, and a stderr line makes a passing run look failed.
+        if (in.lost_events == 0 and n > 0 and !@import("builtin").is_test) std.log.warn("input queue full ({d} events in one frame): dropping input", .{in.queue.len});
+        in.lost_events +|= @intCast(@min(n, std.math.maxInt(u32)));
     }
 
     /// Folds a backend event into the input if it belongs to window `window_id`.
@@ -223,6 +252,7 @@ pub const Input = struct {
         in.wheel_x = 0;
         in.wheel_y = 0;
         in.queue_len = 0;
+        in.lost_events = 0;
         in.drops_len = 0;
     }
 
@@ -289,6 +319,9 @@ pub const Redraw = struct {
 pub const State = struct {
     focus: ?*const anyopaque = null,
     drag: ?*const anyopaque = null,
+    /// The drag's owner was drawn this frame (set by the widget that owns `drag`). A drag whose
+    /// owner was not drawn is cleared when the button is up; see `split.finish`.
+    drag_live: bool = false,
     /// The `SelectState` (by address) that owns the one text selection, if any.
     /// Separate from `focus`: a selection is not a text field, so it does not
     /// stop arrow-key scrolling or an app's own shortcuts.
@@ -574,6 +607,9 @@ pub const Ui = struct {
     clip_n: usize = 0,
     scrolls: [4]ScrollFrame = undefined,
     scroll_n: usize = 0,
+    /// Widgets that have handled this frame's key and text events (see `takeEvents`).
+    event_owners: [8]*const anyopaque = undefined,
+    event_owners_n: usize = 0,
     /// The window's area in points, for placing popups. `init` reads it from the window;
     /// headless Uis set it (the default is huge, so nothing ever flips or shifts).
     bounds: Rect = .{ .x = 0, .y = 0, .w = 10000, .h = 10000 },
@@ -715,6 +751,18 @@ pub const Ui = struct {
         return popup.eventsFor(ui, ui.layer);
     }
 
+    /// Whether the focused widget `id` (its state's address) handles this frame's key and text
+    /// events: true the first time it is asked this frame, false when the same state is drawn
+    /// again in the frame (the first drawing applied the events; a second would apply them twice).
+    pub fn takeEvents(ui: *Ui, id: *const anyopaque) bool {
+        for (ui.event_owners[0..ui.event_owners_n]) |o| if (o == id) return false;
+        if (ui.event_owners_n < ui.event_owners.len) {
+            ui.event_owners[ui.event_owners_n] = id;
+            ui.event_owners_n += 1;
+        }
+        return true;
+    }
+
     // ---- keyboard focus (see focus.zig) --------------------------------
 
     /// Registers a focusable widget occupying `r` under `id` and handles focus for it (click to
@@ -845,10 +893,23 @@ pub const Ui = struct {
         ui.labelAt(x, r.y, str, opts);
     }
 
-    /// Like `label`, formatting its text.
+    /// Like `label`, formatting its text. Output past 512 bytes is cut off (on a cluster
+    /// boundary), not dropped.
     pub fn labelFmt(ui: *Ui, r: Rect, comptime fmt: []const u8, args: anytype, opts: LabelOpts) void {
-        var buf: [128]u8 = undefined;
-        ui.label(r, std.fmt.bufPrint(&buf, fmt, args) catch "", opts);
+        var buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        var out: []const u8 = undefined;
+        if (w.print(fmt, args)) |_| {
+            out = w.buffered();
+        } else |_| {
+            // Full: the last cluster may be partial, so it goes (and with it any partial code point).
+            const got = w.buffered();
+            var n = got.len;
+            while (n > 0 and got[n - 1] & 0xC0 == 0x80) n -= 1;
+            if (n > 0) n -= 1; // the lead byte of the code point that was cut
+            out = got[0..text_edit.prevBoundary(got[0..n], n)];
+        }
+        ui.label(r, out, opts);
     }
 
     /// A rounded panel.
@@ -1127,7 +1188,7 @@ pub const Ui = struct {
             if (more) {
                 var tmp: [384]u8 = undefined;
                 var out: [384]u8 = undefined;
-                const keep = @min(line.len, tmp.len - 3);
+                const keep = text_edit.snapCluster(line, @min(line.len, tmp.len - 3));
                 @memcpy(tmp[0..keep], line[0..keep]);
                 @memcpy(tmp[keep..][0..3], "...");
                 ui.labelAt(x, y, ui.fitTextWeighted(&out, tmp[0 .. keep + 3], size, opts.weight, r.w), opts);
@@ -1432,16 +1493,23 @@ pub const Ui = struct {
     /// from the start of the text.
     pub fn offsetAtX(ui: *const Ui, str: []const u8, size: f32, x: f32) usize {
         if (x <= 0) return 0;
-        var prev_w: f32 = 0;
-        var i: usize = 0;
-        while (i < str.len) {
-            const nb = text_edit.nextBoundary(str, i);
-            const w = ui.measure(str[0..nb], size);
-            if (w >= x) return if (x - prev_w < w - x) i else nb;
-            prev_w = w;
-            i = nb;
-        }
-        return str.len;
+        const Narrower = struct {
+            ui: *const Ui,
+            str: []const u8,
+            size: f32,
+            x: f32,
+
+            fn ok(c: @This(), b: usize) bool {
+                return c.ui.measure(c.str[0..b], c.size) < c.x;
+            }
+        };
+        // The last boundary left of `x`, then the nearer of it and the next one.
+        const i = lastBoundaryWhere(str, 0, str.len, Narrower{ .ui = ui, .str = str, .size = size, .x = x });
+        if (i >= str.len) return str.len;
+        const nb = text_edit.nextBoundary(str, i);
+        const w = ui.measure(str[0..nb], size);
+        const prev_w: f32 = if (i == 0) 0 else ui.measure(str[0..i], size);
+        return if (x - prev_w < w - x) i else nb;
     }
 
     /// Byte offset in the buffer of the caret position nearest to `x` points from the start of
@@ -1477,6 +1545,9 @@ pub const Ui = struct {
     /// shows the normal caret is hidden and plain keys are left to the input method.
     /// `opts.password` masks everything. Focused, the field tells the input method where the
     /// caret is (`setTextInputArea`).
+    ///
+    /// Drawing one `state` twice in a frame is allowed (say, a field and its zoomed copy): the
+    /// first call in the frame takes the keys and typed text, later ones only draw.
     pub fn textField(ui: *Ui, r: Rect, st: *TextFieldState, opts: TextFieldOpts) TextFieldResult {
         const t = ui.theme;
         const size = opts.size orelse t.font_body;
@@ -1548,6 +1619,7 @@ pub const Ui = struct {
                     .can_undo = st.edit.canUndo(),
                     .can_redo = st.edit.canRedo(),
                     .allow_copy = !pw,
+                    .can_paste = st.paste_probe.get(ui),
                 };
                 if (text_input.contextMenu(ui, &st.ctx, caps)) |act| {
                     s.focus = id;
@@ -1557,14 +1629,16 @@ pub const Ui = struct {
                     if (text_input.applyAction(ui, &st.edit, act, !pw)) res.changed = true;
                 }
             }
+            if (!st.ctx.open) st.paste_probe.known = false; // look again next time it opens
         }
 
         const composing = text_input.composingNow(&st.was_focused, &st.ime_block, focused, in.composition.len > 0);
 
-        if (focused) {
+        if (focused and ui.takeEvents(id)) {
             const s = ui.state.?;
             st.edit.now = in.time;
             for (ui.events()) |ev| {
+                if (!focused) break; // Escape blurred it: what follows is not for it
                 st.blink_origin = in.time;
                 switch (ev) {
                     .text => |chunk| {
@@ -1587,8 +1661,7 @@ pub const Ui = struct {
                             },
                             .paste => if (ui.clipboard.get) |get| if (get(st.edit.gpa)) |str| {
                                 defer st.edit.gpa.free(str);
-                                st.edit.insertAs(str, .paste) catch {};
-                                res.changed = true;
+                                if (text_input.insertClean(&st.edit, str, .paste)) res.changed = true;
                             },
                             .submit => res.submitted = true,
                             .cancel => {
@@ -1605,9 +1678,10 @@ pub const Ui = struct {
         // selection), or bullets.
         const text = st.edit.text();
         const sel = st.edit.selection();
-        const pre = if (composing and focused) text_input.preedit(&in.composition, pw, text_input.roomFor(&st.edit, sel.end - sel.start)) else null;
+        const pre_in = if (composing and focused) text_input.preedit(&in.composition, pw, text_input.roomFor(&st.edit, sel.end - sel.start)) else null;
         const caret_off = text_edit.snapCluster(text, st.edit.cursor);
-        const d = text_input.display(st.edit.gpa, &st.disp, text, pw, pre, if (pre != null) sel else .{ .start = caret_off, .end = caret_off });
+        const d = text_input.display(st.edit.gpa, &st.disp, text, pw, pre_in, if (pre_in != null) sel else .{ .start = caret_off, .end = caret_off });
+        const pre = d.pre; // null when the display could not be built
         const dt = d.text;
         const caret_x = ui.measure(dt[0..d.caretAt(caret_off)], size);
         const pre_x = ui.measure(dt[0..d.pre_start], size);
@@ -1860,45 +1934,17 @@ pub const Ui = struct {
     /// Returns the content's rectangle: `r`'s x and width, `content_h` tall,
     /// moved up by the scroll offset. Lay children out inside it; they are
     /// clipped to `r`, and clicks outside `r` don't reach them. The mouse
-    /// wheel scrolls it while the pointer is over `r`. Pair with `endScroll`.
+    /// wheel and the scroll keys move it while the pointer is over `r` and its content
+    /// overflows, unless something inside (a nested view, a `textArea`) took them first. That
+    /// is settled in `endScroll`, so the new offset shows on the next frame (one is requested).
+    /// Pair with `endScroll`.
     /// The scrollbar is drawn over the right edge of `r`, so leave it some padding.
     pub fn beginScroll(ui: *Ui, r: Rect, st: *ScrollState, content_h: f32) Rect {
         const max = @max(0, content_h - r.h);
-        if (ui.hit(r).hovered and ui.input.wheel_y != 0) {
-            st.offset -= ui.input.wheel_y * ui.theme.scroll_step;
-            ui.input.wheel_y = 0; // consumed, so an enclosing scroll area doesn't also move
-        }
-        // Keys: Page Up/Down always; arrows and Home/End only while the focused widget (a text
-        // field, a slider...) does not want them (`keyClaimed`).
-        if (st.key_scroll or ui.hit(r).hovered) {
-            for (ui.events()) |ev| switch (ev) {
-                .key => |k| {
-                    const free = st.arrow_keys and !ui.keyClaimed(k.code, k.mods);
-                    switch (k.code) {
-                        keys.page_up => st.offset -= r.h * 0.9,
-                        keys.page_down => st.offset += r.h * 0.9,
-                        keys.up => if (free) {
-                            st.offset -= ui.theme.scroll_step * 2;
-                        },
-                        keys.down => if (free) {
-                            st.offset += ui.theme.scroll_step * 2;
-                        },
-                        keys.home => if (free) {
-                            st.offset = 0;
-                        },
-                        keys.end => if (free) {
-                            st.offset = max;
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
-            };
-        }
         st.offset = std.math.clamp(st.offset, 0, max);
         std.debug.assert(ui.scroll_n < ui.scrolls.len);
         if (ui.scroll_n < ui.scrolls.len) {
-            ui.scrolls[ui.scroll_n] = .{ .rect = r, .state = st, .content_h = content_h };
+            ui.scrolls[ui.scroll_n] = .{ .rect = r, .state = st, .content_h = content_h, .hovered = ui.hit(r).hovered };
             ui.scroll_n += 1;
         }
         ui.pushClip(r);
@@ -1912,16 +1958,81 @@ pub const Ui = struct {
         if (ui.scroll_n == 0) return;
         ui.scroll_n -= 1;
         const f = ui.scrolls[ui.scroll_n];
-        const max = f.content_h - f.rect.h;
+        const max = @max(0, f.content_h - f.rect.h);
+        // The wheel and the scroll keys are decided here, after the children: a nested view
+        // or text area that can scroll has already taken them (and removed them from the
+        // input), and a view whose content fits leaves them to the one around it. What moves
+        // is drawn next frame, so one more is asked for.
+        if (max > 0) {
+            var moved = false;
+            if (f.hovered and ui.input.wheel_y != 0) {
+                f.state.offset -= ui.input.wheel_y * ui.theme.scroll_step;
+                ui.input.wheel_y = 0;
+                moved = true;
+            }
+            if (f.state.key_scroll or f.hovered) moved = ui.scrollKeys(f.state, f.rect.h, max) or moved;
+            f.state.offset = std.math.clamp(f.state.offset, 0, max);
+            if (moved) ui.requestRedraw();
+        }
         if (max <= 0) return;
         const track = f.rect.h - 8;
         const thumb_h = @max(24, track * f.rect.h / f.content_h);
         const ty = f.rect.y + 4 + (track - thumb_h) * (f.state.offset / max);
         ui.list.rrect(.{ .x = f.rect.x + f.rect.w - 6, .y = ty, .w = 3, .h = thumb_h }, 1.5, ui.theme.scrollbar);
     }
+
+    /// Applies and removes this frame's scroll keys: Page Up/Down always; arrows and Home/End
+    /// only while the focused widget (a text field, a slider...) does not want them
+    /// (`keyClaimed`). Returns whether any was used.
+    fn scrollKeys(ui: *Ui, st: *ScrollState, view_h: f32, max: f32) bool {
+        if (ui.events().len == 0) return false; // none, or a popup above holds them
+        var used = false;
+        var i: usize = 0;
+        while (i < ui.input.queue_len) {
+            const k = switch (ui.input.queue[i]) {
+                .key => |k| k,
+                else => {
+                    i += 1;
+                    continue;
+                },
+            };
+            const free = st.arrow_keys and !ui.keyClaimed(k.code, k.mods);
+            var used_key = true;
+            switch (k.code) {
+                keys.page_up => st.offset -= view_h * 0.9,
+                keys.page_down => st.offset += view_h * 0.9,
+                keys.up => if (free) {
+                    st.offset -= ui.theme.scroll_step * 2;
+                } else {
+                    used_key = false;
+                },
+                keys.down => if (free) {
+                    st.offset += ui.theme.scroll_step * 2;
+                } else {
+                    used_key = false;
+                },
+                keys.home => if (free) {
+                    st.offset = 0;
+                } else {
+                    used_key = false;
+                },
+                keys.end => if (free) {
+                    st.offset = max;
+                } else {
+                    used_key = false;
+                },
+                else => used_key = false,
+            }
+            if (used_key) {
+                used = true;
+                ui.input.removeEvent(i);
+            } else i += 1;
+        }
+        return used;
+    }
 };
 
-const ScrollFrame = struct { rect: Rect, state: *ScrollState, content_h: f32 };
+const ScrollFrame = struct { rect: Rect, state: *ScrollState, content_h: f32, hovered: bool };
 
 /// Scroll position of one `beginScroll` area. The app owns it; set `offset`
 /// to scroll programmatically (it is clamped on the next `beginScroll`).
@@ -2008,6 +2119,8 @@ pub const TextFieldState = struct {
     multi: text_edit.MultiClick = .{},
     /// The right-click menu (Undo, Redo, Cut, Copy, Paste, Select All); drawn as a popup.
     ctx: PopupState = .{},
+    /// Whether the clipboard had text when `ctx` opened (for the Paste item).
+    paste_probe: text_input.PasteProbe = .{},
     /// The text as drawn (pre-edit spliced in, or bullets for a password), rebuilt each frame.
     disp: std.ArrayList(u8) = .empty,
     /// Pre-edit bookkeeping: was focused last frame, and a composition that was already running
@@ -2076,6 +2189,35 @@ pub const TextFieldResult = struct {
     caret_x: f32 = 0,
 };
 
+/// The largest cluster boundary `b` in `from..to` for which `ctx.ok(b)` holds, given that it
+/// holds at `from` and, as `b` grows, turns false once and stays so (a text's width grows with
+/// its length). Found by doubling the step from `from`, then bisecting, so the work follows
+/// the distance from `from` to the answer rather than to `to`.
+fn lastBoundaryWhere(str: []const u8, from: usize, to: usize, ctx: anytype) usize {
+    var lo = from;
+    var hi: usize = to;
+    var step: usize = 16;
+    while (true) {
+        if (lo >= to) return to;
+        var p = text_edit.snapCluster(str, @min(to, lo + step));
+        if (p <= lo) p = text_edit.nextBoundary(str, lo);
+        p = @min(p, to);
+        if (!ctx.ok(p)) {
+            hi = p;
+            break;
+        }
+        lo = p;
+        step *= 2;
+    }
+    while (true) {
+        const nb = text_edit.nextBoundary(str, lo);
+        if (nb >= hi) return lo;
+        var mid = text_edit.snapCluster(str, lo + (hi - lo) / 2);
+        if (mid <= lo or mid >= hi) mid = nb;
+        if (ctx.ok(mid)) lo = mid else hi = mid;
+    }
+}
+
 /// Lines of text wrapped greedily to a width. Each `next` returns a slice of
 /// the source: words break at spaces (the spaces at a break are dropped),
 /// '\n' always breaks (a blank line is an empty slice), and a word wider
@@ -2093,6 +2235,20 @@ pub const WrapIter = struct {
         return it.ui.measure(str, it.size) <= it.max_w;
     }
 
+    /// Words longer than this are cut by searching for where the line ends, not by measuring
+    /// the whole word first (which would cost the word's length again on every line it spans).
+    const long_word = 64;
+
+    /// `ok` for `lastBoundaryWhere`: the text from the line start to `b` still fits.
+    const FitTo = struct {
+        it: *const WrapIter,
+        start: usize,
+
+        fn ok(c: FitTo, b: usize) bool {
+            return c.it.fits(c.it.str[c.start..b]);
+        }
+    };
+
     pub fn next(it: *WrapIter) ?[]const u8 {
         if (it.done) return null;
         const s = it.str;
@@ -2106,6 +2262,17 @@ pub const WrapIter = struct {
             var we = ws;
             while (we < para_end and s[we] != ' ') we += 1;
             if (we == ws) break; // only spaces (or nothing) left in the paragraph
+            if (end_fit == start and we - ws > long_word) {
+                const cut = lastBoundaryWhere(s, ws, we, FitTo{ .it = it, .start = start });
+                if (cut == we) {
+                    end_fit = we;
+                    p = we;
+                    continue;
+                }
+                // Not even the first word fits: break it between characters, but always take one.
+                end_fit = if (cut == ws) text_edit.nextBoundary(s, ws) else cut;
+                break;
+            }
             if (it.fits(s[start..we])) {
                 end_fit = we;
                 p = we;
@@ -2626,6 +2793,10 @@ test "scroll: wheel scrolls when hovered, clamps, content rect follows" {
     c = ui.beginScroll(r, &ss, 300);
     ui.endScroll();
     try std.testing.expectEqual(@as(f32, 48), ss.offset);
+    try std.testing.expectEqual(@as(f32, 20), c.y); // decided after the children: shows next frame
+    ui = Ui.initHeadless(&list, .{ .mouse_x = 50, .mouse_y = 50 }, .{}, null);
+    c = ui.beginScroll(r, &ss, 300);
+    ui.endScroll();
     try std.testing.expectEqual(@as(f32, -28), c.y);
     // Clamped to content_h - r.h.
     ui = Ui.initHeadless(&list, .{ .mouse_x = 50, .mouse_y = 50, .wheel_y = -100 }, .{}, null);
@@ -3470,4 +3641,212 @@ test "a caret asks for the frame where it next turns on or off, a hair after the
         ui.finish();
         try std.testing.expectApproxEqAbs(c.next, st.redraw.at, 1e-9);
     }
+}
+
+// ---- tests: audit batch (scrolling, queue, wrapping cost, labels) -----------------
+
+/// `s` repeated `n` times, at compile time.
+fn rep(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    @setEvalBranchQuota(100_000);
+    comptime {
+        var b: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(b[i * s.len ..][0..s.len], s);
+        const f = b;
+        return &f;
+    }
+}
+
+test "scroll: the wheel goes to the innermost view that can scroll, not the first one begun" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var state: State = .{};
+    var outer: ScrollState = .{};
+    var inner: ScrollState = .{};
+    var ui = Ui.initHeadless(&list, .{ .mouse_x = 50, .mouse_y = 20, .wheel_y = -1 }, .{}, null);
+    ui.state = &state;
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 100 }, &outer, 1000);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 50 }, &inner, 500);
+    ui.endScroll();
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 24), inner.offset);
+    try std.testing.expectEqual(@as(f32, 0), outer.offset);
+    // The content already drawn this frame is stale, so another frame is asked for.
+    ui.finish();
+    try std.testing.expect(state.redraw.animating);
+}
+
+test "scroll: a view whose content fits does not eat the wheel" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var outer: ScrollState = .{};
+    var inner: ScrollState = .{};
+    var ui = Ui.initHeadless(&list, .{ .mouse_x = 50, .mouse_y = 20, .wheel_y = -1 }, .{}, null);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 100 }, &outer, 1000);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 50 }, &inner, 40);
+    ui.endScroll();
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 0), inner.offset);
+    try std.testing.expectEqual(@as(f32, 24), outer.offset);
+}
+
+test "scroll: a text area inside a scroll view scrolls itself, the view stays" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var outer: ScrollState = .{};
+    var area = TextAreaState.init(std.testing.allocator);
+    defer area.deinit();
+    try area.edit.setText("a\nb\nc\nd\ne\nf\ng\nh");
+    var ui = Ui.initHeadless(&list, .{ .mouse_x = 20, .mouse_y = 20, .wheel_y = -1 }, .{}, cpMeasure);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 100 }, &outer, 1000);
+    _ = ui.textArea(.{ .x = 0, .y = 0, .w = 100, .h = 50 }, &area, .{ .size = 10, .bare = true });
+    ui.endScroll();
+    try std.testing.expect(area.scroll_y > 0);
+    try std.testing.expectEqual(@as(f32, 0), outer.offset);
+    // Outside the area the wheel still reaches the view.
+    area.scroll_y = 0;
+    ui = Ui.initHeadless(&list, .{ .mouse_x = 20, .mouse_y = 80, .wheel_y = -1 }, .{}, cpMeasure);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 100 }, &outer, 1000);
+    _ = ui.textArea(.{ .x = 0, .y = 0, .w = 100, .h = 50 }, &area, .{ .size = 10, .bare = true });
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 0), area.scroll_y);
+    try std.testing.expectEqual(@as(f32, 24), outer.offset);
+}
+
+test "scroll: Page Down moves only the innermost view under the pointer" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var outer: ScrollState = .{};
+    var inner: ScrollState = .{};
+    var in: Input = .{ .mouse_x = 50, .mouse_y = 20 };
+    in.pushKey(keys.page_down, .{});
+    var ui = Ui.initHeadless(&list, in, .{}, null);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 100 }, &outer, 1000);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 50 }, &inner, 500);
+    ui.endScroll();
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 45), inner.offset);
+    try std.testing.expectEqual(@as(f32, 0), outer.offset);
+    // A view whose content fits leaves the key to the one around it.
+    outer = .{};
+    inner = .{};
+    in = .{ .mouse_x = 50, .mouse_y = 20 };
+    in.pushKey(keys.page_down, .{});
+    ui = Ui.initHeadless(&list, in, .{}, null);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 100 }, &outer, 1000);
+    _ = ui.beginScroll(.{ .x = 0, .y = 0, .w = 100, .h = 50 }, &inner, 40);
+    ui.endScroll();
+    ui.endScroll();
+    try std.testing.expectEqual(@as(f32, 0), inner.offset);
+    try std.testing.expectEqual(@as(f32, 90), outer.offset);
+}
+
+test "input: a frame's worth of typed text is never dropped" {
+    var in: Input = .{};
+    const big: [2048]u8 = @splat('x');
+    in.pushText(&big);
+    var got: usize = 0;
+    for (in.events()) |ev| switch (ev) {
+        .text => |c| got += c.len,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2048), got);
+    try std.testing.expectEqual(@as(u32, 0), in.lost_events);
+    // Beyond what the queue can hold the loss is counted, not silent.
+    const huge: [100_000]u8 = @splat('y');
+    in.pushText(&huge);
+    try std.testing.expect(in.lost_events > 0);
+}
+
+var measure_calls: usize = 0;
+var measure_bytes: usize = 0;
+
+fn countingMeasure(_: ?*anyopaque, str: []const u8, size: f32) f32 {
+    measure_calls += 1;
+    measure_bytes += str.len;
+    return @as(f32, @floatFromInt(str.len)) * size;
+}
+
+test "wrapText: an over-long word costs about its own length to measure, not its length per line" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    const ui = Ui.initHeadless(&list, .{}, .{}, countingMeasure);
+    const word: [10_000]u8 = @splat('a');
+    measure_calls = 0;
+    measure_bytes = 0;
+    var it = ui.wrapText(&word, 1, 50);
+    var lines: usize = 0;
+    while (it.next()) |line| : (lines += 1) try std.testing.expectEqual(@as(usize, 50), line.len);
+    try std.testing.expectEqual(@as(usize, 200), lines);
+    try std.testing.expect(measure_bytes < 400_000);
+    // A word that fits after others, and a long word after a short one, wrap as before.
+    const mixed = "ab " ++ comptime rep("c", 120) ++ " d";
+    var it2 = ui.wrapText(mixed, 1, 50);
+    try std.testing.expectEqualStrings("ab", it2.next().?);
+    try std.testing.expectEqual(@as(usize, 50), it2.next().?.len);
+    try std.testing.expectEqual(@as(usize, 50), it2.next().?.len);
+    try std.testing.expectEqualStrings(comptime rep("c", 20) ++ " d", it2.next().?);
+    try std.testing.expect(it2.next() == null);
+}
+
+test "offsetAtX: finds the caret by searching, not by measuring every prefix" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    const ui = Ui.initHeadless(&list, .{}, .{}, countingMeasure);
+    const str = comptime rep("a", 10_000);
+    measure_calls = 0;
+    try std.testing.expectEqual(@as(usize, 9000), ui.offsetAtX(str, 1, 9000));
+    try std.testing.expect(measure_calls < 100);
+    measure_calls = 0;
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtX(str, 1, 3.4));
+    try std.testing.expectEqual(@as(usize, 4), ui.offsetAtX(str, 1, 3.6));
+    try std.testing.expectEqual(@as(usize, 10_000), ui.offsetAtX(str, 1, 99_999));
+    try std.testing.expectEqual(@as(usize, 0), ui.offsetAtX(str, 1, 0.4));
+    try std.testing.expectEqual(@as(usize, 1), ui.offsetAtX(str, 1, 0.6));
+    try std.testing.expectEqual(@as(usize, 0), ui.offsetAtX("", 1, 5));
+}
+
+fn lastText(list: *const DisplayList) ?[]const u8 {
+    var out: ?[]const u8 = null;
+    for (list.cmds.items) |c| switch (c) {
+        .text => |x| out = x.str,
+        else => {},
+    };
+    return out;
+}
+
+test "labelLines: the ellipsis cut never leaves half a character" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    // 'a' then 3-byte characters: byte 381 falls inside one.
+    const line = "a" ++ comptime rep("\u{4E2D}", 166);
+    _ = ui.labelLines(.{ .x = 0, .y = 0, .w = 100_000, .h = 0 }, line ++ "\nsecond", 1, .{ .size = 1 });
+    const got = lastText(&list).?;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(got));
+    try std.testing.expect(std.mem.endsWith(u8, got, "..."));
+}
+
+test "labelFmt: long output is shortened on a character boundary, not dropped" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    ui.labelFmt(.{ .x = 0, .y = 0, .w = 1000, .h = 20 }, "{s}", .{comptime rep("b", 200)}, .{});
+    try std.testing.expectEqual(@as(usize, 200), lastText(&list).?.len);
+    list.reset();
+    ui.labelFmt(.{ .x = 0, .y = 0, .w = 1000, .h = 20 }, "{s}", .{comptime rep("\u{4E2D}", 400)}, .{});
+    const got = lastText(&list).?;
+    try std.testing.expect(got.len > 0 and got.len <= 1200);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(got));
+}
+
+test "R13: labelFmt cuts on a cluster boundary, not between a letter and its marks" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    const full = comptime rep("x", 509) ++ "e\u{301}\u{302}\u{303}";
+    ui.labelFmt(.{ .x = 0, .y = 0, .w = 100_000, .h = 20 }, "{s}", .{full}, .{});
+    const got = lastText(&list).?;
+    try std.testing.expect(got.len > 400 and got.len < full.len);
+    try std.testing.expect(std.mem.startsWith(u8, full, got));
+    try std.testing.expect(grapheme.isBoundary(full, got.len));
 }

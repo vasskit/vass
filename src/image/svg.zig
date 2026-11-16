@@ -24,6 +24,12 @@ pub const max_shapes = 4_000;
 pub const max_points = 200_000;
 pub const max_gradients = 64;
 pub const max_input_bytes = 4 * 1024 * 1024;
+/// Total text of all `<style>` elements. Real icon and illustration stylesheets are a few KB.
+pub const max_css_bytes = 256 * 1024;
+/// Declarations applied over a whole document, from stylesheet rules and `style` attributes.
+/// A rule's declarations are applied once per matching element, so this bounds the product
+/// of rule size and element count; real files need a few hundred thousand at most.
+const max_css_work = 8_000_000;
 
 pub const Rgba = struct {
     r: u8 = 0,
@@ -209,7 +215,9 @@ const Attr = struct { name: []const u8, value: []const u8 };
 const max_attrs = 64;
 
 const RuleKind = enum { all, tag, class, id };
-const CssRule = struct { kind: RuleKind, name: []const u8, decl: []const u8 };
+const Decl = struct { key: []const u8, val: []const u8 };
+/// The declarations are shared by every selector of one rule.
+const CssRule = struct { kind: RuleKind, name: []const u8, decls: []const Decl };
 
 const GradientRec = struct {
     id: []const u8,
@@ -217,6 +225,26 @@ const GradientRec = struct {
     g: Gradient,
     stops: std.ArrayList(Stop) = .empty,
     has_stops_from_href: bool = false,
+};
+
+/// `key: value` pairs of a declaration block (`;` separated), `!important` dropped.
+const DeclIter = struct {
+    rest: []const u8,
+    done: bool = false,
+
+    fn next(it: *DeclIter) ?Decl {
+        while (!it.done) {
+            const semi = std.mem.indexOfScalar(u8, it.rest, ';');
+            const d = if (semi) |i| it.rest[0..i] else it.rest;
+            if (semi) |i| it.rest = it.rest[i + 1 ..] else it.done = true;
+            const colon = std.mem.indexOfScalar(u8, d, ':') orelse continue;
+            const key = std.mem.trim(u8, d[0..colon], " \t\r\n");
+            var val = std.mem.trim(u8, d[colon + 1 ..], " \t\r\n");
+            if (std.mem.endsWith(u8, val, "!important")) val = std.mem.trim(u8, val[0 .. val.len - 10], " \t");
+            return .{ .key = key, .val = val };
+        }
+        return null;
+    }
 };
 
 const PaintRef = struct { shape: u32, stroke: bool, name: []const u8 };
@@ -234,6 +262,9 @@ const Parser = struct {
     refs: std.ArrayList(PaintRef) = .empty,
     rules: std.ArrayList(CssRule) = .empty,
     css_text: std.ArrayList(u8) = .empty,
+    /// Bytes of `<style>` text seen so far (`max_css_bytes`) and declarations still allowed.
+    css_bytes: usize = 0,
+    css_work_left: usize = max_css_work,
     stack: [max_depth]Frame = undefined,
     depth: usize = 0,
     elements: usize = 0,
@@ -254,18 +285,18 @@ const Parser = struct {
         const src = p.src;
         while (p.i < src.len) {
             const lt = std.mem.indexOfScalarPos(u8, src, p.i, '<') orelse {
-                p.text(src[p.i..]);
+                try p.text(src[p.i..]);
                 p.i = src.len;
                 break;
             };
-            p.text(src[p.i..lt]);
+            try p.text(src[p.i..lt]);
             p.i = lt;
             if (std.mem.startsWith(u8, src[p.i..], "<!--")) {
                 const end = std.mem.indexOfPos(u8, src, p.i + 4, "-->") orelse return error.InvalidSvg;
                 p.i = end + 3;
             } else if (std.mem.startsWith(u8, src[p.i..], "<![CDATA[")) {
                 const end = std.mem.indexOfPos(u8, src, p.i + 9, "]]>") orelse return error.InvalidSvg;
-                p.text(src[p.i + 9 .. end]);
+                try p.text(src[p.i + 9 .. end]);
                 p.i = end + 3;
             } else if (std.mem.startsWith(u8, src[p.i..], "<?")) {
                 const end = std.mem.indexOfPos(u8, src, p.i + 2, "?>") orelse return error.InvalidSvg;
@@ -295,9 +326,12 @@ const Parser = struct {
     }
 
     /// Character data: only the content of `<style>` matters.
-    fn text(p: *Parser, s: []const u8) void {
+    fn text(p: *Parser, s: []const u8) Error!void {
         if (p.depth == 0) return;
-        if (p.stack[p.depth - 1].kind == .style) p.css_text.appendSlice(p.gpa, s) catch {};
+        if (p.stack[p.depth - 1].kind != .style) return;
+        p.css_bytes += s.len;
+        if (p.css_bytes > max_css_bytes) return error.TooComplex;
+        try p.css_text.appendSlice(p.gpa, s);
     }
 
     fn openElement(p: *Parser) Error!void {
@@ -466,20 +500,20 @@ const Parser = struct {
                 .id => id.len > 0 and std.mem.eql(u8, r.name, id),
                 .class => hasClass(class, r.name),
             };
-            if (hit) p.applyDecls(st, r.decl);
+            if (hit) {
+                if (r.decls.len > p.css_work_left) return error.TooComplex;
+                p.css_work_left -= r.decls.len;
+                for (r.decls) |d| p.applyProp(st, d.key, d.val);
+            }
         }
         // ... then the style attribute.
-        if (style_attr.len > 0) p.applyDecls(st, style_attr);
-    }
-
-    fn applyDecls(p: *Parser, st: *Style, decls: []const u8) void {
-        var it = std.mem.splitScalar(u8, decls, ';');
-        while (it.next()) |d| {
-            const colon = std.mem.indexOfScalar(u8, d, ':') orelse continue;
-            const key = std.mem.trim(u8, d[0..colon], " \t\r\n");
-            var val = std.mem.trim(u8, d[colon + 1 ..], " \t\r\n");
-            if (std.mem.endsWith(u8, val, "!important")) val = std.mem.trim(u8, val[0 .. val.len - 10], " \t");
-            p.applyProp(st, key, val);
+        if (style_attr.len > 0) {
+            var it = DeclIter{ .rest = style_attr };
+            while (it.next()) |d| {
+                if (p.css_work_left == 0) return error.TooComplex;
+                p.css_work_left -= 1;
+                p.applyProp(st, d.key, d.val);
+            }
         }
     }
 
@@ -554,34 +588,45 @@ const Parser = struct {
             const body = css[open + 1 .. k - 1];
             i = k;
             if (sel.len == 0 or sel[0] == '@') continue;
+            var decls: ?[]const Decl = null; // built for the first selector that is kept
             var it = std.mem.splitScalar(u8, sel, ',');
             while (it.next()) |one| {
                 const s = std.mem.trim(u8, one, " \t\r\n");
                 if (s.len == 0) continue;
                 // Compound and combinator selectors are not supported.
                 if (std.mem.indexOfAny(u8, s, " >+~[:") != null) continue;
-                var rule: CssRule = undefined;
-                rule.decl = try p.a.dupe(u8, body);
+                var kind: RuleKind = undefined;
+                var name: []const u8 = "";
                 if (s[0] == '.') {
                     if (std.mem.indexOfAny(u8, s[1..], ".#") != null) continue;
-                    rule.kind = .class;
-                    rule.name = try p.a.dupe(u8, s[1..]);
+                    kind = .class;
+                    name = s[1..];
                 } else if (s[0] == '#') {
                     if (std.mem.indexOfAny(u8, s[1..], ".#") != null) continue;
-                    rule.kind = .id;
-                    rule.name = try p.a.dupe(u8, s[1..]);
+                    kind = .id;
+                    name = s[1..];
                 } else if (s[0] == '*') {
-                    rule.kind = .all;
-                    rule.name = "";
+                    kind = .all;
                 } else {
                     if (std.mem.indexOfAny(u8, s, ".#") != null) continue;
-                    rule.kind = .tag;
-                    rule.name = try p.a.dupe(u8, s);
+                    kind = .tag;
+                    name = s;
                 }
                 if (p.rules.items.len >= 512) return error.TooComplex;
-                try p.rules.append(p.gpa, rule);
+                if (decls == null) decls = try p.parseDecls(body);
+                try p.rules.append(p.gpa, .{ .kind = kind, .name = try p.a.dupe(u8, name), .decls = decls.? });
             }
         }
+    }
+
+    /// Splits a declaration block once, into slices of a private copy (the stylesheet text
+    /// is discarded after its `<style>` element).
+    fn parseDecls(p: *Parser, body: []const u8) Error![]const Decl {
+        const text_copy = try p.a.dupe(u8, body);
+        var list: std.ArrayList(Decl) = .empty;
+        var it = DeclIter{ .rest = text_copy };
+        while (it.next()) |d| try list.append(p.a, d);
+        return list.items;
     }
 
     // ---- gradients ----------------------------------------------------------------
@@ -607,7 +652,7 @@ const Parser = struct {
             const eql = std.mem.eql;
             if (eql(u8, n, "id")) {
                 rec.id = try p.a.dupe(u8, at.value);
-            } else if (eql(u8, n, "href")) {
+            } else if (eql(u8, n, "href") or eql(u8, n, "xlink:href")) {
                 rec.href = try p.a.dupe(u8, std.mem.trim(u8, at.value, "# "));
             } else if (eql(u8, n, "gradientTransform")) {
                 rec.g.xf = try parseTransform(at.value);
@@ -1763,5 +1808,105 @@ test "fuzz-ish: random bytes and truncations never crash" {
             var d2 = dd.*;
             d2.deinit();
         } else |_| {}
+    }
+}
+
+fn cssDoc(gpa: std.mem.Allocator, css: []const u8, body: []const u8) !std.ArrayList(u8) {
+    var l: std.ArrayList(u8) = .empty;
+    errdefer l.deinit(gpa);
+    try l.appendSlice(gpa, "<svg viewBox=\"0 0 10 10\"><style>");
+    try l.appendSlice(gpa, css);
+    try l.appendSlice(gpa, body);
+    try l.appendSlice(gpa, "</style><rect width=\"1\" height=\"1\"/></svg>");
+    return l;
+}
+
+test "css: a rule body is stored once, however many selectors share it" {
+    const a = testing.allocator;
+    var css: std.ArrayList(u8) = .empty;
+    defer css.deinit(a);
+    // 400 usable class selectors (and as many skipped compound ones) over one 100 KB body.
+    for (0..400) |i| {
+        var b: [32]u8 = undefined;
+        try css.appendSlice(a, try std.fmt.bufPrint(&b, ".c{d},.d{d}.e,", .{ i, i }));
+    }
+    try css.appendSlice(a, ".last{");
+    for (0..10_000) |_| try css.appendSlice(a, "fill:red;");
+    try css.appendSlice(a, "}");
+    const doc = try std.fmt.allocPrint(a, "<svg viewBox=\"0 0 10 10\"><style>{s}</style><rect width=\"1\" height=\"1\"/></svg>", .{css.items});
+    defer a.free(doc);
+    // Before: each of the 800 selectors copied the body (72 MB). An 8 MB heap refuses that.
+    const buf = try a.alloc(u8, 8 * 1024 * 1024);
+    defer a.free(buf);
+    var fba = std.heap.FixedBufferAllocator.init(buf);
+    var d = try parse(fba.allocator(), doc);
+    d.deinit();
+}
+
+test "css: skipped selectors are classified before the body is copied" {
+    const a = testing.allocator;
+    // 20,000 compound selectors (never matched) in front of a 100 KB body.
+    var css: std.ArrayList(u8) = .empty;
+    defer css.deinit(a);
+    for (0..20_000) |_| try css.appendSlice(a, ".a.b,");
+    try css.appendSlice(a, ".z{");
+    for (0..11_000) |_| try css.appendSlice(a, "fill:red;");
+    try css.appendSlice(a, "}");
+    var doc = try cssDoc(a, css.items, "");
+    defer doc.deinit(a);
+    const buf = try a.alloc(u8, 8 * 1024 * 1024);
+    defer a.free(buf);
+    var fba = std.heap.FixedBufferAllocator.init(buf);
+    var d = try parse(fba.allocator(), doc.items);
+    d.deinit();
+}
+
+test "css: more stylesheet text than any icon needs is refused" {
+    const a = testing.allocator;
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(a);
+    try big.appendSlice(a, ".x{");
+    while (big.items.len < max_css_bytes + 100) try big.appendSlice(a, "fill:red;");
+    try big.appendSlice(a, "}");
+    var bigdoc = try cssDoc(a, big.items, "");
+    defer bigdoc.deinit(a);
+    try testing.expectError(error.TooComplex, parseOne(bigdoc.items));
+}
+
+test "css: declarations applied are budgeted (a universal rule over many elements)" {
+    const a = testing.allocator;
+    var work: std.ArrayList(u8) = .empty;
+    defer work.deinit(a);
+    try work.appendSlice(a, "<svg viewBox=\"0 0 10 10\"><style>*{");
+    for (0..2500) |_| try work.appendSlice(a, "fill:red;");
+    try work.appendSlice(a, "}</style>");
+    for (0..4000) |_| try work.appendSlice(a, "<g/>");
+    try work.appendSlice(a, "</svg>");
+    try testing.expectError(error.TooComplex, parseOne(work.items));
+}
+
+test "css: a modest stylesheet over many elements still parses" {
+    const a = testing.allocator;
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(a);
+    try l.appendSlice(a, "<svg viewBox=\"0 0 10 10\"><style>*{fill:red} .a{stroke:blue;stroke-width:2} g{opacity:.5}</style>");
+    for (0..3000) |_| try l.appendSlice(a, "<g class=\"a\"><rect width=\"1\" height=\"1\"/></g>");
+    try l.appendSlice(a, "</svg>");
+    var d = try parseOne(l.items);
+    defer d.deinit();
+    try testing.expectEqual(@as(usize, 3000), d.shapes.len);
+}
+
+test "gradients: xlink:href inherits stops like href (Inkscape, Illustrator)" {
+    var d = try parseOne(
+        \\<svg xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 10 10"><defs>
+        \\<linearGradient id="base"><stop offset="0" stop-color="#f00"/><stop offset="1" stop-color="#00f"/></linearGradient>
+        \\<linearGradient id="lg" xlink:href="#base" x1="0" y1="0" x2="0" y2="1"/></defs>
+        \\<rect width="10" height="10" fill="url(#lg)"/></svg>
+    );
+    defer d.deinit();
+    switch (d.shapes[0].fill) {
+        .gradient => |gi| try testing.expectEqual(@as(usize, 2), d.gradients[gi].stops.len),
+        else => return error.WrongPaint,
     }
 }

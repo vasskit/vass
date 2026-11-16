@@ -19,7 +19,11 @@ pub fn Cache(comptime Tex: type) type {
         const Self = @This();
         pub const Entry = struct { tex: Tex, bytes: usize, last_used: u64 };
 
+        const Stale = struct { key: u64, tex: Tex, last_used: u64 };
+
         map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+        /// Textures replaced by `put`, destroyed by the first `evict` after their last use.
+        stale: std.ArrayList(Stale) = .empty,
         bytes: usize = 0,
         max_entries: usize = 192,
         max_bytes: usize = 24 * 1024 * 1024,
@@ -36,14 +40,31 @@ pub fn Cache(comptime Tex: type) type {
         }
 
         pub fn put(c: *Self, gpa: std.mem.Allocator, k: u64, tex: Tex, bytes: usize, frame: u64) !void {
-            const old = try c.map.fetchPut(gpa, k, .{ .tex = tex, .bytes = bytes, .last_used = frame });
-            if (old) |o| c.bytes -= o.value.bytes;
+            if (c.map.getPtr(k)) |e| {
+                // Queued draws may still use the old texture, and `put` has no way to destroy
+                // it: keep it until `evict` can.
+                try c.stale.append(gpa, .{ .key = k, .tex = e.tex, .last_used = e.last_used });
+                c.bytes -= e.bytes;
+                e.* = .{ .tex = tex, .bytes = bytes, .last_used = frame };
+            } else {
+                try c.map.put(gpa, k, .{ .tex = tex, .bytes = bytes, .last_used = frame });
+            }
             c.bytes += bytes;
         }
 
         /// Drops entries over the limits, least recently used first, never one used in `frame`.
         /// `destroy(ctx, tex)` releases the texture.
         pub fn evict(c: *Self, gpa: std.mem.Allocator, frame: u64, ctx: anytype, comptime destroy: anytype) void {
+            var keep: usize = 0;
+            for (c.stale.items) |st| {
+                if (st.last_used < frame) {
+                    destroy(ctx, st.tex);
+                } else {
+                    c.stale.items[keep] = st;
+                    keep += 1;
+                }
+            }
+            c.stale.shrinkRetainingCapacity(keep);
             while (c.map.count() > c.max_entries or c.bytes > c.max_bytes) {
                 var oldest: ?u64 = null;
                 var oldest_used: u64 = frame;
@@ -76,11 +97,23 @@ pub fn Cache(comptime Tex: type) type {
                 if (keyId(k.*) == id) doomed.append(gpa, k.*) catch break;
             }
             for (doomed.items) |k| c.remove(gpa, k, ctx, destroy);
+            var keep: usize = 0;
+            for (c.stale.items) |st| {
+                if (keyId(st.key) == id) {
+                    destroy(ctx, st.tex);
+                } else {
+                    c.stale.items[keep] = st;
+                    keep += 1;
+                }
+            }
+            c.stale.shrinkRetainingCapacity(keep);
         }
 
         pub fn deinit(c: *Self, gpa: std.mem.Allocator, ctx: anytype, comptime destroy: anytype) void {
             var it = c.map.valueIterator();
             while (it.next()) |e| destroy(ctx, e.tex);
+            for (c.stale.items) |st| destroy(ctx, st.tex);
+            c.stale.deinit(gpa);
             c.map.deinit(gpa);
             c.bytes = 0;
         }
@@ -152,4 +185,41 @@ test "removeIcon drops all sizes of one icon only" {
     try testing.expectEqual(@as(usize, 1), c.count());
     try testing.expectEqual(@as(usize, 5), c.bytes);
     try testing.expectEqual(@as(usize, 2), f.destroyed.items.len);
+}
+
+test "replacing an entry hands the old texture back for destruction, once, after its frame" {
+    var c: Cache(u32) = .{};
+    var f: Fake = .{};
+    defer f.destroyed.deinit(testing.allocator);
+    try c.put(testing.allocator, key(1, 16, 16), 10, 100, 1);
+    // Frame 5 replaces it (a re-rasterise at the same size); queued draws of frame 5 may still
+    // use texture 10, so it goes at the first eviction after that frame.
+    _ = c.get(key(1, 16, 16), 5);
+    try c.put(testing.allocator, key(1, 16, 16), 11, 300, 5);
+    try testing.expectEqual(@as(usize, 300), c.bytes);
+    c.evict(testing.allocator, 5, &f, Fake.destroy);
+    try testing.expectEqual(@as(usize, 0), f.destroyed.items.len);
+    c.evict(testing.allocator, 6, &f, Fake.destroy);
+    try testing.expectEqualSlices(u32, &.{10}, f.destroyed.items);
+    c.evict(testing.allocator, 7, &f, Fake.destroy);
+    try testing.expectEqual(@as(usize, 1), f.destroyed.items.len);
+    // A replacement that is never evicted is released by deinit, together with the live ones.
+    try c.put(testing.allocator, key(1, 16, 16), 12, 5, 8);
+    c.deinit(testing.allocator, &f, Fake.destroy);
+    std.mem.sort(u32, f.destroyed.items, {}, std.sort.asc(u32));
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 12 }, f.destroyed.items);
+}
+
+test "removeIcon also releases replaced textures of that icon" {
+    var c: Cache(u32) = .{};
+    var f: Fake = .{};
+    defer f.destroyed.deinit(testing.allocator);
+    defer c.deinit(testing.allocator, &f, Fake.destroy);
+    try c.put(testing.allocator, key(1, 16, 16), 1, 5, 1);
+    try c.put(testing.allocator, key(1, 16, 16), 2, 5, 2);
+    try c.put(testing.allocator, key(2, 16, 16), 3, 5, 2);
+    try c.put(testing.allocator, key(2, 16, 16), 4, 5, 3);
+    c.removeIcon(testing.allocator, 1, &f, Fake.destroy);
+    std.mem.sort(u32, f.destroyed.items, {}, std.sort.asc(u32));
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, f.destroyed.items);
 }

@@ -108,22 +108,29 @@ pub const Run = struct {
 pub const RunIterator = struct {
     text: []const u8,
     pos: usize = 0,
+    /// Regional indicators that end just before `pos`, carried so a run of flags is linear.
+    ri: usize = 0,
 
     pub fn next(it: *RunIterator) ?Run {
         if (it.pos >= it.text.len) return null;
         const start = it.pos;
-        const first_end = grapheme.nextBoundary(it.text, start);
+        var ri = it.ri;
+        const first_end = grapheme.nextBoundaryCarry(it.text, start, ri, &ri);
         if (isEmojiCluster(it.text[start..first_end])) {
             it.pos = first_end;
+            it.ri = ri;
             return .{ .start = start, .end = first_end, .emoji = true };
         }
         var end = first_end;
         while (end < it.text.len) {
-            const next_end = grapheme.nextBoundary(it.text, end);
+            var ri_next: usize = undefined;
+            const next_end = grapheme.nextBoundaryCarry(it.text, end, ri, &ri_next);
             if (isEmojiCluster(it.text[end..next_end])) break;
             end = next_end;
+            ri = ri_next;
         }
         it.pos = end;
+        it.ri = ri;
         return .{ .start = start, .end = end, .emoji = false };
     }
 };
@@ -195,4 +202,21 @@ test "Emoji_Presentation lookup" {
     try t.expect(!hasEmojiPresentation(0x41));
     try t.expect(!hasEmojiPresentation(0x2764));
     try t.expect(!hasEmojiPresentation(0x231B + 1));
+}
+
+test "runs over a long string of flags is linear" {
+    const flags = try t.allocator.alloc(u8, 4000 * 4);
+    defer t.allocator.free(flags);
+    for (0..4000) |i| @memcpy(flags[i * 4 ..][0..4], "\u{1F1F3}");
+    grapheme.test_ri_steps = 0;
+    var it = runs(flags);
+    var n: usize = 0;
+    var total: usize = 0;
+    while (it.next()) |r| : (n += 1) {
+        try t.expect(r.emoji);
+        total += r.end - r.start;
+    }
+    try t.expectEqual(@as(usize, 2000), n);
+    try t.expectEqual(flags.len, total);
+    try t.expect(grapheme.test_ri_steps < 4 * 4000);
 }

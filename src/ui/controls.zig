@@ -371,6 +371,7 @@ pub fn slider(ui: *Ui, r: Rect, value: *f32, opts: SliderOpts) SliderResult {
                 s.select = null;
             }
             if (s.drag == id) {
+                s.drag_live = true;
                 if (in.down or hv.clicked) {
                     value.* = sliderValue(fracAt(in.mouse_x, r.x + half, span), opts.min, opts.max, opts.step);
                     res.dragging = true;
@@ -443,8 +444,9 @@ pub const WaveformOpts = struct {
     /// Draw only: no hover, click or drag tracking, and no dimming (a level history, a
     /// thumbnail of a clip).
     passive: bool = false,
-    /// Identifies this waveform for drag tracking. Default: the address of the peaks, so
-    /// two waveforms drawn from the same slice need different ids.
+    /// Identifies this waveform for focus and drag tracking. Default: derived from the order of
+    /// the waveforms drawn this frame (like the other widgets without a value), so it survives
+    /// the peaks being rebuilt; give each an id of its own if their order can change mid-drag.
     id: ?*const anyopaque = null,
 };
 
@@ -488,12 +490,13 @@ pub fn waveform(ui: *Ui, r: Rect, peaks: []const f32, opts: WaveformOpts) Wavefo
     var res: WaveformResult = .{};
     const hv = interact(ui, r, opts.disabled or opts.passive);
     res.hovered = hv.hovered;
-    const id: *const anyopaque = opts.id orelse @ptrCast(peaks.ptr);
+    const fid = if (opts.id) |p| focus.idOfPtr(p) else ui.widgetId(12, 0, null);
+    const id = focus.ptrOfId(fid);
     // Focusable like a slider: Left / Right seek by 5% (Shift: 20%), Home / End to the ends.
     var ring_vis = false;
     defer if (ring_vis) ui.focusRing(r, @min(4, r.h / 2), 2);
     if (!opts.disabled and !opts.passive and r.w > 0) {
-        const f = ui.focusable(focus.idOfPtr(id), r, .{ .role = .slider, .label = "", .activate = false, .ring = false });
+        const f = ui.focusable(fid, r, .{ .role = .slider, .label = "", .activate = false, .ring = false });
         ring_vis = f.visible;
         if (f.focused) {
             const at = opts.progress orelse 0;
@@ -516,6 +519,7 @@ pub fn waveform(ui: *Ui, r: Rect, peaks: []const f32, opts: WaveformOpts) Wavefo
                 res.clicked = true;
             }
             if (s.drag == id) {
+                s.drag_live = true;
                 if (in.down or hv.clicked) {
                     res.dragging = true;
                     res.seek = at;
@@ -906,4 +910,66 @@ test "waveform: colours the played bars, reports click and drag positions" {
     list.reset();
     _ = ui.waveform(.{ .x = 0, .y = 0, .w = 1, .h = 20 }, &pk, .{});
     try std.testing.expectEqual(@as(usize, 0), list.cmds.items.len);
+}
+
+test "waveform: two with empty peaks are told apart, and a rebuilt buffer keeps the drag" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var st: ui_mod.State = .{};
+    const a: Rect = .{ .x = 0, .y = 0, .w = 100, .h = 40 };
+    const b: Rect = .{ .x = 200, .y = 0, .w = 100, .h = 40 };
+    // Press on the first; the second, drawn from another empty slice, must not drag along.
+    var ui = dragUi(&list, &st, 10, true, true);
+    const empty1: []const f32 = &.{};
+    const empty2: []const f32 = &[_]f32{};
+    const r1 = ui.waveform(a, empty1, .{});
+    const r2 = ui.waveform(b, empty2, .{});
+    try std.testing.expect(r1.dragging);
+    try std.testing.expect(!r2.dragging and !r2.released);
+    // The first one's buffer is rebuilt while the button is down: still the same drag.
+    var buf1 = [_]f32{ 0.1, 0.2 };
+    var buf2 = [_]f32{ 0.3, 0.4 };
+    st = .{};
+    list.reset();
+    ui = dragUi(&list, &st, 10, true, true);
+    try std.testing.expect(ui.waveform(a, &buf1, .{}).dragging);
+    list.reset();
+    ui = dragUi(&list, &st, 20, false, true);
+    const res = ui.waveform(a, &buf2, .{});
+    try std.testing.expect(res.dragging);
+    try std.testing.expect(res.seek != null);
+}
+
+test "R1: a click that presses and releases in one frame still gets its release frame" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var st: ui_mod.State = .{};
+    var v: f32 = 0;
+    const r: Rect = .{ .x = 0, .y = 0, .w = 116, .h = 24 };
+    var ui = dragUi(&list, &st, 58, true, false); // a trackpad tap: pressed, already up
+    _ = ui.slider(r, &v, .{ .min = 0, .max = 100 });
+    ui.finish();
+    list.reset();
+    ui = dragUi(&list, &st, 58, false, false);
+    const res = ui.slider(r, &v, .{ .min = 0, .max = 100 });
+    ui.finish();
+    try std.testing.expect(res.released);
+    list.reset();
+    ui = dragUi(&list, &st, 58, false, false);
+    try std.testing.expect(!ui.slider(r, &v, .{ .min = 0, .max = 100 }).released); // exactly once
+    ui.finish();
+
+    list.reset();
+    ui = dragUi(&list, &st, 50, true, false);
+    var pk = [_]f32{ 0.5, 0.5 };
+    _ = ui.waveform(r, &pk, .{});
+    ui.finish();
+    list.reset();
+    ui = dragUi(&list, &st, 50, false, false);
+    try std.testing.expect(ui.waveform(r, &pk, .{}).released);
+    ui.finish();
+    list.reset();
+    ui = dragUi(&list, &st, 50, false, false);
+    try std.testing.expect(!ui.waveform(r, &pk, .{}).released);
+    ui.finish();
 }

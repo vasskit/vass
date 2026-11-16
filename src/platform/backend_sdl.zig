@@ -150,11 +150,16 @@ const c = struct {
     extern fn SDL_UpdateTexture(t: *Texture, rect: ?*const SdlRect, pixels: *const anyopaque, pitch: c_int) bool;
     extern fn SDL_SetTextureBlendMode(t: *Texture, mode: u32) bool;
     extern fn SDL_SetTextureScaleMode(t: *Texture, mode: c_int) bool;
+    const PathInfo = extern struct { kind: c_int, size: u64, create_time: i64, modify_time: i64, access_time: i64 };
+    const PATHTYPE_FILE: c_int = 1;
+    extern fn SDL_GetPathInfo(path: [*:0]const u8, info: *PathInfo) bool;
     extern fn SDL_LoadFile(file: [*:0]const u8, datasize: *usize) ?*anyopaque;
     extern fn SDL_CreateSurfaceFrom(w: c_int, h: c_int, format: u32, pixels: *anyopaque, pitch: c_int) ?*Surface;
     extern fn SDL_SetWindowIcon(w: *SdlWindow, icon: *Surface) bool;
     extern fn SDL_ShowOpenFileDialog(cb: DialogCallback, userdata: ?*anyopaque, w: ?*SdlWindow, filters: ?[*]const DialogFilter, n: c_int, default_location: ?[*:0]const u8, allow_many: bool) void;
     extern fn SDL_SetRenderClipRect(r: *Renderer, rect: ?*const SdlRect) bool;
+    extern fn SDL_GetRendererProperties(r: *Renderer) u32;
+    extern fn SDL_GetNumberProperty(props: u32, name: [*:0]const u8, default: i64) i64;
     extern fn TTF_Init() bool;
     extern fn TTF_Quit() void;
     extern fn TTF_OpenFont(file: [*:0]const u8, ptsize: f32) ?*Font;
@@ -614,8 +619,12 @@ fn setDrag(win: *c.SdlWindow, region: ?geom.Rect, exclude: []const geom.Rect) bo
     return true;
 }
 
-var pending_text: [256]u8 = undefined;
-var pending_len: usize = 0;
+/// The text event being delivered, copied out of SDL's event memory. Short strings use
+/// `pending_buf`; a longer one (dictation, a big IME commit) gets a heap copy, freed once the
+/// next text event replaces it.
+var pending_buf: [256]u8 = undefined;
+var pending_text: []const u8 = "";
+var pending_heap: ?[]u8 = null;
 var pending_pos: usize = 0;
 var pending_window: u32 = 0;
 
@@ -634,7 +643,7 @@ fn readF32(raw: []const u8, off: usize) f32 {
 
 fn keyFrom(raw: []const u8) Key {
     return .{
-        .code = std.mem.readInt(u32, raw[28..32], .little),
+        .code = keys.normalize(std.mem.readInt(u32, raw[28..32], .little)),
         .mods = modsFrom(std.mem.readInt(u16, raw[32..34], .little)),
         .repeat = raw[37] != 0,
         .window = std.mem.readInt(u32, raw[16..20], .little),
@@ -651,8 +660,8 @@ fn eventString(raw: []const u8, off: usize) []const u8 {
 
 /// Splits `pending_text` into chunks of at most 32 bytes on character boundaries.
 fn nextPendingChunk() ?Event {
-    if (pending_pos >= pending_len) return null;
-    const end = textChunkEnd(pending_text[0..pending_len], pending_pos);
+    if (pending_pos >= pending_text.len) return null;
+    const end = textChunkEnd(pending_text, pending_pos);
     const chunk = TextChunk.from(pending_text[pending_pos..end]);
     pending_pos = end;
     return .{ .text_input = .{ .window = pending_window, .text = chunk } };
@@ -670,10 +679,22 @@ fn decodeRaw(ev_type: u32, raw: []const u8) ?Event {
         c.EVENT_KEY_UP => return .{ .key_up = keyFrom(raw) },
         c.EVENT_TEXT_INPUT => {
             const str = eventString(raw, 24);
-            // Anything beyond the buffer (256 bytes in one event) is dropped.
-            const n = @min(str.len, pending_text.len);
-            @memcpy(pending_text[0..n], str[0..n]);
-            pending_len = n;
+            // The previous event was fully delivered before SDL was polled again.
+            if (pending_heap) |h| std.heap.c_allocator.free(h);
+            pending_heap = null;
+            if (str.len <= pending_buf.len) {
+                @memcpy(pending_buf[0..str.len], str);
+                pending_text = pending_buf[0..str.len];
+            } else if (std.heap.c_allocator.dupe(u8, str)) |h| {
+                pending_heap = h;
+                pending_text = h;
+            } else |_| {
+                // Out of memory: deliver what fits, cut on a character boundary.
+                var n = pending_buf.len;
+                while (n > 0 and str[n] & 0xC0 == 0x80) n -= 1;
+                @memcpy(pending_buf[0..n], str[0..n]);
+                pending_text = pending_buf[0..n];
+            }
             pending_pos = 0;
             pending_window = window;
             return nextPendingChunk();
@@ -711,7 +732,7 @@ var held_event: ?Event = null;
 /// exposed, say) also ends the wait, so a caller that redraws on every wake-up repaints for it.
 /// Costs no CPU while it waits: this is what an app that draws only on demand sleeps in.
 pub fn waitEvent(timeout_ms: ?u32) bool {
-    if (held_event != null or pending_pos < pending_len) return true;
+    if (held_event != null or pending_pos < pending_text.len) return true;
     var e: c.SdlEvent = undefined;
     const got = if (timeout_ms) |ms|
         c.SDL_WaitEventTimeout(&e, @intCast(@min(ms, std.math.maxInt(i32))))
@@ -851,7 +872,58 @@ fn destroySvgTexture(_: void, t: ?*c.Texture) void {
 
 pub const ImageError = decode_mod.Error || error{ FileReadFailed, TextureFailed };
 
-const CachedText = struct { tex: *c.Texture, w: f32, h: f32, last_frame: u64 };
+/// The renderer's maximum texture size per side (the software renderer reports none: unlimited).
+fn rendererMaxTexture(ren: *c.Renderer) u32 {
+    const n = c.SDL_GetNumberProperty(c.SDL_GetRendererProperties(ren), "SDL.renderer.max_texture_size", 0);
+    return if (n > 0) @intCast(@min(n, std.math.maxInt(c_int))) else std.math.maxInt(c_int);
+}
+
+/// A drawn line of text. A line wider than the renderer's largest texture is cut into strips:
+/// `tex` is the first, `more` the rest, left to right, each `max texture size` pixels wide
+/// except the last.
+const CachedText = struct {
+    tex: *c.Texture,
+    w: f32,
+    h: f32,
+    last_frame: u64,
+    more: []const *c.Texture = &.{},
+};
+
+/// Text wider than this many pixels is not drawn (it would take tens of megabytes to rasterise).
+const max_line_px: u32 = 1 << 18;
+/// Most pixels (width x height) one line of text may take: 32 Mpx is 128 MB of ARGB, and the
+/// width limit alone allows gigabytes at the largest text size.
+const max_text_area: u64 = 1 << 25;
+
+/// Whether a line `width` x `height` pixels may be rasterised.
+fn textSurfaceOk(width: u64, height: u64) bool {
+    return width <= max_line_px and width * height <= max_text_area;
+}
+
+/// A string that was not drawn, remembered so it is not rasterised every frame.
+const TextMiss = struct {
+    /// The last frame it was asked for (it is dropped when nobody asks for a while).
+    seen: u64,
+    /// The first frame it may be tried again; `never` for what can never succeed (too big).
+    retry_at: u64,
+    tries: u8 = 0,
+
+    const never = std.math.maxInt(u64);
+
+    /// Frames to wait after the `tries`-th failure: half a second at 60 fps, doubling to eight.
+    fn backoff(tries: u8) u64 {
+        return @as(u64, 30) << @min(tries, 4);
+    }
+
+    /// The entry after a failure at `frame` (`prev`: the one it had, if it was tried again).
+    fn failed(prev: ?TextMiss, frame: u64, permanent: bool) TextMiss {
+        const tries: u8 = if (prev) |p| p.tries +| 1 else 0;
+        return .{ .seen = frame, .retry_at = if (permanent) never else frame + backoff(tries), .tries = tries };
+    }
+};
+/// Text sizes are clamped to this many pixels tall.
+const max_text_px: f32 = 4096;
+
 
 pub fn sleepMs(ms: u32) void {
     c.SDL_Delay(ms);
@@ -934,10 +1006,20 @@ pub const Window = struct {
     win: *c.SdlWindow,
     ren: *c.Renderer,
     /// Physical pixels per logical point (2.0 on Retina displays).
+    /// The largest texture the renderer can make, in pixels per side (see `rendererMaxTexture`).
+    max_tex: u32,
     density: f32,
     frame: u64 = 0,
     fonts: std.ArrayList(CachedFont) = .empty,
     texts: std.AutoHashMapUnmanaged(u64, CachedText) = .empty,
+    /// Strings that could not be drawn, so they are not rasterised again every frame.
+    text_misses: std.AutoHashMapUnmanaged(u64, TextMiss) = .empty,
+    /// Set by `textTexture` when it returns null for a reason that cannot go away (too big), as
+    /// opposed to running out of memory or a texture failing, which may pass.
+    text_never: bool = false,
+    /// Icons whose render failure has been logged, and how many log lines that made.
+    svg_failed: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    svg_failure_logs: u32 = 0,
     verts: std.ArrayList(c.Vertex) = .empty,
     idx: std.ArrayList(c_int) = .empty,
     /// If set, the next rendered frame is also saved to this path as a BMP.
@@ -945,6 +1027,10 @@ pub const Window = struct {
     /// Active clip rectangles (window points), innermost last.
     clips: [16]geom.Rect = undefined,
     clip_n: usize = 0,
+    /// Pushes beyond the stack depth, so pops stay balanced; while it is non-zero `clip_over`
+    /// is the clip in force (the innermost intersected).
+    clip_overflow: usize = 0,
+    clip_over: geom.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     font_set: ?FontSet = null,
     fallback_sources: []const FontSource = &.{},
     system_fallback: bool = true,
@@ -1013,6 +1099,7 @@ pub const Window = struct {
             .gpa = gpa,
             .win = win,
             .ren = ren,
+            .max_tex = rendererMaxTexture(ren),
             .density = density,
             .font_set = opts.fonts,
             .fallback_sources = opts.fallback_fonts,
@@ -1033,8 +1120,10 @@ pub const Window = struct {
         discardDialogOf(w.id());
         _ = setDrag(w.win, null, &.{});
         var it = w.texts.valueIterator();
-        while (it.next()) |t| c.SDL_DestroyTexture(t.tex);
+        while (it.next()) |t| w.destroyText(t.*);
         w.texts.deinit(w.gpa);
+        w.text_misses.deinit(w.gpa);
+        w.svg_failed.deinit(w.gpa);
         var imgs = w.images.valueIterator();
         while (imgs.next()) |t| c.SDL_DestroyTexture(t.tex);
         w.images.deinit(w.gpa);
@@ -1243,7 +1332,7 @@ pub const Window = struct {
     }
 
     fn clampInt(v: f32) c_int {
-        if (!std.math.isFinite(v)) return 0;
+        if (std.math.isNan(v)) return 0;
         return @intFromFloat(std.math.clamp(v, -1e6, 1e6));
     }
 
@@ -1270,6 +1359,10 @@ pub const Window = struct {
         const z = try w.gpa.allocSentinel(u8, path.len, 0);
         @memcpy(z, path);
         defer w.gpa.free(z);
+        // Look before reading: a huge file is refused without loading it.
+        var info: c.PathInfo = undefined;
+        if (!c.SDL_GetPathInfo(z.ptr, &info) or info.kind != c.PATHTYPE_FILE) return error.FileReadFailed;
+        if (info.size > decode_mod.max_file_bytes) return error.ImageTooLarge;
         var size: usize = 0;
         const data = c.SDL_LoadFile(z.ptr, &size) orelse return error.FileReadFailed;
         defer c.SDL_free(data);
@@ -1378,16 +1471,34 @@ pub const Window = struct {
         return .{ .w = @intFromFloat(wpx), .h = @intFromFloat(hpx) };
     }
 
-    fn makeSvgTexture(w: *Window, e: *const SvgEntry, wpx: u32, hpx: u32) ?*c.Texture {
+    /// Says once per icon why it did not draw (the failure is cached, so it would otherwise be
+    /// a blank icon with no trace).
+    fn noteSvgFailure(w: *Window, icon_id: u32, err: anyerror, wpx: u32, hpx: u32) void {
+        const gop = w.svg_failed.getOrPut(w.gpa, icon_id) catch return;
+        if (gop.found_existing) return;
+        w.svg_failure_logs += 1;
+        if (!@import("builtin").is_test) std.log.warn("svg icon {d} not drawn: {s} at {d}x{d} px", .{ icon_id, @errorName(err), wpx, hpx });
+    }
+
+    fn makeSvgTexture(w: *Window, icon_id: u32, e: *const SvgEntry, wpx: u32, hpx: u32) ?*c.Texture {
         const n = @as(usize, wpx) * hpx;
-        const rgba = w.gpa.alloc(u8, n * 4) catch return null;
+        const rgba = w.gpa.alloc(u8, n * 4) catch |err| {
+            w.noteSvgFailure(icon_id, err, wpx, hpx);
+            return null;
+        };
         defer w.gpa.free(rgba);
         if (e.color) {
-            const px = raster_mod.renderRgba(w.gpa, &e.doc, wpx, hpx, .{ .r = 255, .g = 255, .b = 255 }) catch return null;
+            const px = raster_mod.renderRgba(w.gpa, &e.doc, wpx, hpx, .{ .r = 255, .g = 255, .b = 255 }) catch |err| {
+                w.noteSvgFailure(icon_id, err, wpx, hpx);
+                return null;
+            };
             defer w.gpa.free(px);
             @memcpy(rgba, px);
         } else {
-            const mask = raster_mod.renderMask(w.gpa, &e.doc, wpx, hpx) catch return null;
+            const mask = raster_mod.renderMask(w.gpa, &e.doc, wpx, hpx) catch |err| {
+                w.noteSvgFailure(icon_id, err, wpx, hpx);
+                return null;
+            };
             defer w.gpa.free(mask);
             // Premultiplied white: the tint colour then scales it at draw time.
             for (mask, 0..) |a, i| rgba[i * 4 ..][0..4].* = .{ a, a, a, a };
@@ -1410,7 +1521,7 @@ pub const Window = struct {
         const sz = svgPixelSize(r, aspect, d) orelse return;
         const k = svg_cache.key(icon.id, sz.w, sz.h);
         const tex_opt: ?*c.Texture = w.svg_cache.get(k, w.frame) orelse blk: {
-            const t = w.makeSvgTexture(e, sz.w, sz.h);
+            const t = w.makeSvgTexture(icon.id, e, sz.w, sz.h);
             w.svg_cache.put(w.gpa, k, t, @as(usize, sz.w) * sz.h * 4, w.frame) catch {
                 if (t) |tt| c.SDL_DestroyTexture(tt);
                 return;
@@ -1590,6 +1701,7 @@ pub const Window = struct {
         _ = c.SDL_SetRenderDrawColor(w.ren, clear.r, clear.g, clear.b, clear.a);
         _ = c.SDL_RenderClear(w.ren);
         w.clip_n = 0;
+        w.clip_overflow = 0;
         for (list.cmds.items) |cmd| switch (cmd) {
             .rrect => |r| w.addRRect(r.rect, r.radius, r.color),
             .ellipse => |e| w.addEllipse(e.cx, e.cy, e.rx, e.ry, e.color),
@@ -1630,25 +1742,31 @@ pub const Window = struct {
         w.flush(); // geometry queued so far belongs to the old clip
         var next = r;
         if (w.clip_n > 0) {
-            const p = w.clips[w.clip_n - 1];
+            const p = if (w.clip_overflow > 0) w.clip_over else w.clips[w.clip_n - 1];
             const x0 = @max(p.x, r.x);
             const y0 = @max(p.y, r.y);
             const x1 = @min(p.x + p.w, r.x + r.w);
             const y1 = @min(p.y + p.h, r.y + r.h);
             next = .{ .x = x0, .y = y0, .w = @max(0, x1 - x0), .h = @max(0, y1 - y0) };
         }
-        if (w.clip_n < w.clips.len) {
+        if (w.clip_n < w.clips.len and w.clip_overflow == 0) {
             w.clips[w.clip_n] = next;
             w.clip_n += 1;
         } else {
-            w.clips[w.clips.len - 1] = next; // too deep: keep the innermost intersected
+            // Too deep: remember the depth, and keep the innermost intersected until it unwinds.
+            w.clip_overflow += 1;
+            w.clip_over = next;
         }
         w.applyClip();
     }
 
     fn popClip(w: *Window) void {
         w.flush();
-        if (w.clip_n > 0) w.clip_n -= 1;
+        if (w.clip_overflow > 0) {
+            w.clip_overflow -= 1;
+        } else if (w.clip_n > 0) {
+            w.clip_n -= 1;
+        }
         w.applyClip();
     }
 
@@ -1659,13 +1777,24 @@ pub const Window = struct {
             _ = c.SDL_SetRenderClipRect(w.ren, null);
             return;
         }
-        const r = w.clips[w.clip_n - 1];
-        const x0: c_int = @intFromFloat(@floor(r.x));
-        const y0: c_int = @intFromFloat(@floor(r.y));
-        const x1: c_int = @intFromFloat(@ceil(r.x + r.w));
-        const y1: c_int = @intFromFloat(@ceil(r.y + r.h));
-        const ir: c.SdlRect = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+        const r = if (w.clip_overflow > 0) w.clip_over else w.clips[w.clip_n - 1];
+        const ir = clipInts(r);
         _ = c.SDL_SetRenderClipRect(w.ren, &ir);
+    }
+
+    /// The whole-unit clip rectangle for `r`. SDL reads a negative size as "no clipping", so the
+    /// result never has one: a rectangle that is NaN, or reaches NaN (inf - inf), clips everything
+    /// away, and infinite or huge edges are limited to +-1e6 instead of collapsing to 0.
+    fn clipInts(r: geom.Rect) c.SdlRect {
+        const none: c.SdlRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        const rx1 = r.x + r.w;
+        const ry1 = r.y + r.h;
+        if (std.math.isNan(r.x) or std.math.isNan(r.y) or std.math.isNan(rx1) or std.math.isNan(ry1)) return none;
+        const x0 = clampInt(@floor(r.x));
+        const y0 = clampInt(@floor(r.y));
+        const x1 = clampInt(@ceil(rx1));
+        const y1 = clampInt(@ceil(ry1));
+        return .{ .x = x0, .y = y0, .w = @max(0, x1 - x0), .h = @max(0, y1 - y0) };
     }
 
     // ---- shapes -------------------------------------------------------
@@ -2007,17 +2136,77 @@ pub const Window = struct {
 
     /// The texture of `str` for text pixels `px` tall in colour `col`, or null if nothing could be drawn.
     fn textTexture(w: *Window, i: usize, str: []const u8, col: Color, px: u32) ?CachedText {
+        w.text_never = false;
         if (w.hasEmojiRuns(str, px)) {
             if (w.composeText(i, str, col, px)) |t| return t;
+            w.text_never = false; // the plain path below may still draw it
         }
         const font = w.withFallbacks(i, str);
+        const fh = c.TTF_GetFontHeight(font);
+        if (fh <= 0 or !textSurfaceOk(w.plainWidth(i, str), @intCast(fh))) {
+            w.text_never = true;
+            return null;
+        }
         const surf = c.TTF_RenderText_Blended(font, str.ptr, str.len, .{ .r = col.r, .g = col.g, .b = col.b, .a = col.a }) orelse return null;
         defer c.SDL_DestroySurface(surf);
+        const hdr: *const c.SurfaceHeader = @ptrCast(@alignCast(surf));
+        if (hdr.w > 0 and @as(u32, @intCast(hdr.w)) > w.maxTextureSize()) {
+            if (hdr.pixels == null or hdr.format != c.PIXELFORMAT_ARGB8888 or hdr.h <= 0 or hdr.pitch < hdr.w * 4) return null;
+            return w.stripTexture(c.PIXELFORMAT_ARGB8888, hdr.pixels.?, @intCast(hdr.pitch), @intCast(hdr.w), @intCast(hdr.h));
+        }
         const tex = c.SDL_CreateTextureFromSurface(w.ren, surf) orelse return null;
         var tw: f32 = 0;
         var th: f32 = 0;
         _ = c.SDL_GetTextureSize(tex, &tw, &th);
         return .{ .tex = tex, .w = tw / w.density, .h = th / w.density, .last_frame = w.frame };
+    }
+
+    fn maxTextureSize(w: *const Window) u32 {
+        return w.max_tex;
+    }
+
+    /// Uploads a line of pixels wider than the renderer's maximum texture as side-by-side strips.
+    /// `pixels` is `height` rows of `pitch` bytes, 4 bytes per pixel in `format`.
+    fn stripTexture(w: *Window, format: u32, pixels: [*]const u8, pitch: usize, width: usize, height: usize) ?CachedText {
+        const max: usize = w.maxTextureSize();
+        const n = (width + max - 1) / max;
+        const texs = w.gpa.alloc(*c.Texture, n) catch return null;
+        var made: usize = 0;
+        while (made < n) : (made += 1) {
+            const x0 = made * max;
+            const sw = @min(max, width - x0);
+            const tex = c.SDL_CreateTexture(w.ren, format, c.TEXTUREACCESS_STATIC, @intCast(sw), @intCast(height)) orelse break;
+            if (!c.SDL_UpdateTexture(tex, null, pixels + x0 * 4, @intCast(pitch))) {
+                c.SDL_DestroyTexture(tex);
+                break;
+            }
+            _ = c.SDL_SetTextureBlendMode(tex, c.BLENDMODE_BLEND);
+            texs[made] = tex;
+        }
+        if (made < n) {
+            for (texs[0..made]) |t| c.SDL_DestroyTexture(t);
+            w.gpa.free(texs);
+            return null;
+        }
+        const rest = if (n > 1) w.gpa.dupe(*c.Texture, texs[1..]) catch null else &[0]*c.Texture{};
+        defer w.gpa.free(texs);
+        if (rest == null) {
+            for (texs) |t| c.SDL_DestroyTexture(t);
+            return null;
+        }
+        return .{
+            .tex = texs[0],
+            .more = rest.?,
+            .w = @as(f32, @floatFromInt(width)) / w.density,
+            .h = @as(f32, @floatFromInt(height)) / w.density,
+            .last_frame = w.frame,
+        };
+    }
+
+    fn destroyText(w: *Window, t: CachedText) void {
+        c.SDL_DestroyTexture(t.tex);
+        for (t.more) |m| c.SDL_DestroyTexture(m);
+        if (t.more.len > 0) w.gpa.free(t.more);
     }
 
     /// A line of text as straight-alpha RGBA pixels.
@@ -2031,12 +2220,18 @@ pub const Window = struct {
         const ui_font = w.fonts.items[i].font;
         const height_i = c.TTF_GetFontHeight(ui_font);
         const ascent_i = c.TTF_GetFontAscent(ui_font);
-        if (height_i <= 0) return null;
+        if (height_i <= 0) {
+            w.text_never = true;
+            return null;
+        }
         const height: usize = @intCast(height_i);
         var total: usize = 0;
         var it = emoji_mod.runs(str);
         while (it.next()) |r| total += w.runWidth(i, str, r, px);
-        if (total == 0) return null;
+        if (total == 0 or !textSurfaceOk(total, height)) {
+            w.text_never = true;
+            return null;
+        }
         const buf = w.gpa.alloc(u8, total * height * 4) catch return null;
         @memset(buf, 0);
         var x: usize = 0;
@@ -2072,6 +2267,7 @@ pub const Window = struct {
     fn composeText(w: *Window, i: usize, str: []const u8, col: Color, px: u32) ?CachedText {
         const line = w.composeBuffer(i, str, col, px) orelse return null;
         defer w.gpa.free(line.rgba);
+        if (line.w > w.maxTextureSize()) return w.stripTexture(c.PIXELFORMAT_RGBA32, line.rgba.ptr, line.w * 4, line.w, line.h);
         const tex = c.SDL_CreateTexture(w.ren, c.PIXELFORMAT_RGBA32, c.TEXTUREACCESS_STATIC, @intCast(line.w), @intCast(line.h)) orelse return null;
         if (!c.SDL_UpdateTexture(tex, null, line.rgba.ptr, @intCast(line.w * 4))) {
             c.SDL_DestroyTexture(tex);
@@ -2095,7 +2291,7 @@ pub const Window = struct {
     /// `drawText` makes for it, emoji and fallback fonts included.
     pub fn measureTextWeighted(w: *Window, str: []const u8, size: f32, weight: gfx.Weight) f32 {
         if (str.len == 0) return 0;
-        const px: u32 = @intFromFloat(@round(size * w.density));
+        const px = w.textPx(size) orelse return 0;
         const i = w.fontIndex(px, weight) orelse return 0;
         var total: u32 = 0;
         if (w.hasEmojiRuns(str, px)) {
@@ -2109,15 +2305,25 @@ pub const Window = struct {
 
     fn drawText(w: *Window, x: f32, y: f32, str: []const u8, size: f32, col: Color, alignment: gfx.Align, weight: gfx.Weight) void {
         if (str.len == 0) return;
-        const px: u32 = @intFromFloat(@round(size * w.density));
+        const px = w.textPx(size) orelse return;
         var h = std.hash.Wyhash.init(@as(u64, px) << 8 | @intFromEnum(weight));
         h.update(str);
         h.update(std.mem.asBytes(&col));
         const key = h.final();
 
         const entry = w.texts.getPtr(key) orelse blk: {
+            var prior: ?TextMiss = null;
+            if (w.text_misses.getPtr(key)) |m| {
+                m.seen = w.frame;
+                if (w.frame < m.retry_at) return;
+                prior = m.*; // a failure that may have passed: try again, not every frame
+            }
             const i = w.fontIndex(px, weight) orelse return;
-            const t = w.textTexture(i, str, col, px) orelse return;
+            const t = w.textTexture(i, str, col, px) orelse {
+                w.text_misses.put(w.gpa, key, TextMiss.failed(prior, w.frame, w.text_never)) catch @panic("out of memory");
+                return;
+            };
+            _ = w.text_misses.remove(key);
             w.texts.put(w.gpa, key, t) catch @panic("out of memory");
             break :blk w.texts.getPtr(key).?;
         };
@@ -2129,6 +2335,26 @@ pub const Window = struct {
         };
         const dst: c.FRect = .{ .x = dx, .y = y, .w = entry.w, .h = entry.h };
         _ = c.SDL_RenderTexture(w.ren, entry.tex, null, &dst);
+        if (entry.more.len > 0) {
+            var tw: f32 = 0;
+            var th: f32 = 0;
+            _ = c.SDL_GetTextureSize(entry.tex, &tw, &th);
+            var sx = dx + tw / w.density;
+            for (entry.more) |m| {
+                _ = c.SDL_GetTextureSize(m, &tw, &th);
+                const part: c.FRect = .{ .x = sx, .y = y, .w = tw / w.density, .h = entry.h };
+                _ = c.SDL_RenderTexture(w.ren, m, null, &part);
+                sx += tw / w.density;
+            }
+        }
+    }
+
+    /// Text pixel height for a size in points, or null for sizes that draw nothing (not a
+    /// positive finite number, or under half a pixel).
+    fn textPx(w: *const Window, size: f32) ?u32 {
+        const v = size * w.density;
+        if (!(v >= 0.5)) return null;
+        return @intFromFloat(@round(@min(v, max_text_px)));
     }
 
     /// Drops text textures that have not been drawn for a couple of seconds.
@@ -2137,9 +2363,16 @@ pub const Window = struct {
         var it = w.texts.iterator();
         while (it.next()) |e| {
             if (w.frame - e.value_ptr.last_frame > 120) {
-                c.SDL_DestroyTexture(e.value_ptr.tex);
+                w.destroyText(e.value_ptr.*);
                 w.texts.removeByPtr(e.key_ptr);
                 it = w.texts.iterator(); // removal invalidates the iterator
+            }
+        }
+        var mi = w.text_misses.iterator();
+        while (mi.next()) |e| {
+            if (w.frame - e.value_ptr.seen > 120) {
+                w.text_misses.removeByPtr(e.key_ptr);
+                mi = w.text_misses.iterator();
             }
         }
     }
@@ -2242,6 +2475,230 @@ test "text is chunked on character boundaries, in chunks of at most 32 bytes" {
         try std.testing.expect(std.unicode.utf8ValidateSlice(mixed[i..end]));
         i = end;
     }
+}
+
+test "a long text event is delivered whole, in valid UTF-8 chunks, in order" {
+    var cjk_buf: [336:0]u8 = undefined; // past the 256-byte buffer
+    for (0..14) |k| @memcpy(cjk_buf[k * 24 ..][0..24], "日本語のテキスト");
+    cjk_buf[336] = 0;
+    const cjk: [:0]const u8 = &cjk_buf;
+    var raw: [128]u8 = @splat(0);
+    std.mem.writeInt(u32, raw[0..4], c.EVENT_TEXT_INPUT, .little);
+    std.mem.writeInt(u32, raw[16..20], 5, .little);
+    std.mem.writeInt(usize, raw[24..][0..@sizeOf(usize)], @intFromPtr(cjk.ptr), .little);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(std.testing.allocator);
+    var ev = decodeRaw(c.EVENT_TEXT_INPUT, &raw);
+    while (ev) |e| : (ev = nextPendingChunk()) {
+        try std.testing.expectEqual(@as(u32, 5), e.text_input.window);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(e.text_input.text.slice()));
+        try got.appendSlice(std.testing.allocator, e.text_input.text.slice());
+    }
+    try std.testing.expectEqualStrings(cjk, got.items);
+    // A short event after it reuses the inline buffer and releases the heap copy.
+    std.mem.writeInt(usize, raw[24..][0..@sizeOf(usize)], @intFromPtr(@as([*:0]const u8, "hi")), .little);
+    try std.testing.expectEqualStrings("hi", decodeRaw(c.EVENT_TEXT_INPUT, &raw).?.text_input.text.slice());
+    try std.testing.expect(pending_heap == null and nextPendingChunk() == null);
+}
+
+test "text sizes that are not a positive finite number draw nothing and measure 0" {
+    const win = try dummyWindow(.{ .title = "sizes", .width = 80, .height = 60 });
+    defer win.destroy();
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    for ([_]f32{ -5, 0, 0.1, nan, inf, -inf }) |size| {
+        const m = win.measureText("hello", size);
+        if (size == inf) {
+            try std.testing.expect(m > 0); // clamped, not a crash
+        } else {
+            try std.testing.expectEqual(@as(f32, 0), m);
+        }
+        win.drawText(0, 0, "hello", size, white, .left, .regular);
+    }
+    // A huge size is clamped to the text size cap: a finite, bounded width.
+    const huge_w = win.measureText("hello", 1e30);
+    try std.testing.expect(std.math.isFinite(huge_w) and huge_w > win.measureText("hello", 14) and huge_w < 1e6);
+    win.drawText(0, 0, "hello", 1e30, white, .left, .regular);
+    // A size under half a pixel opens no font, however often it is asked for.
+    const fonts = win.fonts.items.len;
+    for (0..5) |_| _ = win.measureText("hello", 0.1);
+    try std.testing.expectEqual(fonts, win.fonts.items.len);
+}
+
+test "text wider than the largest texture is drawn in strips, measured as one line" {
+    const win = try dummyWindow(.{ .title = "long text", .width = 80, .height = 60 });
+    defer win.destroy();
+    const size: f32 = 14;
+    const px: u32 = @intFromFloat(@round(size * win.density));
+    const i = win.fontIndex(px, .regular).?;
+    win.max_tex = 2048; // as if the renderer could not make wider textures
+    const max = win.maxTextureSize();
+    // Plain text: enough characters to need three strips.
+    const per = win.measureText("m", size) * win.density;
+    const n: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(max)) * 2.5 / per));
+    const long = try std.testing.allocator.alloc(u8, n);
+    defer std.testing.allocator.free(long);
+    @memset(long, 'm');
+    const want = win.measureText(long, size);
+    try std.testing.expect(want * win.density > @as(f32, @floatFromInt(max)));
+    if (win.textTexture(i, long, white, px)) |t| {
+        defer win.destroyText(t);
+        try std.testing.expectEqual(want, t.w);
+        try std.testing.expect(t.more.len >= 2);
+        var sum: f32 = 0;
+        var tw: f32 = 0;
+        var th: f32 = 0;
+        _ = c.SDL_GetTextureSize(t.tex, &tw, &th);
+        sum += tw;
+        for (t.more) |m| {
+            _ = c.SDL_GetTextureSize(m, &tw, &th);
+            sum += tw;
+        }
+        try std.testing.expectEqual(want * win.density, sum);
+    } else return error.TestUnexpectedResult;
+    // Drawn through the cache it is not retried: one texture set, no miss entry.
+    win.drawText(0, 0, long, size, white, .left, .regular);
+    win.drawText(0, 0, long, size, white, .left, .regular);
+    try std.testing.expectEqual(@as(u32, 1), win.texts.count());
+    try std.testing.expectEqual(@as(u32, 0), win.text_misses.count());
+    // A string under the limit is one texture, as before.
+    const short = win.textTexture(i, "hello", white, px).?;
+    defer win.destroyText(short);
+    try std.testing.expectEqual(@as(usize, 0), short.more.len);
+    // Text past the size cap cannot be drawn: it is remembered, not rasterised every frame.
+    const huge = try std.testing.allocator.alloc(u8, max_line_px / 2);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'm');
+    win.drawText(0, 0, huge, size, white, .left, .regular);
+    win.drawText(0, 0, huge, size, white, .left, .regular);
+    try std.testing.expectEqual(@as(u32, 1), win.text_misses.count());
+    try std.testing.expectEqual(@as(u32, 1), win.texts.count());
+}
+
+test "R8: a line is limited by its area, not only its width" {
+    try std.testing.expect(textSurfaceOk(1000, 100));
+    try std.testing.expect(textSurfaceOk(max_line_px, 20));
+    // Within the width limit, but a gigabyte of pixels at the largest text size.
+    try std.testing.expect(!textSurfaceOk(max_line_px, 4800));
+    try std.testing.expect(!textSurfaceOk(max_line_px + 1, 1));
+}
+
+test "R9: only a failure that cannot pass is remembered for good; others are retried, at a bounded rate" {
+    const first = TextMiss.failed(null, 100, false);
+    try std.testing.expectEqual(@as(u64, 130), first.retry_at);
+    const second = TextMiss.failed(first, 130, false);
+    try std.testing.expectEqual(@as(u64, 190), second.retry_at);
+    var m = second;
+    var at: u64 = 190;
+    for (0..20) |_| {
+        at = m.retry_at;
+        m = TextMiss.failed(m, at, false);
+    }
+    try std.testing.expectEqual(@as(u64, 480), m.retry_at - at); // the wait stops doubling at 480 frames
+    try std.testing.expect(TextMiss.failed(null, 5, true).retry_at == TextMiss.never);
+    try std.testing.expect(TextMiss.failed(first, 130, true).retry_at == TextMiss.never);
+}
+
+test "R9: a string that is too big is a permanent miss, one that merely failed is retried later" {
+    const win = try dummyWindow(.{ .title = "misses", .width = 80, .height = 60 });
+    defer win.destroy();
+    const size: f32 = 14;
+    const huge = try std.testing.allocator.alloc(u8, max_line_px / 2);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'm');
+    win.drawText(0, 0, huge, size, white, .left, .regular);
+    try std.testing.expectEqual(@as(u32, 1), win.text_misses.count());
+    var it = win.text_misses.valueIterator();
+    try std.testing.expectEqual(TextMiss.never, it.next().?.retry_at);
+    // A transient failure (here: the miss table says so) is tried again once it is due.
+    var key_it = win.text_misses.keyIterator();
+    const key = key_it.next().?.*;
+    win.text_misses.getPtr(key).?.retry_at = win.frame + 1;
+    win.frame += 1;
+    win.drawText(0, 0, huge, size, white, .left, .regular);
+    try std.testing.expectEqual(TextMiss.never, win.text_misses.get(key).?.retry_at); // tried, and now permanent
+    try std.testing.expectEqual(@as(u8, 1), win.text_misses.get(key).?.tries);
+}
+
+test "R10: a failed icon render is reported once per icon" {
+    const win = try dummyWindow(.{ .title = "svg log", .width = 80, .height = 60 });
+    defer win.destroy();
+    const icon = try win.loadSvg("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\"/></svg>");
+    const e = win.svgs.getPtr(icon.id).?;
+    // Over the raster's side limit: refused.
+    try std.testing.expect(win.makeSvgTexture(icon.id, e, 5000, 1) == null);
+    try std.testing.expect(win.makeSvgTexture(icon.id, e, 5000, 2) == null);
+    try std.testing.expectEqual(@as(u32, 1), win.svg_failure_logs);
+    try std.testing.expect(win.makeSvgTexture(icon.id, e, 16, 16) != null);
+}
+
+test "clip rects: push and pop stay balanced past the depth, and odd numbers do not crash" {
+    const win = try dummyWindow(.{ .title = "clips", .width = 80, .height = 60 });
+    defer win.destroy();
+    const depth = win.clips.len;
+    for (0..depth + 4) |k| win.pushClip(.{ .x = @floatFromInt(k), .y = 0, .w = 50, .h = 50 });
+    try std.testing.expectEqual(depth, win.clip_n);
+    try std.testing.expectEqual(@as(usize, 4), win.clip_overflow);
+    for (0..4) |_| win.popClip();
+    // Back at the depth limit with the 16th clip in force, not the 15th.
+    try std.testing.expectEqual(depth, win.clip_n);
+    try std.testing.expectEqual(@as(f32, depth - 1), win.clips[depth - 1].x);
+    for (0..depth) |_| win.popClip();
+    try std.testing.expectEqual(@as(usize, 0), win.clip_n);
+    win.popClip(); // popping an empty stack is harmless
+    const inf = std.math.inf(f32);
+    win.pushClip(.{ .x = std.math.nan(f32), .y = -inf, .w = inf, .h = 1e30 });
+    win.pushClip(.{ .x = -1e30, .y = 0, .w = 1e30, .h = inf });
+    win.popClip();
+    win.popClip();
+    try std.testing.expectEqual(@as(usize, 0), win.clip_n);
+}
+
+test "R5: an infinite or NaN clip rectangle never widens what is drawn" {
+    const inf = std.math.inf(f32);
+    const a = Window.clipInts(.{ .x = 100, .y = 0, .w = inf, .h = 50 });
+    try std.testing.expectEqual(@as(c_int, 100), a.x);
+    try std.testing.expect(a.w > 0 and a.h == 50);
+    const b = Window.clipInts(.{ .x = -inf, .y = 0, .w = 10, .h = 10 });
+    try std.testing.expect(b.w >= 0 and b.x + b.w <= 11);
+    const n = Window.clipInts(.{ .x = std.math.nan(f32), .y = 0, .w = 10, .h = 10 });
+    try std.testing.expect(n.w == 0 and n.h == 0);
+    const m = Window.clipInts(.{ .x = -inf, .y = 0, .w = inf, .h = 10 }); // inf - inf
+    try std.testing.expect(m.w == 0 and m.h == 0);
+    const big = Window.clipInts(.{ .x = 5, .y = 5, .w = 1e30, .h = 1e30 });
+    try std.testing.expect(big.w > 0 and big.h > 0);
+}
+
+test "loadImageFile refuses a file over the size limit without reading it" {
+    const win = try dummyWindow(.{ .title = "big file", .width = 80, .height = 60 });
+    defer win.destroy();
+    var buf: [256]u8 = undefined;
+    const dir = std.mem.span(std.c.getenv("TMPDIR") orelse "/tmp");
+    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/vass-big-image-{d}.bin", .{ std.mem.trimEnd(u8, dir, "/"), std.c.getpid() }, 0);
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o600));
+    try std.testing.expect(fd >= 0); // the temp directory must be writable
+    defer _ = std.c.unlink(path.ptr);
+    // A sparse 16 TB file: reading it would need more memory than exists.
+    const rc = std.c.ftruncate(fd, 1 << 44);
+    _ = std.c.close(fd);
+    if (rc != 0) {
+        // Only a file system that cannot hold such a file excuses the test.
+        switch (std.posix.errno(rc)) {
+            .FBIG, .NOSPC, .INVAL, .OPNOTSUPP => return error.SkipZigTest,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectError(error.ImageTooLarge, win.loadImageFile(path));
+    try std.testing.expectError(error.FileReadFailed, win.loadImageFile("/tmp/vass-no-such-image.png"));
+    try std.testing.expectError(error.FileReadFailed, win.loadImageFile("/tmp")); // a directory
+}
+
+test "keypad Enter arrives as Return" {
+    var raw: [128]u8 = @splat(0);
+    std.mem.writeInt(u32, raw[16..20], 3, .little);
+    std.mem.writeInt(u32, raw[28..32], 0x40000058, .little); // SDLK_KP_ENTER
+    try std.testing.expectEqual(keys.@"return", decodeRaw(c.EVENT_KEY_DOWN, &raw).?.key_down.code);
+    try std.testing.expectEqual(keys.@"return", decodeRaw(c.EVENT_KEY_UP, &raw).?.key_up.code);
 }
 
 test "drop events decode, copying the path" {

@@ -75,6 +75,9 @@ const sdl = struct {
     extern fn SDL_GetAudioStreamData(s: *AudioStream, buf: *anyopaque, len: c_int) c_int;
     extern fn SDL_GetAudioStreamAvailable(s: *AudioStream) c_int;
     extern fn SDL_GetCurrentAudioDriver() ?[*:0]const u8;
+    const PathInfo = extern struct { kind: c_int, size: u64, create_time: i64, modify_time: i64, access_time: i64 };
+    const PATHTYPE_FILE: c_int = 1;
+    extern fn SDL_GetPathInfo(path: [*:0]const u8, info: *PathInfo) bool;
     extern fn SDL_LoadFile(file: [*:0]const u8, datasize: *usize) ?*anyopaque;
     extern fn SDL_SaveFile(file: [*:0]const u8, data: *const anyopaque, datasize: usize) bool;
     extern fn SDL_free(p: ?*anyopaque) void;
@@ -209,6 +212,18 @@ const Recording = struct {
     }
 };
 
+/// Frames a recording may keep: `max_seconds` (at least 0.1; NaN counts as the floor), but
+/// never more than a sound may hold. Infinity and absurd values mean "as much as allowed".
+fn recordingCapFrames(max_seconds: f32, rate: u32, ch: u8) usize {
+    const limit: usize = pcm_mod.max_bytes / @sizeOf(f32) / ch;
+    const max_f: f64 = @as(f64, @max(max_seconds, 0.1)) * @as(f64, @floatFromInt(rate));
+    if (max_f >= @as(f64, @floatFromInt(limit))) return limit;
+    return @intFromFloat(max_f);
+}
+
+/// Largest audio file `loadSoundFile` reads.
+const max_file_bytes = 256 * 1024 * 1024;
+
 pub const Audio = struct {
     gpa: std.mem.Allocator,
     shared: *Shared,
@@ -311,10 +326,15 @@ pub const Audio = struct {
     pub fn loadSoundFile(a: *Audio, path: []const u8) LoadError!Sound {
         const z = a.gpa.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
         defer a.gpa.free(z);
+        // Ask for the size first: `SDL_LoadFile` reads everything before it returns. Devices
+        // and pipes report no size, so only regular files are read.
+        var info: sdl.PathInfo = undefined;
+        if (!sdl.SDL_GetPathInfo(z.ptr, &info) or info.kind != sdl.PATHTYPE_FILE) return error.FileReadFailed;
+        if (info.size > max_file_bytes) return error.FileTooLarge;
         var size: usize = 0;
         const raw = sdl.SDL_LoadFile(z.ptr, &size) orelse return error.FileReadFailed;
         defer sdl.SDL_free(raw);
-        if (size > 256 * 1024 * 1024) return error.FileTooLarge;
+        if (size > max_file_bytes) return error.FileTooLarge; // it grew since the check
         return a.loadSound(@as([*]const u8, @ptrCast(raw))[0..size]);
     }
 
@@ -580,8 +600,7 @@ pub const Audio = struct {
             list.deinit(a.gpa);
             return error.NoDevice;
         }
-        const max_f: f64 = @as(f64, @max(opts.max_seconds, 0.1)) * @as(f64, @floatFromInt(rate));
-        const cap_frames: usize = @min(@as(usize, @intFromFloat(max_f)), pcm_mod.max_bytes / @sizeOf(f32) / ch);
+        const cap_frames = recordingCapFrames(opts.max_seconds, rate, ch);
         a.rec = .{
             .stream = st,
             .sample_rate = rate,
@@ -848,4 +867,64 @@ test "opt-in: the real output device opens and takes silent audio (VASS_AUDIO_RE
     std.debug.print("driver={s} position={d:.3}\n", .{ a.driverName().?, a.position(v) });
     try testing.expect(a.position(v) > 0.05);
     a.stop(v);
+}
+
+test "recording: a huge or non-finite time limit is clamped, not converted" {
+    try testing.expectEqual(@as(usize, 100 * 8000), recordingCapFrames(100, 8000, 1));
+    try testing.expectEqual(@as(usize, 800), recordingCapFrames(0, 8000, 1)); // floor of 0.1 s
+    try testing.expectEqual(@as(usize, 800), recordingCapFrames(std.math.nan(f32), 8000, 1));
+    const limit = pcm_mod.max_bytes / @sizeOf(f32);
+    try testing.expectEqual(limit, recordingCapFrames(std.math.inf(f32), 8000, 1));
+    try testing.expectEqual(limit / 2, recordingCapFrames(3.0e38, 96000, 2));
+    // And through the real entry point (dummy microphone).
+    var a = Audio.init(testing.allocator, .{ .driver = "dummy" });
+    defer a.deinit();
+    try a.startRecording(.{ .sample_rate = 16000, .channels = 2, .max_seconds = std.math.inf(f32) });
+    try testing.expectEqual(limit / 2, a.rec.?.max_frames);
+    a.cancelRecording();
+}
+
+test "stopping a paused voice while the idle output is paused leaves nothing busy" {
+    var a = Audio.init(testing.allocator, .{ .driver = "dummy" });
+    defer a.deinit();
+    const t = try tone(testing.allocator, 440, 2, 8000);
+    defer testing.allocator.free(t);
+    const s = try a.soundFromSamples(t, 8000, 1);
+    const v = try a.play(s, .{ .volume = 0.5 });
+    a.pause(v);
+    sdl.SDL_Delay(80); // the fade-out takes a few ms
+    try testing.expectEqual(VoiceState.paused, a.voiceState(v));
+    try testing.expectEqual(@as(@TypeOf(a.shared.mixer.slots[0].phase), .paused), a.shared.mixer.slots[v.slot].phase);
+    // What `update` does after two quiet seconds: the device stops asking for data.
+    _ = sdl.SDL_PauseAudioStreamDevice(a.play_stream.?);
+    a.play_running = false;
+    a.stop(v);
+    try testing.expect(!a.busy());
+    try testing.expectEqual(@as(usize, 0), a.activeVoices());
+    // The same through stopAll.
+    const v2 = try a.play(s, .{ .volume = 0.5 });
+    a.pause(v2);
+    sdl.SDL_Delay(80);
+    try testing.expectEqual(@as(@TypeOf(a.shared.mixer.slots[0].phase), .paused), a.shared.mixer.slots[v2.slot].phase);
+    _ = sdl.SDL_PauseAudioStreamDevice(a.play_stream.?);
+    a.play_running = false;
+    a.stopAll();
+    try testing.expect(!a.busy());
+    try testing.expectEqual(@as(usize, 0), a.activeVoices());
+}
+
+test "a file over the size limit is refused before any of it is read" {
+    var a = Audio.init(testing.allocator, .{ .driver = "dummy" });
+    defer a.deinit();
+    var buf: [256]u8 = undefined;
+    const dir = std.mem.span(std.c.getenv("TMPDIR") orelse "/tmp");
+    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/vass-audio-big-{d}.wav", .{ std.mem.trimEnd(u8, dir, "/"), std.c.getpid() }, 0);
+    // A sparse 257 MB file that nobody may read: only a size check can say what is wrong with
+    // it (reading it first would report a read failure).
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(c_uint, 0));
+    try testing.expect(fd >= 0);
+    defer _ = std.c.unlink(path.ptr);
+    try testing.expectEqual(@as(c_int, 0), std.c.ftruncate(fd, 257 * 1024 * 1024));
+    _ = std.c.close(fd);
+    try testing.expectError(error.FileTooLarge, a.loadSoundFile(path));
 }

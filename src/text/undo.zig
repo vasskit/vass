@@ -122,7 +122,8 @@ pub const History = struct {
         h.open = false;
     }
 
-    fn clearRedo(h: *History, gpa: std.mem.Allocator) void {
+    /// Forgets the undone steps (the undo steps stay).
+    pub fn dropRedo(h: *History, gpa: std.mem.Allocator) void {
         for (h.redo_stack.items) |en| {
             h.bytes -= en.data.len;
             gpa.free(en.data);
@@ -160,7 +161,7 @@ pub const History = struct {
     /// the redo stack. Never fails: if memory runs out the history is dropped.
     pub fn record(h: *History, gpa: std.mem.Allocator, d: Delta, now: f64) void {
         if (d.removed.len == 0 and d.inserted.len == 0) return;
-        h.clearRedo(gpa);
+        h.dropRedo(gpa);
         if (h.undo_stack.items.len > 0) {
             const top = &h.undo_stack.items[h.undo_stack.items.len - 1];
             if (h.continues(top.*, d, now)) {

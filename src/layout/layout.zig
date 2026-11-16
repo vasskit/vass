@@ -139,7 +139,8 @@ pub const Opts = struct {
     min_h: f32 = 0,
     max_h: f32 = inf,
     /// Width divided by height. Derives the height from the width when `h` is `.hug`, and
-    /// the width from a `.fixed` height when `w` is `.hug`. Such a node is not stretched.
+    /// the width from a `.fixed` height when `w` is `.hug`. Such a node is not stretched, except
+    /// across a column, where a `.grow` width takes the column's width and the height follows.
     aspect: ?f32 = null,
     /// How much this node may shrink (relative to its size) when its siblings overflow the
     /// main axis; 0 means never. It does not go below `min_w`/`min_h`.
@@ -613,7 +614,8 @@ pub const Layout = struct {
             const ce = &items[c];
             initItem(ce, ax, inner_len, bounded);
             if (wrap) {
-                const hyp = if (ce.sz[ax].kind == .grow) @max(ce.base, ce.nat[ax]) else ce.base;
+                // The size it would get on a line of its own, min and max applied.
+                const hyp = if (ce.sz[ax].kind == .grow) @max(ce.tmp, ce.nat[ax]) else ce.tmp;
                 if (in_line > 0 and acc + gap + hyp > inner_len + eps) {
                     line += 1;
                     acc = 0;
@@ -761,7 +763,10 @@ pub const Layout = struct {
             while (k != stop) : (k = l.nextFlow(items[k].next)) {
                 const ce = &items[k];
                 const a = ce.o.align_self orelse e.o.cross;
-                const stretchable = ce.o.aspect == null and (ce.sz[ax].kind == .grow or ((ce.sz[ax].kind == .hug or ce.sz[ax].kind == .measured) and a == .stretch));
+                // An `aspect` node keeps its own size, unless its width is `.grow` in a column (the
+                // height is then derived from the width the column gives it).
+                const grows = ce.sz[ax].kind == .grow and (ce.o.aspect == null or ax == 0);
+                const stretchable = grows or (ce.o.aspect == null and (ce.sz[ax].kind == .hug or ce.sz[ax].kind == .measured) and a == .stretch);
                 var s = crossPref(ce, ax, inner_len, bounded);
                 if (stretchable) {
                     s = clampAx(ce, ax, line_len);
@@ -838,16 +843,28 @@ fn flat(dir: Dir, area: Rect, opts: Opts, sizes: []const Size, out: []Rect) void
     o.max_h = inf;
     o.scroll = .none;
     o.position = .flow;
-    _ = lay.begin(o);
     misuse(sizes.len <= max_sugar_items);
     misuse(out.len == sizes.len); // a length mismatch is a caller bug: loud in Debug, tolerated otherwise
     const n = @min(sizes.len, max_sugar_items);
     var nodes: [max_sugar_items]Node = undefined;
-    for (sizes[0..n], 0..) |s, i| {
-        nodes[i] = lay.leaf(if (dir == .row) .{ .w = s, .h = .grow(1) } else .{ .w = .grow(1), .h = s });
+    // A wrapped line is as tall as its tallest item (0 for `.grow`), so the items get a height
+    // of their own: all of `area` first, then, if that made several lines, the lines' share of it.
+    const wraps = dir == .row and opts.wrap;
+    var line_h: f32 = area.h;
+    var pass: u32 = 0;
+    while (true) : (pass += 1) {
+        lay.reset();
+        _ = lay.begin(o);
+        for (sizes[0..n], 0..) |s, i| {
+            nodes[i] = lay.leaf(if (dir == .row) .{ .w = s, .h = if (wraps) .fixed(line_h) else .grow(1) } else .{ .w = .grow(1), .h = s });
+        }
+        lay.end();
+        lay.solve(area);
+        if (!wraps or pass > 0 or n == 0) break;
+        const lines: f32 = @floatFromInt(@max(1, lay.nodes.items[0].lines));
+        if (lines <= 1) break;
+        line_h = @max(0, (area.h - (opts.line_gap orelse opts.gap) * (lines - 1)) / lines);
     }
-    lay.end();
-    lay.solve(area);
     for (out, 0..) |*r, i| r.* = if (i < n) lay.rect(nodes[i]) else .{ .x = area.x, .y = area.y, .w = 0, .h = 0 };
 }
 
@@ -1402,4 +1419,42 @@ fn checkNode(lay: *const Layout, idx: usize) !void {
         const inside = cr.x >= r.x and cr.y >= r.y and cr.x + cr.w <= r.x + r.w and cr.y + cr.h <= r.y + r.h;
         if (!inside) try testing.expect(ov.w > 0 or ov.h > 0);
     }
+}
+
+// ---- audit fixes -------------------------------------------------------------------------
+
+test "P8: row and col sugar with wrap give each line a share of the area, not zero height" {
+    var out: [2]Rect = undefined;
+    row(.{ .x = 0, .y = 0, .w = 100, .h = 40 }, .{ .wrap = true }, &.{ fixed(60), fixed(60) }, &out);
+    try testing.expect(out[0].h > 0 and out[1].h > 0);
+    try expectRect(r4(0, 0, 60, 20), out[0]);
+    try expectRect(r4(0, 20, 60, 20), out[1]);
+    // One line: as tall as the area, as before.
+    row(.{ .x = 0, .y = 0, .w = 200, .h = 40 }, .{ .wrap = true }, &.{ fixed(60), fixed(60) }, &out);
+    try expectRect(r4(0, 0, 60, 40), out[0]);
+    try expectRect(r4(60, 0, 60, 40), out[1]);
+}
+
+test "P9: a grow-width aspect leaf in a column takes the column's width and derives its height" {
+    var lay = Layout.init(testing.allocator);
+    defer lay.deinit();
+    _ = lay.begin(.{ .dir = .col, .w = .grow(1), .h = .grow(1) });
+    const a = lay.leaf(.{ .w = .grow(1), .aspect = 16.0 / 9.0 });
+    lay.end();
+    lay.solve(.{ .x = 0, .y = 0, .w = 160, .h = 300 });
+    try expectRect(r4(0, 0, 160, 90), lay.rect(a));
+}
+
+test "P10: line breaking uses the sizes after min and max" {
+    var lay = Layout.init(testing.allocator);
+    defer lay.deinit();
+    _ = lay.begin(.{ .dir = .row, .wrap = true, .w = .fixed(200), .h = .hug });
+    const a = lay.leaf(.{ .w = .fixed(50), .min_w = 90, .h = .fixed(10) });
+    _ = lay.leaf(.{ .w = .fixed(50), .min_w = 90, .h = .fixed(10) });
+    const c = lay.leaf(.{ .w = .fixed(50), .min_w = 90, .h = .fixed(10) });
+    lay.end();
+    lay.solve(.{ .x = 0, .y = 0, .w = 200, .h = 100 });
+    try expectEqual(@as(f32, 0), lay.rect(a).y);
+    try expectEqual(@as(f32, 10), lay.rect(c).y);
+    try expectEqual(@as(f32, 90), lay.rect(c).w);
 }

@@ -14,11 +14,17 @@
 //!
 //! **Input.** A popup is declared after the widgets it covers, so those widgets cannot know
 //! about it yet. Each popup therefore records its rectangle in `State.popups`, and `Ui.finish`
-//! keeps last frame's list. `Ui.hit` ignores the pointer inside a rectangle of a layer above the
-//! one being drawn (and everywhere, below a modal popup). A mouse press, key press or typed text
+//! keeps last frame's list. `Ui.hit` ignores the pointer inside a rectangle of a popup above the
+//! one being drawn (and everywhere, below a modal popup). "Above" is draw order: a higher layer,
+//! or the same layer declared later in the frame (two sibling popups: the later one is on top). A mouse press, key press or typed text
 //! is not delivered to layers below an open popup (`Ui.pressedNow`, `Ui.events`). A press outside
 //! every open popup closes it (when `dismiss_on_outside`) and is swallowed; Escape closes the
 //! topmost popup and is consumed.
+//!
+//! **Nesting.** A popup drawn inside another's `beginPopup`...`endPopup` is its child and closes
+//! with it. The link is rebuilt every frame from what was drawn: `PopupState.child` is cleared
+//! when the parent ends a frame without drawing it, and closing never follows a link older than
+//! the previous frame. See `PopupState` for when a state may be freed.
 //!
 //! Popups need `ui.state` (a caller-owned `State`) and a `ui.finish()` call at the end of every
 //! frame; without a state they still draw but route no input.
@@ -32,6 +38,7 @@ const icons = @import("icons.zig");
 const keys = @import("../core/keys.zig");
 const ui_mod = @import("ui.zig");
 const focus = @import("focus.zig");
+const split = @import("split.zig");
 const Rect = geom.Rect;
 const Color = geom.Color;
 const Ui = ui_mod.Ui;
@@ -78,6 +85,16 @@ pub const PopupOpts = struct {
 };
 
 /// Caller-owned state of one popup: keep it at a stable address.
+///
+/// Lifetime. The library never reads a state it was not handed in the current call, with one
+/// exception: a parent follows its `child` link to close the chain. So:
+/// - Close with `Ui.closePopup` (or let the popup close itself), not by writing `open`: only
+///   closing through the library tells the input routing that the popup is gone and unlinks it.
+/// - Once a closing call has returned (`closePopup`, or a `menu` / `dropdown` that reported an
+///   item, which closes before returning) the state may be freed at once, even in the same frame.
+/// - A state that is still open may be freed only after a frame in which it was not drawn (its
+///   parent drops the link then); freeing an open child between its parent's frame and the next
+///   close of that parent is not supported.
 pub const PopupState = struct {
     open: bool = false,
     /// Set by `openPopup`, cleared by the first `beginPopup` that sees it: that frame's pointer
@@ -93,8 +110,15 @@ pub const PopupState = struct {
     /// Where it was opened by `contextOpen`.
     point: [2]f32 = .{ 0, 0 },
     last_mouse: [2]f32 = .{ std.math.nan(f32), 0 },
-    /// The popup most recently drawn inside this one, closed together with it.
+    /// The popup drawn inside this one in the frame `child_frame` (see `State.frames`), closed
+    /// together with it. Cleared when a frame of this popup ends without drawing it; do not
+    /// dereference it outside that frame, the state may be gone.
     child: ?*PopupState = null,
+    child_frame: u64 = 0,
+    /// The popup this one was drawn inside, while linked from it (so a close can unlink it).
+    up: ?*PopupState = null,
+    /// The layer it was last drawn on (1 until then).
+    layer: u8 = 1,
     /// Keyboard focus when it was opened, given back when it closes (see `openPopup`).
     return_focus: ?*const anyopaque = null,
     has_return: bool = false,
@@ -105,10 +129,13 @@ pub const PopupState = struct {
     }
 };
 
-/// A popup drawn this frame or last: where, and how it takes input.
-pub const Rec = struct { rect: Rect, layer: u8, modal: bool, swallow: bool };
+/// A popup drawn this frame or last: where, and how it takes input. `order` is its position in
+/// the frame's declaration order (between popups of one layer, the later one is above). `owner`
+/// is the popup's state by address: compared, never dereferenced (the app may free it as soon as
+/// it is closed). `closed`: it was closed after being recorded, so it is dropped at `rotate`.
+pub const Rec = struct { rect: Rect, layer: u8, modal: bool, swallow: bool, order: u8 = 0, owner: ?*const anyopaque = null, closed: bool = false };
 
-pub const max_recs = 8;
+pub const max_recs = 16;
 
 /// Last frame's popup rectangles (`prev`, what input routing reads) and this frame's (`cur`).
 pub const Tracker = struct {
@@ -116,18 +143,55 @@ pub const Tracker = struct {
     prev_n: u8 = 0,
     cur: [max_recs]Rec = undefined,
     cur_n: u8 = 0,
+    /// Records offered this frame (also the ones that did not fit).
+    seq: u8 = 0,
+    /// Records that did not fit, ever. More than `max_recs` popups in one frame is a bug in the
+    /// caller; the tracker then keeps the topmost ones so that blocking stays on where it matters.
+    dropped: u32 = 0,
 
     pub fn record(t: *Tracker, rec: Rec) void {
+        var r = rec;
+        r.order = t.seq;
+        t.seq +|= 1;
         if (t.cur_n < max_recs) {
-            t.cur[t.cur_n] = rec;
+            t.cur[t.cur_n] = r;
             t.cur_n += 1;
+            return;
+        }
+        t.dropped +%= 1;
+        // Tests overflow it on purpose; a Debug app should hear about it.
+        if (@import("builtin").mode == .debug and !@import("builtin").is_test) std.debug.assert(false);
+        // Replace the lowest layer, but never a modal with a non-modal: a modal blocks the whole window.
+        var low: ?usize = null;
+        for (t.cur[0..t.cur_n], 0..) |c, i| {
+            if (c.modal and !r.modal) continue;
+            if (low == null or c.layer < t.cur[low.?].layer) low = i;
+        }
+        if (low) |l| if (r.layer >= t.cur[l].layer) {
+            t.cur[l] = r;
+        };
+    }
+
+    /// `owner` closed: its record of this frame (and those of the popups drawn inside it) no longer
+    /// count as of the next frame.
+    pub fn markClosed(t: *Tracker, owner: *const anyopaque) void {
+        for (t.cur[0..t.cur_n]) |*r| {
+            if (r.owner == owner) r.closed = true;
         }
     }
 
+    /// Makes this frame's records last frame's, leaving out popups that were closed during the
+    /// frame (their rectangle must not swallow input once they are gone).
     pub fn rotate(t: *Tracker) void {
-        t.prev = t.cur;
-        t.prev_n = t.cur_n;
+        var n: u8 = 0;
+        for (t.cur[0..t.cur_n]) |r| {
+            if (r.closed) continue;
+            t.prev[n] = r;
+            n += 1;
+        }
+        t.prev_n = n;
         t.cur_n = 0;
+        t.seq = 0;
     }
 
     pub fn last(t: *const Tracker) []const Rec {
@@ -142,6 +206,10 @@ pub const Frame = struct {
     saved_layer: u8,
     saved_clip_base: usize,
     saved_scroll_base: usize,
+    /// Position among this frame's popups (`Rec.order`).
+    order: u8,
+    /// A popup was drawn inside this one this frame.
+    child_drawn: bool = false,
 };
 
 // ---- input routing -------------------------------------------------------------------------
@@ -151,30 +219,67 @@ fn lastRecs(ui: *const Ui) []const Rec {
     return s.popups.last();
 }
 
-/// True if the pointer should not reach widgets of the layer being drawn: it is inside a popup
-/// of a higher layer as of last frame, or such a popup is modal.
+/// Where something is drawn in the stack of popups: the layer, and the order among the popups
+/// of that layer.
+const Pos = struct {
+    layer: u8,
+    order: u8,
+    /// The popup itself, whose own record from last frame is not "above" it.
+    self: ?*const anyopaque = null,
+};
+
+/// The place of what is being drawn now: the innermost open `beginPopup`, or the main stream.
+fn curPos(ui: *const Ui) Pos {
+    if (ui.popup_n == 0) return .{ .layer = ui.layer, .order = 0 };
+    const f = ui.popup_stack[ui.popup_n - 1];
+    return .{ .layer = ui.layer, .order = f.order, .self = f.st };
+}
+
+/// The order the popup about to be recorded gets (what `Tracker.record` assigns).
+fn nextPos(ui: *const Ui, layer: u8, st: *const PopupState) Pos {
+    const order: u8 = if (ui.state) |s| s.popups.seq else 0;
+    return .{ .layer = layer, .order = order, .self = st };
+}
+
+/// Orders are counted per frame, so a record of last frame is compared with this frame's position
+/// only for popups other than `pos.self`: when an earlier popup stops being drawn, a later one's own
+/// old record would otherwise look as if it were above it.
+fn isAbove(p: Rec, pos: Pos) bool {
+    if (pos.self != null and p.owner == pos.self) return false;
+    return p.layer > pos.layer or (p.layer == pos.layer and p.order > pos.order);
+}
+
+/// True if the pointer should not reach widgets of what is being drawn: it is inside a popup
+/// above it as of last frame, or such a popup is modal.
 pub fn pointerBlocked(ui: *const Ui) bool {
+    const pos = curPos(ui);
     for (lastRecs(ui)) |p| {
-        if (p.layer <= ui.layer) continue;
+        if (!isAbove(p, pos)) continue;
         if (p.modal or p.rect.contains(ui.input.mouse_x, ui.input.mouse_y)) return true;
     }
     return false;
 }
 
-/// True if a click or key of this frame belongs to a popup above layer `layer`.
-fn takenAbove(ui: *const Ui, layer: u8) bool {
+/// True if a click or key of this frame belongs to a popup above `pos`.
+fn takenAbove(ui: *const Ui, pos: Pos) bool {
     for (lastRecs(ui)) |p| {
-        if (p.layer > layer and p.swallow) return true;
+        if (isAbove(p, pos) and p.swallow) return true;
     }
     return false;
 }
 
 pub fn pressSwallowed(ui: *const Ui) bool {
-    return takenAbove(ui, ui.layer);
+    return takenAbove(ui, curPos(ui));
 }
 
 pub fn eventsFor(ui: *const Ui, layer: u8) []const ui_mod.InEvent {
-    if (takenAbove(ui, layer)) return &.{};
+    var pos = curPos(ui);
+    pos.layer = layer;
+    return eventsAt(ui, pos);
+}
+
+fn eventsAt(ui: *const Ui, pos: Pos) []const ui_mod.InEvent {
+    if (takenAbove(ui, pos)) return &.{};
     return ui.input.events();
 }
 
@@ -182,9 +287,9 @@ pub fn anyOpen(ui: *const Ui) bool {
     return ui.popup_n > 0 or lastRecs(ui).len > 0;
 }
 
-fn insideAbove(ui: *const Ui, layer: u8, x: f32, y: f32) bool {
+fn insideAbove(ui: *const Ui, pos: Pos, x: f32, y: f32) bool {
     for (lastRecs(ui)) |p| {
-        if (p.layer > layer and p.rect.contains(x, y)) return true;
+        if (isAbove(p, pos) and p.rect.contains(x, y)) return true;
     }
     return false;
 }
@@ -266,6 +371,7 @@ pub fn openPopup(ui: *Ui, st: *PopupState) void {
     st.serial +%= 1;
     st.highlight = null;
     st.scroll = 0;
+    st.child = null;
     st.last_mouse = .{ std.math.nan(f32), 0 };
     st.parent_serial = if (ui.popup_n > 0) ui.popup_stack[ui.popup_n - 1].st.serial else 0;
     // Remember what had keyboard focus, to give it back on close.
@@ -275,42 +381,59 @@ pub fn openPopup(ui: *Ui, st: *PopupState) void {
     }
 }
 
-/// Closes `st` and any popup opened from inside it.
+/// Closes `st` and any popup opened from inside it. Every close goes through here or `closeSelf`.
 pub fn closePopup(ui: *Ui, st: *PopupState) void {
-    for (ui.popup_stack[0..ui.popup_n], 0..) |f, i| {
-        if (f.st == st and i > 0 and ui.popup_stack[i - 1].st.child == st) ui.popup_stack[i - 1].st.child = null;
-    }
     closeTree(ui, st);
+}
+
+/// Whether the focus a popup remembered should be given back as it closes: only when nothing has
+/// focus or the focused widget was declared inside that popup (not in another popup of the same
+/// layer, nor below).
+fn focusReturns(ui: *const Ui, st: *const PopupState) bool {
+    const s = ui.state orelse return false;
+    if (s.focus == null) return true;
+    const owner = focus.focusPopup(s) orelse return false;
+    return owner == @as(*const anyopaque, st);
 }
 
 fn closeTree(ui: *Ui, st: *PopupState) void {
     st.open = false;
     st.fresh = false;
+    if (ui.state) |s| s.popups.markClosed(st);
+    if (st.up) |p| {
+        if (p.child == st) p.child = null;
+        st.up = null;
+    }
     if (st.child) |c| {
         st.child = null;
-        if (c.open) closeTree(ui, c);
+        // A link that was not refreshed in this or the last frame may point at a state that is gone.
+        const fresh_link = if (ui.state) |s| st.child_frame +| 1 >= s.frames else true;
+        if (fresh_link and c.open) closeTree(ui, c);
     }
     // Focus goes back to what had it before the popup opened (children first, so the
     // outermost popup's value wins).
     if (st.has_return) {
         st.has_return = false;
-        if (ui.state) |s| s.focus = st.return_focus;
+        if (ui.state) |s| if (focusReturns(ui, st)) {
+            s.focus = st.return_focus;
+        };
     }
 }
 
 /// `st` closes itself from inside its own `beginPopup` (Escape, outside press, stale).
 fn closeSelf(ui: *Ui, st: *PopupState) void {
-    if (ui.popup_n > 0) {
-        const parent = ui.popup_stack[ui.popup_n - 1].st;
-        if (parent.child == st) parent.child = null;
-    }
     closeTree(ui, st);
 }
 
 pub fn beginPopup(ui: *Ui, st: *PopupState, anchor: Rect, size: [2]f32, opts: PopupOpts) ?Rect {
     if (!st.open) return null;
-    if (ui.popup_n >= max_depth) return null;
     const layer: u8 = @intCast(ui.popup_n + 1);
+    st.layer = layer;
+    if (ui.popup_n >= max_depth) {
+        // Nowhere to draw it: do not stay open, unseen and unlinked.
+        closeSelf(ui, st);
+        return null;
+    }
     // Tab is handled (and removed from the events) even if no widget has been drawn yet.
     if (ui.state) |s| focus.frameBegin(ui, s);
 
@@ -332,11 +455,12 @@ pub fn beginPopup(ui: *Ui, st: *PopupState, anchor: Rect, size: [2]f32, opts: Po
     const h = @min(size[1], @max(0, bounds.h - 2 * edge_margin));
     const rect = place(anchor, w, h, opts.placement, opts.alignment, opts.gap, bounds);
     const swallow = opts.modal or opts.dismiss_on_outside;
+    const pos = nextPos(ui, layer, st);
 
     if (!fresh) {
         const in = &ui.input;
-        // Escape: the topmost popup only (the events of a layer under an open popup are empty).
-        const evs = eventsFor(ui, layer);
+        // Escape: the topmost popup only (the events of a popup under an open one are empty).
+        const evs = eventsAt(ui, pos);
         for (evs, 0..) |ev, i| switch (ev) {
             .key => |k| if (k.code == keys.escape) {
                 in.removeEvent(i);
@@ -345,19 +469,25 @@ pub fn beginPopup(ui: *Ui, st: *PopupState, anchor: Rect, size: [2]f32, opts: Po
             },
             else => {},
         };
-        // A press outside this popup and every popup opened from it.
+        // A press outside this popup and every popup above it.
         if ((in.pressed or in.right_pressed) and opts.dismiss_on_outside and !rect.contains(in.mouse_x, in.mouse_y) and
-            !insideAbove(ui, layer, in.mouse_x, in.mouse_y))
+            !insideAbove(ui, pos, in.mouse_x, in.mouse_y))
         {
             closeSelf(ui, st);
             return null;
         }
     }
 
-    if (ui.popup_n > 0) ui.popup_stack[ui.popup_n - 1].st.child = st;
-    if (ui.state) |s| s.popups.record(.{ .rect = rect, .layer = layer, .modal = opts.modal, .swallow = swallow });
+    if (ui.popup_n > 0) {
+        const parent = &ui.popup_stack[ui.popup_n - 1];
+        parent.st.child = st;
+        st.up = parent.st;
+        parent.child_drawn = true;
+        if (ui.state) |s| parent.st.child_frame = s.frames;
+    }
+    if (ui.state) |s| s.popups.record(.{ .rect = rect, .layer = layer, .modal = opts.modal, .swallow = swallow, .owner = st });
 
-    ui.popup_stack[ui.popup_n] = .{ .st = st, .rect = rect, .saved_layer = ui.layer, .saved_clip_base = ui.clip_base, .saved_scroll_base = ui.scroll_base };
+    ui.popup_stack[ui.popup_n] = .{ .st = st, .rect = rect, .saved_layer = ui.layer, .saved_clip_base = ui.clip_base, .saved_scroll_base = ui.scroll_base, .order = pos.order };
     ui.popup_n += 1;
     ui.layer = layer;
     ui.clip_base = ui.clip_n;
@@ -380,6 +510,8 @@ pub fn endPopup(ui: *Ui) void {
     if (ui.popup_n == 0) return;
     ui.popup_n -= 1;
     const f = ui.popup_stack[ui.popup_n];
+    // The child link lives only as long as the child keeps being drawn.
+    if (!f.child_drawn) f.st.child = null;
     ui.layer = f.saved_layer;
     ui.clip_base = f.saved_clip_base;
     ui.scroll_base = f.saved_scroll_base;
@@ -391,6 +523,7 @@ pub fn finish(ui: *Ui) void {
     std.debug.assert(ui.popup_n == 0);
     if (ui.state) |s| {
         s.popups.rotate();
+        split.finish(s, &ui.input);
         focus.rotate(s, true);
         s.tip.waiting = s.tip.waiting_next;
         s.tip.waiting_next = false;
@@ -450,7 +583,8 @@ fn enabled(it: MenuItem) bool {
 /// starts from the outside. No wrapping. Null if there is none.
 pub fn stepEnabled(items: []const MenuItem, from: ?usize, dir: i32) ?usize {
     if (items.len == 0) return null;
-    var i: isize = if (from) |f| @intCast(f) else if (dir > 0) -1 else @intCast(items.len);
+    // A `from` past the end (the list shrank) counts as the end.
+    var i: isize = if (from) |f| @intCast(@min(f, items.len)) else if (dir > 0) -1 else @intCast(items.len);
     const d: isize = if (dir > 0) 1 else -1;
     while (true) {
         i += d;
@@ -528,6 +662,10 @@ pub fn menu(ui: *Ui, st: *PopupState, anchor: Rect, items: []const MenuItem, opt
     }) orelse return null;
     defer endPopup(ui);
 
+    // The list may have shrunk or changed since the highlight was set.
+    if (st.highlight) |h| if (h >= items.len) {
+        st.highlight = null;
+    };
     var result: ?usize = null;
     var total_h: f32 = 0;
     for (items) |it| total_h += itemH(it, opts);
@@ -655,7 +793,7 @@ pub fn dropdown(ui: *Ui, r: Rect, st: *DropdownState, items: []const []const u8,
     const id: *const anyopaque = st;
     const size = opts.size orelse t.font_body;
     var changed = false;
-    if (opts.disabled and st.popup.open) st.popup.open = false;
+    if (opts.disabled and st.popup.open) closePopup(ui, &st.popup);
     const hv = if (opts.disabled) ui_mod.Interaction{ .hovered = false, .clicked = false } else ui.hit(r);
     // A Tab stop; the dropdown handles the mouse and its keys itself.
     _ = ui.focusable(focus.idOfPtr(id), r, .{ .role = .dropdown, .label = if (items.len > 0 and selected.* < items.len) items[selected.*] else opts.placeholder, .disabled = opts.disabled, .ring = false, .activate = false, .click_focus = false });
@@ -1709,4 +1847,412 @@ test "two windows: a popup open in one does not block, close or steal input from
         b.end(&ub);
     }
     try testing.expect(pst.open);
+}
+
+// ---- audit fixes ---------------------------------------------------------------------------------
+
+test "P1: a highlight past the end of a shrunk list is dropped; arrows and Home do not index out of bounds" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st: PopupState = .{};
+    const anchor: Rect = .{ .x = 20, .y = 20, .w = 60, .h = 24 };
+    {
+        var u = rig.ui();
+        u.openPopup(&st);
+        u.finish();
+    }
+    _ = menuFrame(&rig, &st, anchor, &test_items); // fresh
+    const short = test_items[0..2]; // Cut, Copy (disabled)
+    for ([_]u32{ keys.down, keys.up, keys.home, keys.end, keys.@"return" }) |code| {
+        st.highlight = 4;
+        rig.key(code);
+        _ = menuFrame(&rig, &st, anchor, short);
+        if (st.highlight) |h| try testing.expect(h < short.len);
+        // And with nothing in it at all.
+        st.highlight = 3;
+        rig.key(code);
+        const got = menuFrame(&rig, &st, anchor, &[_]MenuItem{});
+        try testing.expectEqual(@as(?usize, null), got);
+        try testing.expectEqual(@as(?usize, null), st.highlight);
+    }
+    st.highlight = 4;
+    rig.key(keys.down);
+    _ = menuFrame(&rig, &st, anchor, short);
+    try testing.expectEqual(@as(?usize, 0), st.highlight);
+}
+
+test "P1: a dropdown whose list shrinks while it is open, and one with no items, stay in bounds" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st: DropdownState = .{};
+    var sel: usize = 3;
+    const r: Rect = .{ .x = 20, .y = 20, .w = 120, .h = 28 };
+    const four = [_][]const u8{ "a", "b", "c", "d" };
+    const frame = struct {
+        fn run(rg: *Rig, rr: Rect, s: *DropdownState, items: []const []const u8, v: *usize) void {
+            var u = rg.ui();
+            _ = u.dropdown(rr, s, items, v, .{});
+            rg.end(&u);
+        }
+    }.run;
+    {
+        var u = rig.ui();
+        u.openPopup(&st.popup);
+        u.finish();
+    }
+    frame(&rig, r, &st, &four, &sel);
+    frame(&rig, r, &st, &four, &sel);
+    rig.key(keys.down);
+    frame(&rig, r, &st, four[0..1], &sel); // selected (3) is now out of range
+    rig.key(keys.up);
+    frame(&rig, r, &st, &[_][]const u8{}, &sel);
+    rig.key(keys.down);
+    frame(&rig, r, &st, &[_][]const u8{}, &sel);
+}
+
+fn twoSiblings(rig: *Rig, a: *PopupState, b: *PopupState, hit_a: *bool, hit_b: *bool) void {
+    var u = rig.ui();
+    if (u.beginPopup(a, .{ .x = 20, .y = 20, .w = 60, .h = 24 }, .{ 160, 120 }, .{})) |c| {
+        hit_a.* = u.hit(c).clicked;
+        u.endPopup();
+    }
+    if (u.beginPopup(b, .{ .x = 60, .y = 20, .w = 60, .h = 24 }, .{ 160, 120 }, .{})) |c| {
+        hit_b.* = u.hit(c).clicked;
+        u.endPopup();
+    }
+    rig.end(&u);
+}
+
+test "P4: of two overlapping popups at one depth the later one gets the click and the Escape" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var a: PopupState = .{ .open = true, .fresh = true };
+    var b: PopupState = .{ .open = true, .fresh = true };
+    var ha = false;
+    var hb = false;
+    twoSiblings(&rig, &a, &b, &ha, &hb);
+    twoSiblings(&rig, &a, &b, &ha, &hb);
+    rig.click(100, 100); // inside both
+    twoSiblings(&rig, &a, &b, &ha, &hb);
+    try testing.expect(!ha and hb);
+    try testing.expect(a.open and b.open);
+    rig.key(keys.escape);
+    twoSiblings(&rig, &a, &b, &ha, &hb);
+    try testing.expect(a.open and !b.open);
+}
+
+test "P5: a child that stopped being drawn and was freed is not touched when the parent closes" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var parent: PopupState = .{};
+    const child = try testing.allocator.create(PopupState);
+    child.* = .{};
+    var freed = false;
+    defer if (!freed) testing.allocator.destroy(child);
+    const anchor: Rect = .{ .x = 20, .y = 20, .w = 60, .h = 24 };
+    const frame = struct {
+        fn run(r: *Rig, p: *PopupState, c: *PopupState, draw_child: bool, a: Rect) void {
+            var u = r.ui();
+            if (u.beginPopup(p, a, .{ 200, 120 }, .{})) |content| {
+                if (draw_child) if (u.beginPopup(c, content, .{ 80, 50 }, .{ .placement = .right })) |_| u.endPopup();
+                u.endPopup();
+            }
+            r.end(&u);
+        }
+    }.run;
+    parent.open = true;
+    parent.fresh = true;
+    child.open = true;
+    child.fresh = true;
+    frame(&rig, &parent, child, true, anchor);
+    frame(&rig, &parent, child, true, anchor);
+    try testing.expect(parent.child == child);
+    // The child is no longer drawn: the parent lets go of it, then it is freed.
+    frame(&rig, &parent, child, false, anchor);
+    try testing.expect(parent.child == null);
+    testing.allocator.destroy(child);
+    freed = true;
+    rig.key(keys.escape);
+    frame(&rig, &parent, undefined, false, anchor);
+    try testing.expect(!parent.open);
+}
+
+test "P5: a link older than the last frame is not followed by a close from outside a frame" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var parent: PopupState = .{};
+    const child = try testing.allocator.create(PopupState);
+    child.* = .{};
+    const anchor: Rect = .{ .x = 20, .y = 20, .w = 60, .h = 24 };
+    parent.open = true;
+    parent.fresh = true;
+    child.open = true;
+    child.fresh = true;
+    for (0..2) |_| {
+        var u = rig.ui();
+        if (u.beginPopup(&parent, anchor, .{ 200, 120 }, .{})) |content| {
+            if (u.beginPopup(child, content, .{ 80, 50 }, .{ .placement = .right })) |_| u.endPopup();
+            u.endPopup();
+        }
+        rig.end(&u);
+    }
+    // The whole subtree stops being drawn for a few frames (the parent is not even called), then
+    // the child is freed while the parent is still flagged open.
+    for (0..3) |_| {
+        var u = rig.ui();
+        rig.end(&u);
+    }
+    testing.allocator.destroy(child);
+    var u = rig.ui();
+    u.closePopup(&parent);
+    rig.end(&u);
+    try testing.expect(!parent.open);
+}
+
+test "P6 (popup side): a popup closed by Escape gives focus back when focus is inside it" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st: PopupState = .{};
+    const opener: *const anyopaque = focus.ptrOfId(5);
+    const anchor: Rect = .{ .x = 20, .y = 20, .w = 60, .h = 24 };
+    const frame = struct {
+        fn run(r: *Rig, p: *PopupState, a: Rect) void {
+            var u = r.ui();
+            _ = u.focusable(5, a, .{});
+            if (u.beginPopup(p, a, .{ 100, 60 }, .{})) |c| {
+                _ = u.focusable(77, c, .{});
+                u.endPopup();
+            }
+            r.end(&u);
+        }
+    }.run;
+    frame(&rig, &st, anchor);
+    rig.state.focus = opener;
+    {
+        var u = rig.ui();
+        u.openPopup(&st);
+        u.finish();
+    }
+    frame(&rig, &st, anchor);
+    frame(&rig, &st, anchor);
+    rig.state.focus = focus.ptrOfId(77);
+    frame(&rig, &st, anchor);
+    rig.key(keys.escape);
+    frame(&rig, &st, anchor);
+    try testing.expect(!st.open);
+    try testing.expect(rig.state.focus == opener);
+}
+
+test "P13: a popup nested deeper than max_depth is closed, not left open and unseen" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var ps: [max_depth + 1]PopupState = undefined;
+    for (&ps) |*p| p.* = .{ .open = true, .fresh = true };
+    const nest = struct {
+        fn run(u: *Ui, list: []PopupState, i: usize, anchor: Rect) void {
+            if (i >= list.len) return;
+            if (u.beginPopup(&list[i], anchor, .{ 60, 40 }, .{ .placement = .right, .gap = 2 })) |c| {
+                run(u, list, i + 1, c);
+                u.endPopup();
+            }
+        }
+    }.run;
+    var u = rig.ui();
+    nest(&u, &ps, 0, .{ .x = 10, .y = 10, .w = 20, .h = 20 });
+    rig.end(&u);
+    for (ps[0..max_depth]) |p| try testing.expect(p.open);
+    try testing.expect(!ps[max_depth].open);
+}
+
+test "P14: more popups than the tracker holds keep the topmost ones' blocking" {
+    var t_: Tracker = .{};
+    const r: Rect = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    for (0..max_recs + 2) |i| t_.record(.{ .rect = r, .layer = if (i == max_recs + 1) 4 else 1, .modal = false, .swallow = true });
+    try testing.expectEqual(@as(u32, 2), t_.dropped);
+    t_.rotate();
+    var top: u8 = 0;
+    for (t_.last()) |p| top = @max(top, p.layer);
+    try testing.expectEqual(@as(u8, 4), top);
+}
+
+test "P15: after a menu activation the popup's rectangle no longer blocks the next frame" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st: PopupState = .{};
+    const anchor: Rect = .{ .x = 20, .y = 20, .w = 60, .h = 24 };
+    const size = menuSize(&rig.ui(), &test_items, .{});
+    const rect = place(anchor, size[0], size[1], .below, .start, 4, rig.bounds);
+    {
+        var u = rig.ui();
+        u.openPopup(&st);
+        u.finish();
+    }
+    _ = menuFrame(&rig, &st, anchor, &test_items); // fresh
+    _ = menuFrame(&rig, &st, anchor, &test_items);
+    rig.click(rect.x + 30, rect.y + menu_pad + 1 + 14);
+    try testing.expectEqual(@as(?usize, 0), menuFrame(&rig, &st, anchor, &test_items));
+    try testing.expect(!st.open);
+    // One frame per event, as a loop that draws on demand does: the very next click lands.
+    rig.click(rect.x + 30, rect.y + 30);
+    var u = rig.ui();
+    try testing.expect(!u.popupOpen());
+    try testing.expect(u.hit(rect).clicked);
+    rig.end(&u);
+}
+
+test "R2: a menu whose state is freed by the item's own action leaves nothing behind" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    const st = try testing.allocator.create(PopupState);
+    st.* = .{};
+    const anchor: Rect = .{ .x = 20, .y = 20, .w = 60, .h = 24 };
+    const size = menuSize(&rig.ui(), &test_items, .{});
+    const rect = place(anchor, size[0], size[1], .below, .start, 4, rig.bounds);
+    {
+        var u = rig.ui();
+        u.openPopup(st);
+        u.finish();
+    }
+    _ = menuFrame(&rig, st, anchor, &test_items);
+    _ = menuFrame(&rig, st, anchor, &test_items);
+    rig.click(rect.x + 30, rect.y + menu_pad + 1 + 14);
+    {
+        var u = rig.ui();
+        // "Delete": the row that owns the state goes away inside the frame, before it ends.
+        if (u.menu(st, anchor, &test_items, .{})) |_| testing.allocator.destroy(st) else return error.TestUnexpectedResult;
+        rig.end(&u);
+    }
+    rig.click(rect.x + 30, rect.y + 30);
+    var u = rig.ui();
+    try testing.expect(!u.popupOpen());
+    try testing.expect(u.hit(rect).clicked);
+    rig.end(&u);
+}
+
+test "R2: closing a child with closePopup between frames, then freeing it, leaves the parent's close safe" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var parent: PopupState = .{ .open = true, .fresh = true };
+    const child = try testing.allocator.create(PopupState);
+    child.* = .{ .open = true, .fresh = true };
+    const anchor: Rect = .{ .x = 20, .y = 20, .w = 60, .h = 24 };
+    const frame = struct {
+        fn run(r: *Rig, p: *PopupState, c: ?*PopupState, a: Rect) void {
+            var u = r.ui();
+            if (u.beginPopup(p, a, .{ 200, 120 }, .{})) |content| {
+                if (c) |cc| if (u.beginPopup(cc, content, .{ 80, 50 }, .{ .placement = .right })) |_| u.endPopup();
+                u.endPopup();
+            }
+            r.end(&u);
+        }
+    }.run;
+    frame(&rig, &parent, child, anchor);
+    frame(&rig, &parent, child, anchor);
+    {
+        var u = rig.ui();
+        u.closePopup(child); // outside the parent's begin/end
+        testing.allocator.destroy(child);
+        u.finish();
+    }
+    rig.state.focus = null;
+    rig.key(keys.escape);
+    frame(&rig, &parent, null, anchor);
+    try testing.expect(!parent.open);
+    try testing.expect(rig.state.focus == null);
+}
+
+test "R2: a closed child is never linked from its parent" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var parent: PopupState = .{ .open = true, .fresh = true };
+    var child: PopupState = .{ .open = true, .fresh = true };
+    for (0..2) |_| {
+        var u = rig.ui();
+        if (u.beginPopup(&parent, .{ .x = 20, .y = 20, .w = 60, .h = 24 }, .{ 200, 120 }, .{})) |c| {
+            if (u.beginPopup(&child, c, .{ 80, 50 }, .{ .placement = .right })) |_| u.endPopup();
+            u.endPopup();
+        }
+        rig.end(&u);
+    }
+    try testing.expect(parent.child == &child);
+    var u = rig.ui();
+    u.closePopup(&child); // between frames: the parent is not on the popup stack
+    try testing.expect(parent.child == null);
+    rig.end(&u);
+}
+
+test "R3: a sibling is not blocked by its own record when the popup declared before it stops being drawn" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var a: PopupState = .{ .open = true, .fresh = true };
+    var b: PopupState = .{ .open = true, .fresh = true };
+    const frame = struct {
+        fn run(r: *Rig, pa: *PopupState, pb: *PopupState, close_a: bool, hit_b: *bool) void {
+            var u = r.ui();
+            if (close_a) u.closePopup(pa);
+            if (u.beginPopup(pa, .{ .x = 20, .y = 20, .w = 60, .h = 24 }, .{ 100, 80 }, .{ .dismiss_on_outside = false })) |_| u.endPopup();
+            if (u.beginPopup(pb, .{ .x = 200, .y = 20, .w = 60, .h = 24 }, .{ 100, 80 }, .{ .dismiss_on_outside = false })) |c| {
+                hit_b.* = u.hit(c).clicked;
+                u.endPopup();
+            }
+            r.end(&u);
+        }
+    }.run;
+    var hb = false;
+    frame(&rig, &a, &b, false, &hb);
+    frame(&rig, &a, &b, false, &hb);
+    const prect = place(.{ .x = 200, .y = 20, .w = 60, .h = 24 }, 100, 80, .below, .start, 6, rig.bounds);
+    rig.click(prect.x + 20, prect.y + 20);
+    frame(&rig, &a, &b, true, &hb); // A is gone: B is the first popup of the frame now
+    try testing.expect(hb);
+}
+
+test "R13: a modal record is never replaced by a non-modal one when the tracker is full" {
+    var t_: Tracker = .{};
+    const r: Rect = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    t_.record(.{ .rect = r, .layer = 1, .modal = true, .swallow = true });
+    for (1..max_recs) |_| t_.record(.{ .rect = r, .layer = 2, .modal = false, .swallow = true });
+    t_.record(.{ .rect = r, .layer = 2, .modal = false, .swallow = true });
+    t_.rotate();
+    var modal = false;
+    for (t_.last()) |p| modal = modal or p.modal;
+    try testing.expect(modal);
+}
+
+test "R13: focus that moved into a sibling popup on the same layer is not taken back when the other closes" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var a: PopupState = .{};
+    var b: PopupState = .{};
+    const opener: *const anyopaque = focus.ptrOfId(5);
+    const frame = struct {
+        fn run(r: *Rig, pa: *PopupState, pb: *PopupState, close_a: bool) void {
+            var u = r.ui();
+            if (close_a) u.closePopup(pa);
+            _ = u.focusable(5, .{ .x = 0, .y = 0, .w = 10, .h = 10 }, .{});
+            if (u.beginPopup(pa, .{ .x = 20, .y = 20, .w = 20, .h = 20 }, .{ 100, 60 }, .{ .dismiss_on_outside = false })) |c| {
+                _ = u.focusable(70, c, .{});
+                u.endPopup();
+            }
+            if (u.beginPopup(pb, .{ .x = 200, .y = 20, .w = 20, .h = 20 }, .{ 100, 60 }, .{ .dismiss_on_outside = false })) |c| {
+                _ = u.focusable(71, c, .{});
+                u.endPopup();
+            }
+            r.end(&u);
+        }
+    }.run;
+    frame(&rig, &a, &b, false);
+    rig.state.focus = opener;
+    {
+        var u = rig.ui();
+        u.openPopup(&a);
+        u.openPopup(&b);
+        u.finish();
+    }
+    frame(&rig, &a, &b, false);
+    frame(&rig, &a, &b, false);
+    rig.state.focus = focus.ptrOfId(71); // inside B
+    frame(&rig, &a, &b, false);
+    frame(&rig, &a, &b, true);
+    try testing.expect(rig.state.focus == focus.ptrOfId(71));
 }

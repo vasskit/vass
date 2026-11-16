@@ -8,6 +8,7 @@ const keys = @import("../core/keys.zig");
 const backend = @import("../platform/backend_sdl.zig");
 const ui_mod = @import("ui.zig");
 const text_edit = @import("../text/text_edit.zig");
+const text_input = @import("text_input.zig");
 const Rect = geom.Rect;
 const Ui = ui_mod.Ui;
 const State = ui_mod.State;
@@ -26,7 +27,10 @@ fn cpMeasure(_: ?*anyopaque, str: []const u8, size: f32) f32 {
 var clip_buf: [256]u8 = undefined;
 var clip_len: usize = 0;
 
+var clip_reads: usize = 0;
+
 fn clipGet(gpa: std.mem.Allocator) ?[]u8 {
+    clip_reads += 1;
     if (clip_len == 0) return null;
     return gpa.dupe(u8, clip_buf[0..clip_len]) catch null;
 }
@@ -949,4 +953,136 @@ test "fitText and wrapping never split a cluster" {
         try t.expectEqual(@as(usize, 3), line.len); // one cluster (two code points) per line
     }
     try t.expectEqual(@as(usize, 5), n);
+}
+
+// ---- audit batch ---------------------------------------------------------------------------------
+
+test "password: a double click keeps everything selected while the button is held" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st = TextFieldState.init(t.allocator);
+    defer st.deinit();
+    try setup(&st, &rig, "ab cd");
+    const o: ui_mod.TextFieldOpts = .{ .password = true };
+    _ = rig.field(clickAt(11, 2), &st, o);
+    try t.expectEqual(@as(usize, 5), st.edit.selection().end - st.edit.selection().start);
+    _ = rig.field(dragAt(11), &st, o);
+    try t.expectEqual(@as(usize, 5), st.edit.selection().end - st.edit.selection().start);
+    _ = rig.field(dragAt(60), &st, o);
+    try t.expectEqual(@as(usize, 5), st.edit.selection().end - st.edit.selection().start);
+}
+
+test "textField: events after Escape blurs it are not applied" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st = TextFieldState.init(t.allocator);
+    defer st.deinit();
+    try setup(&st, &rig, "");
+    var in: Input = .{};
+    in.pushKey(keys.escape, .{});
+    in.pushText("x");
+    _ = rig.field(in, &st, .{});
+    try t.expectEqualStrings("", st.edit.text());
+    try t.expect(rig.state.focus == null);
+}
+
+test "the same state drawn twice in a frame handles the events once" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st = TextFieldState.init(t.allocator);
+    defer st.deinit();
+    try setup(&st, &rig, "");
+    var u = rig.ui(textIn("a"));
+    _ = u.textField(field_r, &st, .{ .size = 1 });
+    _ = u.textField(field_r, &st, .{ .size = 1 });
+    u.finish();
+    try t.expectEqualStrings("a", st.edit.text());
+
+    var ar = TextAreaState.init(t.allocator);
+    defer ar.deinit();
+    rig.state.focusOn(&ar);
+    const rect: Rect = .{ .x = 0, .y = 50, .w = 100, .h = 100 };
+    _ = rig.area(.{}, &ar, rect);
+    u = rig.ui(textIn("b"));
+    _ = u.textArea(rect, &ar, .{ .size = 10, .bare = true });
+    _ = u.textArea(rect, &ar, .{ .size = 10, .bare = true });
+    u.finish();
+    try t.expectEqualStrings("b", ar.edit.text());
+}
+
+test "composition with a failed allocation draws nothing and does not crash" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var fa = std.testing.FailingAllocator.init(t.allocator, .{});
+    var st = TextFieldState.init(fa.allocator());
+    defer st.deinit();
+    try setup(&st, &rig, "abc");
+    fa.fail_index = fa.alloc_index;
+    _ = rig.field(withComp(comp("xyz", 1, 1)), &st, .{});
+    fa.fail_index = std.math.maxInt(usize);
+    try t.expectEqualStrings("abc", st.edit.text());
+    var ar = TextAreaState.init(fa.allocator());
+    defer ar.deinit();
+    try ar.edit.setText("abc");
+    rig.state.focusOn(&ar);
+    _ = rig.area(.{}, &ar, .{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    fa.fail_index = fa.alloc_index;
+    _ = rig.area(withComp(comp("xyz", 1, 1)), &ar, .{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    try t.expectEqualStrings("abc", ar.edit.text());
+}
+
+test "context menu: the clipboard is looked at when the menu opens, not every frame" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st = TextFieldState.init(t.allocator);
+    defer st.deinit();
+    try setup(&st, &rig, "abc");
+    setClip("text");
+    clip_reads = 0;
+    _ = rig.field(rightClickAt(20), &st, .{});
+    try t.expect(st.ctx.open);
+    for (0..4) |_| _ = rig.field(.{}, &st, .{});
+    try t.expect(st.ctx.open);
+    try t.expect(clip_reads <= 1);
+    // The next time it opens it looks again.
+    _ = rig.field(keyIn(keys.escape, .{}), &st, .{});
+    try t.expect(!st.ctx.open);
+    const before = clip_reads;
+    _ = rig.field(rightClickAt(20), &st, .{});
+    try t.expect(clip_reads > before);
+}
+
+test "paste that inserts nothing does not report a change" {
+    var rig = Rig.init();
+    defer rig.deinit();
+    var st = TextFieldState.init(t.allocator);
+    defer st.deinit();
+    try setup(&st, &rig, "abc");
+    setClip("\n"); // a single-line field drops line breaks
+    var res = rig.field(keyIn(keys.v, .{ .cmd = true }), &st, .{});
+    try t.expect(!res.changed);
+    try t.expectEqualStrings("abc", st.edit.text());
+    setClip("d");
+    res = rig.field(keyIn(keys.v, .{ .cmd = true }), &st, .{});
+    try t.expect(res.changed);
+    try t.expectEqualStrings("abcd", st.edit.text());
+
+    var ar = TextAreaState.init(t.allocator);
+    defer ar.deinit();
+    try ar.edit.setText("abc");
+    ar.edit.max_len = 3;
+    rig.state.focusOn(&ar);
+    const rect: Rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    _ = rig.area(.{}, &ar, rect);
+    setClip("zzz");
+    const ares = rig.area(keyIn(keys.v, .{ .cmd = true }), &ar, rect);
+    try t.expect(!ares.changed);
+    try t.expectEqualStrings("abc", ar.edit.text());
+
+    // The menu's Paste too.
+    var u = rig.ui(.{});
+    setClip("\n");
+    const len = st.edit.text().len;
+    try t.expect(!text_input.applyAction(&u, &st.edit, .paste, true));
+    try t.expectEqual(len, st.edit.text().len);
 }

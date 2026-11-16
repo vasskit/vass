@@ -131,11 +131,18 @@ pub const Mixer = struct {
         if (s.phase == .paused or s.phase == .pausing) s.phase = .playing;
     }
 
-    /// Ends the voice: it fades out over a few milliseconds and its slot is then free again.
+    /// Ends the voice: it fades out over a few milliseconds and its slot is then free again (at
+    /// once if it is paused or silent).
     /// The handle is stale from this call on.
     pub fn stop(m: *Mixer, h: Handle) void {
         const s = m.slotFor(h) orelse return;
-        release(s, .stopping);
+        endVoice(s);
+    }
+
+    /// A silent voice has no tail to fade, and the device may be idle-paused so that nothing
+    /// would ever render it away: free it now. An audible one fades out in `render`.
+    fn endVoice(s: *Slot) void {
+        release(s, if (s.phase == .paused or s.gain <= 0) .free else .stopping);
     }
 
     /// Stops every voice playing `sound_id` at once, with no fade, so its samples can be freed.
@@ -149,7 +156,7 @@ pub const Mixer = struct {
     }
 
     pub fn stopAll(m: *Mixer) void {
-        for (&m.slots) |*s| if (s.phase == .playing or s.phase == .paused or s.phase == .pausing) release(s, .stopping);
+        for (&m.slots) |*s| if (s.phase == .playing or s.phase == .paused or s.phase == .pausing) endVoice(s);
     }
 
     pub fn setVolume(m: *Mixer, h: Handle, v: f32) void {
@@ -446,4 +453,64 @@ test "an empty sound is dropped rather than looped forever" {
     var out: [8]f32 = undefined;
     m.render(&out);
     try testing.expectEqual(State.ended, m.state(h));
+}
+
+test "stopping a paused voice frees its slot at once, with no render needed" {
+    // The output device is paused while nothing is audible, so nothing may wait for a render.
+    var m = Mixer.init(10000);
+    var s: [1000]f32 = @splat(0.5);
+    var out: [200]f32 = undefined;
+    const h = m.start(1, &s, 1, 10000, 1, true, 0).?;
+    m.render(&out);
+    m.pause(h);
+    m.render(&out); // the fade completes: paused
+    try testing.expectEqual(State.paused, m.state(h));
+    try testing.expectEqual(@as(usize, 1), m.activeCount());
+    m.stop(h);
+    try testing.expect(!m.anyAudible());
+    try testing.expectEqual(@as(usize, 0), m.activeCount());
+    // The slot is reusable straight away and the old handle stays stale.
+    const h2 = m.start(1, &s, 1, 10000, 1, true, 0).?;
+    try testing.expectEqual(h.slot, h2.slot);
+    try testing.expectEqual(State.ended, m.state(h));
+    // The same for stopAll, over a paused voice and a still-fading one.
+    m.pause(h2);
+    m.render(&out);
+    const h3 = m.start(2, &s, 1, 10000, 1, true, 0).?;
+    m.stopAll();
+    try testing.expectEqual(@as(usize, 0), m.activeCount());
+    try testing.expectEqual(State.ended, m.state(h3));
+    m.render(&out);
+    try testing.expect(!m.anyAudible()); // the audible one has faded out and freed itself
+    // A voice that is silent anyway (just seeked, gain 0) has no tail to fade.
+    const h4 = m.start(1, &s, 1, 10000, 1, true, 0).?;
+    m.render(&out);
+    m.seek(h4, 0.01);
+    m.stop(h4);
+    try testing.expect(!m.anyAudible());
+}
+
+test "seeking a paused voice moves it without waking it; stopSound frees every phase" {
+    var m = Mixer.init(10000);
+    var s: [1000]f32 = @splat(0.5);
+    var out: [200]f32 = undefined;
+    const h = m.start(7, &s, 1, 10000, 1, true, 0).?;
+    m.render(&out);
+    m.pause(h);
+    m.render(&out);
+    m.seek(h, 0.05);
+    try testing.expectApproxEqAbs(@as(f32, 0.05), m.position(h), 1e-6);
+    try testing.expectEqual(State.paused, m.state(h));
+    try testing.expect(!m.anyAudible());
+    m.resumeVoice(h);
+    m.render(&out);
+    try testing.expect(m.position(h) > 0.05);
+    // A voice fading out on its own (`stop` of a playing one) is also freed by stopSound.
+    const h2 = m.start(7, &s, 1, 10000, 1, true, 0).?;
+    m.render(&out);
+    m.stop(h2);
+    try testing.expect(m.anyAudible());
+    m.stopSound(7);
+    try testing.expect(!m.anyAudible());
+    try testing.expectEqual(@as(usize, 0), m.activeCount());
 }

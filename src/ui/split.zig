@@ -111,11 +111,27 @@ pub const Grabs = struct {
     prev_n: u8 = 0,
     cur: [max_grabs]Grab = undefined,
     cur_n: u8 = 0,
+    /// Records that did not fit, ever.
+    dropped: u32 = 0,
 
     pub fn record(g: *Grabs, grab: Grab) void {
         if (g.cur_n < max_grabs) {
             g.cur[g.cur_n] = grab;
             g.cur_n += 1;
+            return;
+        }
+        g.dropped +%= 1;
+        // Tests overflow it on purpose; a Debug app should hear about it.
+        if (@import("builtin").mode == .debug and !@import("builtin").is_test) std.debug.assert(false);
+        // The one being dragged blocks everything, so it must not be the one that is lost.
+        if (grab.active) {
+            var i = g.cur_n;
+            while (i > 0) : (i -= 1) {
+                if (!g.cur[i - 1].active) {
+                    g.cur[i - 1] = grab;
+                    return;
+                }
+            }
         }
     }
 
@@ -142,6 +158,17 @@ pub fn blocks(ui: *const Ui) bool {
         if (g.active or g.rect.contains(ui.input.mouse_x, ui.input.mouse_y)) return true;
     }
     return false;
+}
+
+/// Ends the frame for dragging (called by `popup.finish`, which `Ui.finish` runs). A drag lasts
+/// while the button is down, so one still recorded after the release belongs to a widget that was
+/// not drawn on the release frame (hidden, disabled, scrolled away) and would never end it.
+/// Left alone, it keeps every splitter from hovering or dragging, and makes a slider follow the
+/// pointer when it comes back. A drag its owner touched this frame stays (`drag_live`): a tap sets
+/// it on a frame where the button is already up, and the owner reports the release on the next.
+pub fn finish(s: *State, in: *const Input) void {
+    if (!in.down and !s.drag_live) s.drag = null;
+    s.drag_live = false;
 }
 
 /// True while the splitter that controls `size` is being dragged.
@@ -260,8 +287,11 @@ pub fn splitter(ui: *Ui, r: Rect, size: *f32, opts: SplitterOpts) SplitterResult
             if (focused) {
                 const dec: u32 = if (vertical) keys.left else keys.up;
                 const inc: u32 = if (vertical) keys.right else keys.down;
+                var stepped = false;
                 while (ui.takeKey(&.{ dec, inc, keys.home, keys.end, keys.@"return" })) |k| {
-                    const base = opts.shown orelse size.*;
+                    // The first key starts from the size shown; the next ones from where it left the size.
+                    const base = if (stepped) size.* else opts.shown orelse size.*;
+                    stepped = true;
                     const mult: f32 = if (k.mods.shift) 5 else 1;
                     switch (k.code) {
                         keys.home => size.* = resolve(opts.min, opts),
@@ -428,7 +458,9 @@ pub const Three = struct {
 /// served first, the right one gets what is left over the centre's minimum. Pure; it is two
 /// `two` calls.
 pub fn three(area: Rect, left_size: f32, right_size: f32, opts: ThreeOpts) Three {
-    const l = two(area, left_size, .{ .axis = opts.axis, .side = .first, .min_other = opts.min_centre, .gap = opts.gap, .thickness = opts.thickness });
+    // The left pane leaves room for the centre, the gap before the right pane (also there when that
+    // pane is collapsed) and nothing else: `two` below takes that gap out again.
+    const l = two(area, left_size, .{ .axis = opts.axis, .side = .first, .min_other = opts.min_centre + opts.gap, .gap = opts.gap, .thickness = opts.thickness });
     const r = two(l.second, right_size, .{ .axis = opts.axis, .side = .second, .min_other = opts.min_centre, .gap = opts.gap, .thickness = opts.thickness });
     return .{
         .left = l.first,
@@ -1111,4 +1143,85 @@ test "feeds a Layout with no lag: the splitter runs first with last frame's divi
     try t.expectEqual(@as(f32, 310), side_w);
     Frame.run(&rig, held(grab_x + 400, 50), &side_w, &div, &side_rect);
     try t.expectEqual(@as(f32, 400), side_rect.w);
+}
+
+// ---- audit fixes ---------------------------------------------------------------------------------------
+
+test "P7: a splitter that is not drawn on the release frame does not leave the drag stuck" {
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var a: f32 = 100;
+    var b: f32 = 100;
+    const bbar: Rect = .{ .x = 300, .y = 0, .w = 1, .h = 400 };
+    const frameB = struct {
+        fn run(r: *Rig, in: Input, size: *f32) SplitterResult {
+            var u = r.ui(in);
+            const res = splitter(&u, bbar, size, .{});
+            r.end(&u);
+            return res;
+        }
+    }.run;
+    _ = frameV(&rig, press(200, 100), &a, .{}); // A is grabbed
+    _ = frameB(&rig, lift(240, 100), &b); // released while only B is drawn
+    _ = frameB(&rig, press(300, 100), &b);
+    const res = frameB(&rig, held(340, 100), &b);
+    try t.expect(res.dragging);
+    try t.expectEqual(@as(f32, 140), b);
+}
+
+test "P7: a slider hidden mid-drag does not follow the pointer when it comes back" {
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var v: f32 = 0.5;
+    const r: Rect = .{ .x = 0, .y = 100, .w = 200, .h = 20 };
+    const frame = struct {
+        fn run(rg: *Rig, in: Input, val: *f32, draw: bool) void {
+            var u = rg.ui(in);
+            if (draw) _ = u.slider(.{ .x = 0, .y = 100, .w = 200, .h = 20 }, val, .{});
+            rg.end(&u);
+        }
+    }.run;
+    frame(&rig, press(r.x + 100, r.y + 10), &v, true);
+    frame(&rig, lift(r.x + 100, r.y + 10), &v, false);
+    const before = v;
+    frame(&rig, held(r.x + 190, 300), &v, true); // a press that began elsewhere
+    try t.expectEqual(before, v);
+}
+
+test "P11: three keeps the centre at min_centre when there is a gap" {
+    const s = three(.{ .x = 0, .y = 0, .w = 500, .h = 100 }, 1000, 0, .{ .min_centre = 200, .gap = 10 });
+    try t.expect(s.centre.w >= 200);
+    try t.expectEqual(@as(f32, 200), s.centre.w);
+    // Everything adds up: left, gap, centre, gap, right fill the area.
+    try t.expectEqual(@as(f32, 500), s.right.x + s.right.w);
+    const s2 = three(.{ .x = 0, .y = 0, .w = 500, .h = 100 }, 100, 100, .{ .min_centre = 200, .gap = 10 });
+    try t.expectEqual(@as(f32, 100), s2.left.w);
+    try t.expectEqual(@as(f32, 100), s2.right.w);
+    try t.expectEqual(@as(f32, 280), s2.centre.w);
+}
+
+test "P12: several arrow presses in one frame all count when a shown size is given" {
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var size: f32 = 200;
+    const o: SplitterOpts = .{ .shown = 100, .step = 16 };
+    _ = frameV(&rig, press(200, 5), &size, o);
+    _ = frameV(&rig, lift(200, 5), &size, o);
+    size = 200;
+    var in: Input = .{};
+    in.pushKey(keys.right, .{});
+    in.pushKey(keys.right, .{});
+    _ = frameV(&rig, in, &size, o);
+    try t.expectEqual(@as(f32, 132), size);
+}
+
+test "P14: more grab areas than fit keep the one being dragged" {
+    var g: Grabs = .{};
+    const r: Rect = .{ .x = 0, .y = 0, .w = 8, .h = 8 };
+    for (0..max_grabs + 3) |i| g.record(.{ .rect = r, .layer = 0, .active = i == max_grabs + 2 });
+    try t.expectEqual(@as(u32, 3), g.dropped);
+    g.rotate();
+    var active = false;
+    for (g.last()) |x| active = active or x.active;
+    try t.expect(active);
 }

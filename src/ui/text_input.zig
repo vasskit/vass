@@ -160,7 +160,7 @@ pub const Display = struct {
 
 /// Builds the `Display` of `src` into `scratch` when needed (a pre-edit or `mask`); otherwise
 /// `text` is `src` itself and nothing is allocated. If the allocation fails a masked field
-/// shows nothing rather than its text.
+/// shows nothing rather than its text, and `pre` is null (the pre-edit is not shown either).
 pub fn display(gpa: std.mem.Allocator, scratch: *std.ArrayList(u8), src: []const u8, mask: bool, pre: ?Preedit, sel: Range) Display {
     var d: Display = .{ .src = src, .text = src, .masked = mask, .ins_start = sel.start, .ins_end = sel.end, .pre = pre };
     if (!mask and pre == null) return d;
@@ -169,6 +169,7 @@ pub fn display(gpa: std.mem.Allocator, scratch: *std.ArrayList(u8), src: []const
     if (!ok) {
         d.text = "";
         d.pre_start = 0;
+        d.pre = null; // nothing of it is in `text`
         return d;
     }
     d.text = scratch.items;
@@ -249,7 +250,16 @@ pub fn passwordKey(k: backend.Key) backend.Key {
 // ---- pasting -------------------------------------------------------------------------------
 
 /// Inserts `str` without carriage returns (pasted CRLF text becomes LF), as one edit of `kind`.
-pub fn insertClean(edit: *TextEdit, str: []const u8, kind: text_edit.EditKind) void {
+/// Returns whether the text changed: false when nothing was inserted (everything was dropped,
+/// or `max_len` is reached) and no selection was replaced.
+pub fn insertClean(edit: *TextEdit, str: []const u8, kind: text_edit.EditKind) bool {
+    const had_selection = edit.hasSelection();
+    const start = edit.selection().start;
+    insertCleanRaw(edit, str, kind);
+    return had_selection or edit.cursor != start;
+}
+
+fn insertCleanRaw(edit: *TextEdit, str: []const u8, kind: text_edit.EditKind) void {
     if (std.mem.indexOfScalar(u8, str, '\r') == null) {
         edit.insertAs(str, kind) catch {};
         return;
@@ -286,6 +296,25 @@ pub const Caps = struct {
     can_redo: bool = false,
     /// False in a password field: Cut and Copy are disabled.
     allow_copy: bool = true,
+    /// Whether the clipboard holds text (Paste is disabled otherwise); see `PasteProbe`.
+    can_paste: bool = true,
+};
+
+/// Whether the clipboard holds text, asked once per time a menu opens (reading the system
+/// clipboard copies all of it, which is too much to do every frame the menu stays open).
+pub const PasteProbe = struct {
+    known: bool = false,
+    has_text: bool = false,
+
+    /// The answer, looked up on the first call after `known` was cleared (the widget clears it
+    /// once its menu is closed).
+    pub fn get(p: *PasteProbe, ui: *const Ui) bool {
+        if (!p.known) {
+            p.has_text = clipboardHasText(ui);
+            p.known = true;
+        }
+        return p.has_text;
+    }
 };
 
 const mod_name = if (builtin.os.tag == .macos) "Cmd" else "Ctrl";
@@ -320,7 +349,7 @@ pub fn contextMenu(ui: *Ui, st: *popup.PopupState, caps: Caps) ?Action {
         add(&items, &acts, &n, .{ .separator = true }, null);
         add(&items, &acts, &n, .{ .label = "Cut", .shortcut = mod_name ++ "+X", .disabled = !can_copy }, .cut);
         add(&items, &acts, &n, .{ .label = "Copy", .shortcut = mod_name ++ "+C", .disabled = !can_copy }, .copy);
-        add(&items, &acts, &n, .{ .label = "Paste", .shortcut = mod_name ++ "+V", .disabled = !clipboardHasText(ui) }, .paste);
+        add(&items, &acts, &n, .{ .label = "Paste", .shortcut = mod_name ++ "+V", .disabled = !caps.can_paste }, .paste);
     } else {
         add(&items, &acts, &n, .{ .label = "Copy", .shortcut = mod_name ++ "+C", .disabled = !can_copy }, .copy);
     }
@@ -352,8 +381,7 @@ pub fn applyAction(ui: *const Ui, edit: *TextEdit, act: Action, allow_copy: bool
             const s = get(edit.gpa) orelse return false;
             defer edit.gpa.free(s);
             if (s.len == 0) return false;
-            insertClean(edit, s, .paste);
-            return true;
+            return insertClean(edit, s, .paste);
         },
         .select_all => {
             edit.selectAll();

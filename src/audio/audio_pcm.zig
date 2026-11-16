@@ -219,33 +219,103 @@ pub fn toI16(s: f32) i16 {
 
 // ---- OGG Vorbis and MP3 -----------------------------------------------------------------
 
-/// Decodes an Ogg Vorbis file (stb_vorbis). Mono and stereo; files with 3 to 6 channels
-/// are mixed down to stereo by the decoder.
+/// Mixes interleaved frames of `ch` (3 to 6) channels in Vorbis channel order down to
+/// interleaved stereo (`out` holds one stereo frame per input frame).
+///
+///     3: L C R          4: FL FR RL RR          5: FL C FR RL RR          6: 5 + LFE
+///
+/// Centre and rear channels go to their own side at -3 dB (0.7071, the usual ITU-R BS.775
+/// coefficient), the LFE is dropped, and each side is divided by the sum of its weights, so
+/// that equal full-scale inputs give full scale and the mix cannot clip.
+fn downmixToStereo(in: []const f32, ch: u32, out: []f32) void {
+    const k: f32 = 0.70710678;
+    const n = in.len / ch;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const f = in[i * ch ..][0..ch];
+        var l: f32 = undefined;
+        var r: f32 = undefined;
+        switch (ch) {
+            3 => {
+                const g = 1 / (1 + k);
+                l = (f[0] + k * f[1]) * g;
+                r = (f[2] + k * f[1]) * g;
+            },
+            4 => {
+                const g = 1 / (1 + k);
+                l = (f[0] + k * f[2]) * g;
+                r = (f[1] + k * f[3]) * g;
+            },
+            else => { // 5 and 6; a sixth channel (LFE) is ignored
+                const g = 1 / (1 + 2 * k);
+                l = (f[0] + k * f[1] + k * f[3]) * g;
+                r = (f[2] + k * f[1] + k * f[4]) * g;
+            },
+        }
+        out[i * 2] = l;
+        out[i * 2 + 1] = r;
+    }
+}
+
+/// stb_vorbis error code for "not enough memory".
+const vorbis_outofmem = 3;
+/// Frames of memory reserved up front per input byte (within `ogg_reserve_max_frames`): well above
+/// what music compresses to, well below what a forged header could claim. Longer files simply
+/// grow as they decode.
+const ogg_reserve_frames_per_byte = 64;
+/// ... and never more than this many frames (about 0.5 MB of stereo), however big the input.
+const ogg_reserve_max_frames = 1 << 16;
+
+/// Decodes an Ogg Vorbis file (stb_vorbis). Mono and stereo as they are; files with 3 to 6
+/// channels are mixed down to stereo (`downmixToStereo`).
+///
+/// The header's length is only a hint: it caps how much is read and sizes the first
+/// reservation (bounded by the input size), but memory grows with what is actually decoded,
+/// and `TooLong` is reported for what was decoded, not for what the header claims.
 pub fn decodeOgg(gpa: std.mem.Allocator, bytes: []const u8) Error!Pcm {
+    return decodeOggLimit(gpa, bytes, max_bytes);
+}
+
+/// `decodeOgg` with the output limit as a parameter (the tests use a small one).
+fn decodeOggLimit(gpa: std.mem.Allocator, bytes: []const u8, limit_bytes: u64) Error!Pcm {
     if (bytes.len < 4 or bytes.len > std.math.maxInt(c_int)) return error.InvalidAudio;
     var err: c_int = 0;
-    const f = stb_vorbis_open_memory(bytes.ptr, @intCast(bytes.len), &err, null) orelse return error.InvalidAudio;
+    const f = stb_vorbis_open_memory(bytes.ptr, @intCast(bytes.len), &err, null) orelse
+        return if (err == vorbis_outofmem) error.OutOfMemory else error.InvalidAudio;
     defer stb_vorbis_close(f);
     const info = stb_vorbis_get_info(f);
     if (info.channels < 1 or info.channels > 6 or info.sample_rate == 0 or info.sample_rate > max_rate) return error.InvalidAudio;
-    const ch: u32 = @min(@as(u32, @intCast(info.channels)), 2);
-    const total: u64 = stb_vorbis_stream_length_in_samples(f);
-    if (total == 0) return error.InvalidAudio;
-    if (!sampleCountOk(total * ch)) return error.TooLong;
-    const out = try gpa.alloc(f32, @intCast(total * ch));
-    errdefer gpa.free(out);
+    const native: u32 = @intCast(info.channels);
+    const ch: u32 = @min(native, 2);
+    const declared: u64 = stb_vorbis_stream_length_in_samples(f);
+    if (declared == 0) return error.InvalidAudio;
+    var list: std.ArrayList(f32) = .empty;
+    errdefer list.deinit(gpa);
+    // Only a first reservation: the header can claim anything, so it never decides an error, and
+    // the list grows with what is decoded.
+    const reserve = @min(declared, @as(u64, bytes.len) * ogg_reserve_frames_per_byte, ogg_reserve_max_frames, limit_bytes / (ch * @sizeOf(f32)));
+    try list.ensureTotalCapacity(gpa, @intCast(reserve * ch));
+    const chunk_frames = 4096;
+    var raw: [chunk_frames * 6]f32 = undefined;
     // Read until the decoder runs dry or the (header-declared) length is filled.
     var got: usize = 0;
-    while (got < total) {
-        const want = @min(total - got, 4096);
-        const n = stb_vorbis_get_samples_float_interleaved(f, @intCast(ch), out[got * ch ..].ptr, @intCast(want * ch));
+    while (got < declared) {
+        const want: usize = @intCast(@min(declared - got, chunk_frames));
+        const n = stb_vorbis_get_samples_float_interleaved(f, @intCast(native), &raw, @intCast(want * native));
         if (n <= 0) break;
-        got += @intCast(n);
+        const frames: usize = @intCast(n);
+        if ((got + frames) * ch * @sizeOf(f32) > limit_bytes) return error.TooLong;
+        if (native <= 2) {
+            try list.appendSlice(gpa, raw[0 .. frames * ch]);
+        } else {
+            const dst = try list.addManyAsSlice(gpa, frames * 2);
+            downmixToStereo(raw[0 .. frames * native], native, dst);
+        }
+        got += frames;
     }
     if (got == 0) return error.InvalidAudio;
-    const trimmed = gpa.realloc(out, got * ch) catch out[0 .. got * ch];
-    for (trimmed) |*s| s.* = clean(s.*);
-    return .{ .samples = trimmed, .sample_rate = info.sample_rate, .channels = @intCast(ch) };
+    for (list.items) |*s| s.* = clean(s.*);
+    return .{ .samples = try list.toOwnedSlice(gpa), .sample_rate = info.sample_rate, .channels = @intCast(ch) };
 }
 
 /// Decodes an MP3 file (dr_mp3), mono or stereo.
@@ -690,4 +760,174 @@ test "mp3: a 440 Hz tone decodes to the right rate and pitch" {
     for ([_]usize{ 10, 300, bytes.len - 3 }) |n| {
         if (decodeMp3(a, bytes[0..n])) |q| q.deinit(a) else |_| {}
     }
+}
+
+/// The decoder as it was for mono and stereo: one allocation sized from the header.
+fn referenceOgg(gpa: std.mem.Allocator, bytes: []const u8) !Pcm {
+    var err: c_int = 0;
+    const f = stb_vorbis_open_memory(bytes.ptr, @intCast(bytes.len), &err, null) orelse return error.InvalidAudio;
+    defer stb_vorbis_close(f);
+    const info = stb_vorbis_get_info(f);
+    const ch: u32 = @intCast(info.channels);
+    const total: u64 = stb_vorbis_stream_length_in_samples(f);
+    const out = try gpa.alloc(f32, @intCast(total * ch));
+    errdefer gpa.free(out);
+    var got: usize = 0;
+    while (got < total) {
+        const want = @min(total - got, 4096);
+        const n = stb_vorbis_get_samples_float_interleaved(f, @intCast(ch), out[got * ch ..].ptr, @intCast(want * ch));
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    const trimmed = try gpa.realloc(out, got * ch);
+    for (trimmed) |*s| s.* = clean(s.*);
+    return .{ .samples = trimmed, .sample_rate = info.sample_rate, .channels = @intCast(ch) };
+}
+
+test "ogg: mono and stereo output is exactly what the decoder produces" {
+    const a = testing.allocator;
+    inline for (.{ "testdata/tone.ogg", "testdata/tone_stereo.ogg" }) |name| {
+        const bytes = @embedFile(name);
+        const want = try referenceOgg(a, bytes);
+        defer want.deinit(a);
+        const got = try decodeOgg(a, bytes);
+        defer got.deinit(a);
+        try testing.expectEqual(want.channels, got.channels);
+        try testing.expectEqual(want.sample_rate, got.sample_rate);
+        try testing.expectEqualSlices(f32, want.samples, got.samples);
+    }
+    const st = try decodeOgg(a, @embedFile("testdata/tone_stereo.ogg"));
+    defer st.deinit(a);
+    try testing.expectEqual(@as(u8, 2), st.channels);
+    // 440 Hz on the left, 660 Hz on the right, 0.2 s: 176 and 264 zero crossings.
+    var cl: usize = 0;
+    var cr: usize = 0;
+    var i: usize = 1;
+    while (i < st.frames()) : (i += 1) {
+        if ((st.samples[(i - 1) * 2] < 0) != (st.samples[i * 2] < 0)) cl += 1;
+        if ((st.samples[(i - 1) * 2 + 1] < 0) != (st.samples[i * 2 + 1] < 0)) cr += 1;
+    }
+    try testing.expectApproxEqAbs(@as(f32, 176), @as(f32, @floatFromInt(cl)), 8);
+    try testing.expectApproxEqAbs(@as(f32, 264), @as(f32, @floatFromInt(cr)), 10);
+}
+
+test "ogg: a 5.1 file is mixed down with the centre in both channels" {
+    const a = testing.allocator;
+    // The tone (amplitude 0.5) is on the centre channel only. The old decoder kept the first
+    // two channels, left and centre, so it came out on the right alone.
+    const p = try decodeOgg(a, @embedFile("testdata/surround51.ogg"));
+    defer p.deinit(a);
+    try testing.expectEqual(@as(u8, 2), p.channels);
+    try testing.expectEqual(@as(u32, 22050), p.sample_rate);
+    try testing.expectApproxEqAbs(@as(f64, 0.2), p.duration(), 0.02);
+    var pl: f32 = 0;
+    var pr: f32 = 0;
+    var i: usize = 0;
+    while (i < p.frames()) : (i += 1) {
+        pl = @max(pl, @abs(p.samples[i * 2]));
+        pr = @max(pr, @abs(p.samples[i * 2 + 1]));
+        try testing.expectApproxEqAbs(p.samples[i * 2], p.samples[i * 2 + 1], 1e-6);
+    }
+    // 0.5 * 0.7071 / 2.4142 = 0.146
+    try testing.expectApproxEqAbs(@as(f32, 0.146), pl, 0.03);
+    try testing.expectApproxEqAbs(pl, pr, 1e-6);
+}
+
+test "downmix: Vorbis channel orders for 3 to 6 channels" {
+    const k: f32 = 0.70710678;
+    // Each case: channels, one input frame, expected left and right.
+    const Case = struct { ch: u32, in: []const f32, l: f32, r: f32 };
+    const cases = [_]Case{
+        // L C R
+        .{ .ch = 3, .in = &.{ 1, 0, 0 }, .l = 1 / (1 + k), .r = 0 },
+        .{ .ch = 3, .in = &.{ 0, 1, 0 }, .l = k / (1 + k), .r = k / (1 + k) },
+        .{ .ch = 3, .in = &.{ 0, 0, 1 }, .l = 0, .r = 1 / (1 + k) },
+        // FL FR RL RR
+        .{ .ch = 4, .in = &.{ 1, 0, 0, 0 }, .l = 1 / (1 + k), .r = 0 },
+        .{ .ch = 4, .in = &.{ 0, 0, 1, 0 }, .l = k / (1 + k), .r = 0 },
+        .{ .ch = 4, .in = &.{ 0, 0, 0, 1 }, .l = 0, .r = k / (1 + k) },
+        // FL C FR RL RR
+        .{ .ch = 5, .in = &.{ 0, 1, 0, 0, 0 }, .l = k / (1 + 2 * k), .r = k / (1 + 2 * k) },
+        .{ .ch = 5, .in = &.{ 0, 0, 1, 0, 0 }, .l = 0, .r = 1 / (1 + 2 * k) },
+        .{ .ch = 5, .in = &.{ 0, 0, 0, 1, 0 }, .l = k / (1 + 2 * k), .r = 0 },
+        // FL C FR RL RR LFE (the LFE is dropped)
+        .{ .ch = 6, .in = &.{ 0, 0, 0, 0, 0, 1 }, .l = 0, .r = 0 },
+        .{ .ch = 6, .in = &.{ 0, 0, 0, 0, 1, 0 }, .l = 0, .r = k / (1 + 2 * k) },
+        // Full-scale everywhere (but the LFE) is full scale, not clipped.
+        .{ .ch = 6, .in = &.{ 1, 1, 1, 1, 1, 0 }, .l = 1, .r = 1 },
+        .{ .ch = 3, .in = &.{ 1, 1, 1 }, .l = 1, .r = 1 },
+        .{ .ch = 4, .in = &.{ 1, 1, 1, 1 }, .l = 1, .r = 1 },
+    };
+    for (cases) |c| {
+        var out: [2]f32 = undefined;
+        downmixToStereo(c.in, c.ch, &out);
+        try testing.expectApproxEqAbs(c.l, out[0], 1e-6);
+        try testing.expectApproxEqAbs(c.r, out[1], 1e-6);
+    }
+    // Several frames at once.
+    var out: [4]f32 = undefined;
+    downmixToStereo(&.{ 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 }, 6, &out);
+    try testing.expectApproxEqAbs(@as(f32, 1 / (1 + 2 * k)), out[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1 / (1 + 2 * k)), out[3], 1e-6);
+}
+
+/// `src` with the last page's granule position (the stream length) replaced, and that page's
+/// checksum redone (Ogg CRC-32: polynomial 0x04c11db7, no reflection, initial value 0).
+fn withGranule(gpa: std.mem.Allocator, src: []const u8, granule: u64) ![]u8 {
+    const b = try gpa.dupe(u8, src);
+    const i = std.mem.lastIndexOf(u8, b, "OggS").?;
+    std.mem.writeInt(u64, b[i + 6 ..][0..8], granule, .little);
+    @memset(b[i + 22 ..][0..4], 0);
+    var crc: u32 = 0;
+    for (b[i..]) |byte| {
+        crc ^= @as(u32, byte) << 24;
+        for (0..8) |_| crc = if (crc & 0x80000000 != 0) (crc << 1) ^ 0x04c11db7 else crc << 1;
+    }
+    std.mem.writeInt(u32, b[i + 22 ..][0..4], crc, .little);
+    return b;
+}
+
+test "ogg: a lying length in the header allocates nothing and is not 'too long'" {
+    const a = testing.allocator;
+    const good = @embedFile("testdata/tone.ogg");
+    const real = try decodeOgg(a, good);
+    defer real.deinit(a);
+    const heap = try a.alloc(u8, 4 * 1024 * 1024); // before: 50M * 4 bytes (200 MB) up front
+    defer a.free(heap);
+    // Under the size limit, over the size limit, and the largest value the decoder reports.
+    for ([_]u64{ 50_000_000, 0x7fff_ffff, 0xffff_fffe }) |g| {
+        const bytes = try withGranule(a, good, g);
+        defer a.free(bytes);
+        var fba = std.heap.FixedBufferAllocator.init(heap);
+        const p = try decodeOgg(fba.allocator(), bytes);
+        try testing.expect(p.frames() >= real.frames() and p.frames() < real.frames() + 4096);
+        try testing.expectEqualSlices(f32, real.samples, p.samples[0..real.samples.len]);
+    }
+    // A length of "unknown" (all ones) is still not a usable file.
+    const unknown = try withGranule(a, good, std.math.maxInt(u64));
+    defer a.free(unknown);
+    try testing.expectError(error.InvalidAudio, decodeOgg(a, unknown));
+    // A header that claims less than there is still limits the output, as it always did.
+    const short = try withGranule(a, good, 1000);
+    defer a.free(short);
+    const q = try decodeOgg(a, short);
+    defer q.deinit(a);
+    try testing.expectEqual(@as(usize, 1000), q.frames());
+}
+
+test "R7: a header that claims a huge length does not fail a file that decodes within the limit" {
+    const a = testing.allocator;
+    const good = @embedFile("testdata/tone.ogg");
+    const real = try decodeOgg(a, good);
+    defer real.deinit(a);
+    // A limit a little above the real size, far below what the input size would reserve up front.
+    const limit: u64 = real.samples.len * @sizeOf(f32) * 2;
+    try testing.expect(good.len * ogg_reserve_frames_per_byte * @sizeOf(f32) > limit);
+    const bytes = try withGranule(a, good, 0xffff_fffe);
+    defer a.free(bytes);
+    const p = try decodeOggLimit(a, bytes, limit);
+    defer p.deinit(a);
+    try testing.expectEqualSlices(f32, real.samples, p.samples[0..real.samples.len]);
+    // The limit still applies to what is decoded.
+    try testing.expectError(error.TooLong, decodeOggLimit(a, bytes, real.samples.len * @sizeOf(f32) / 2));
 }

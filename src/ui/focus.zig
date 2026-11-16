@@ -29,7 +29,16 @@
 //! entries of the *previous* frame (`State.reg`), wrapping around, skipping disabled ones. Only
 //! the topmost open popup's entries take part while a popup is open. The Tab key is removed from
 //! the frame's events. A widget that is not declared in a frame (scrolled out and culled, collapsed)
-//! cannot be reached by Tab, and focus on a widget that vanishes is cleared.
+//! cannot be reached by Tab, and focus on a widget that vanishes is cleared: at the end of a frame
+//! (`Ui.finish`), focus whose widget was not declared in that frame is dropped. Two exceptions, so
+//! that this never takes away a focus the app asked for: a widget focused by `setFocus` may be
+//! declared in the next frame instead (the grace is one frame), and while the table of entries has
+//! overflowed beyond what can be remembered (`max_entries` + `max_overflow` widgets in one frame)
+//! focus is kept, since it cannot be told whether its widget was declared.
+//!
+//! A Tab that comes after other keys or text in the same frame (`a`, Tab, `b`) takes effect at the
+//! start of the next frame, with the events that followed it: the ones before it belong to the
+//! widget that had focus when they were typed. Tab first in the frame acts at once, as always.
 //!
 //! ## Keys
 //!
@@ -50,11 +59,18 @@ const State = ui_mod.State;
 
 pub const FocusId = u64;
 
+/// Events one frame can hold (the length of `Input.queue`).
+const queue_cap = @typeInfo(@FieldType(ui_mod.Input, "queue")).array.len;
+
 /// Set on every derived id; no address has it.
 pub const derived_bit: FocusId = @as(FocusId, 1) << 63;
 
-/// Most widgets remembered per frame; further ones still work with the mouse, but Tab skips them.
+/// Most widgets remembered per frame; further ones still work with the mouse and keep their focus,
+/// but Tab skips them. Their ids are still counted (up to `max_overflow` of them) so that derived
+/// ids stay distinct and focus on them is not cleared as a vanished widget.
 pub const max_entries = 256;
+/// Ids kept, without an entry, for the widgets past `max_entries`.
+pub const max_overflow = 512;
 /// Longest label kept per entry (longer ones are cut on a character boundary).
 pub const max_label = 40;
 /// Deepest nest of scroll areas recorded for one entry.
@@ -92,6 +108,8 @@ pub const Entry = struct {
     role: Role,
     /// Popup layer it was declared in (0 = the main stream).
     layer: u8,
+    /// The popup it was declared in, by address (never dereferenced); null in the main stream.
+    popup: ?*const anyopaque = null,
     disabled: bool,
     /// Plain Tab belongs to the widget (a text area with `tab_inserts`).
     captures_tab: bool,
@@ -126,6 +144,16 @@ pub const Registry = struct {
     /// Widgets that lost focus after they were drawn this / last frame.
     carry_lost: ?*const anyopaque = null,
     lost_last: ?*const anyopaque = null,
+    /// Ids of this frame's widgets past `max_entries`, and whether even those ran out.
+    over: [max_overflow]FocusId = undefined,
+    over_n: u16 = 0,
+    over_full: bool = false,
+    /// The id `setFocus` was last asked for, and how many frame ends it has survived undeclared.
+    grace: ?*const anyopaque = null,
+    grace_age: u8 = 0,
+    /// Events that came after a Tab that was not first in its frame; see `processTab`.
+    parked: [queue_cap]ui_mod.InEvent = undefined,
+    parked_n: u8 = 0,
 
     /// Last completed frame's entries, in declaration order.
     pub fn last(r: *const Registry) []const Entry {
@@ -138,9 +166,22 @@ pub const Registry = struct {
     }
 
     fn add(r: *Registry, e: Entry) void {
-        if (r.lens[r.cur_i] >= max_entries) return;
+        if (r.lens[r.cur_i] >= max_entries) {
+            if (r.over_n < max_overflow) {
+                r.over[r.over_n] = e.id;
+                r.over_n += 1;
+            } else r.over_full = true;
+            return;
+        }
         r.bufs[r.cur_i][r.lens[r.cur_i]] = e;
         r.lens[r.cur_i] += 1;
+    }
+
+    /// Whether a widget with this id registered in the frame being collected.
+    fn has(r: *Registry, id: FocusId) bool {
+        if (find(r.current(), id) != null) return true;
+        for (r.over[0..r.over_n]) |o| if (o == id) return true;
+        return false;
     }
 };
 
@@ -253,11 +294,10 @@ pub fn autoId(ui: *Ui, tag: u64, key: u64, explicit: ?u64) FocusId {
     const k = intHash(intHash(base, tag), key);
     const s = ui.state orelse return finalize(intHash(k, 0));
     frameBegin(ui, s);
-    const cur = s.reg.current();
     var n: u64 = 0;
     while (true) : (n += 1) {
         const id = finalize(intHash(k, n));
-        if (find(cur, id) == null) return id;
+        if (!s.reg.has(id)) return id;
     }
 }
 
@@ -282,10 +322,19 @@ pub fn rotate(s: *State, explicit: bool) void {
     // `explicit`: the frame is known to be over (`finish`). Otherwise this runs at the start of the
     // next frame, and code may have moved focus since (`focusOn` a widget not drawn yet): leave that.
     if (s.focus) |f| {
-        if ((explicit or s.focus == reg.seen_focus) and find(reg.current(), idOfPtr(f)) == null) s.focus = null;
+        const gone = !reg.has(idOfPtr(f)) and !reg.over_full;
+        if ((explicit or f == reg.seen_focus) and gone) {
+            // `setFocus` may name a widget that is declared next frame instead of this one.
+            if (reg.grace == f and reg.grace_age == 0) reg.grace_age = 1 else s.focus = null;
+        }
     }
+    if (reg.grace) |g| if (s.focus != g or reg.has(idOfPtr(g))) {
+        reg.grace = null;
+    };
     reg.cur_i ^= 1;
     reg.lens[reg.cur_i] = 0;
+    reg.over_n = 0;
+    reg.over_full = false;
     reg.open = false;
     reg.reveal_pending = false;
     reg.end_focus = s.focus;
@@ -297,7 +346,7 @@ fn setRaw(s: *State, p: ?*const anyopaque) void {
     const old = s.focus;
     s.focus = p;
     if (old) |o| if (o != p) {
-        if (find(s.reg.current(), idOfPtr(o)) != null) s.reg.carry_lost = o;
+        if (s.reg.has(idOfPtr(o))) s.reg.carry_lost = o;
     };
 }
 
@@ -311,6 +360,20 @@ fn focusedEntry(s: *State) ?*const Entry {
     const f = s.focus orelse return null;
     const id = idOfPtr(f);
     return find(s.reg.current(), id) orelse find(s.reg.last(), id);
+}
+
+/// The popup layer of the focused widget as of its last registration; null if nothing has focus
+/// or the focused id was not declared in this or the last frame.
+pub fn focusLayer(s: *State) ?u8 {
+    const e = focusedEntry(s) orelse return null;
+    return e.layer;
+}
+
+/// The popup (by address) the focused widget was declared in; null if nothing has focus, it sits in
+/// the main stream, or it was not declared in this or the last frame.
+pub fn focusPopup(s: *State) ?*const anyopaque {
+    const e = focusedEntry(s) orelse return null;
+    return e.popup;
 }
 
 /// Moves focus to the next (`dir` > 0) or previous entry of the last frame in the topmost layer.
@@ -343,8 +406,26 @@ fn plainMods(m: keys.Mods) bool {
     return !m.cmd and !m.ctrl and !m.alt;
 }
 
+/// Tab moves focus. Keys and text before it in the frame belong to the widget that has focus, so
+/// the Tab and everything after it are parked and replayed first in the next frame. Two limits
+/// follow from parking when the frame's first widget (or popup) is declared, not when the events
+/// arrive: code that reads `ui.input.events()` or `ui.events()` before that sees the parked
+/// events in this frame and again in the next, and a mouse press of the same frame is applied
+/// one frame before the keys that came after the Tab. Declaring a focusable widget before reading
+/// events avoids the first.
 fn processTab(ui: *Ui, s: *State) void {
     const q = &ui.input;
+    const reg = &s.reg;
+    // Events parked by the last frame come first, ahead of whatever arrived since.
+    if (reg.parked_n > 0) {
+        const n: usize = reg.parked_n;
+        const keep = @min(q.queue_len, q.queue.len - n);
+        q.lose(q.queue_len - keep);
+        std.mem.copyBackwards(ui_mod.InEvent, q.queue[n .. n + keep], q.queue[0..keep]);
+        @memcpy(q.queue[0..n], reg.parked[0..n]);
+        q.queue_len = n + keep;
+        reg.parked_n = 0;
+    }
     var i: usize = 0;
     while (i < q.queue_len) {
         const ev = q.queue[i];
@@ -352,6 +433,16 @@ fn processTab(ui: *Ui, s: *State) void {
             const shift = ev.key.mods.shift;
             const captured = !shift and if (focusedEntry(s)) |e| e.captures_tab else false;
             if (!captured) {
+                if (i > 0) {
+                    // Keys and text typed before the Tab belong to the widget that has focus now:
+                    // keep the Tab and what follows for the next frame.
+                    const n = q.queue_len - i;
+                    @memcpy(reg.parked[0..n], q.queue[i..q.queue_len]);
+                    reg.parked_n = @intCast(n);
+                    q.queue_len = i;
+                    ui.requestRedraw();
+                    return;
+                }
                 q.removeEvent(i);
                 _ = moveFocus(s, if (shift) -1 else 1);
                 continue;
@@ -380,6 +471,8 @@ pub fn setFocus(ui: *Ui, id: FocusId) void {
     frameBegin(ui, s);
     setRaw(s, ptrOfId(id));
     s.reg.reveal_pending = true;
+    s.reg.grace = ptrOfId(id);
+    s.reg.grace_age = 0;
 }
 
 pub fn isFocused(ui: *const Ui, id: FocusId) bool {
@@ -469,7 +562,7 @@ pub fn focusable(ui: *Ui, id: FocusId, r: Rect, opts: FocusOpts) FocusResult {
     const s = ui.state orelse return res;
     frameBegin(ui, s);
     const reg = &s.reg;
-    if (find(reg.current(), id) != null) return res; // first one wins
+    if (reg.has(id)) return res; // first one wins
     const ptr = ptrOfId(id);
 
     var e: Entry = .{
@@ -477,6 +570,7 @@ pub fn focusable(ui: *Ui, id: FocusId, r: Rect, opts: FocusOpts) FocusResult {
         .rect = r,
         .role = opts.role,
         .layer = ui.layer,
+        .popup = if (ui.popup_n > 0) ui.popup_stack[ui.popup_n - 1].st else null,
         .disabled = opts.disabled,
         .captures_tab = opts.captures_tab,
         .scroll_n = 0,
@@ -520,6 +614,9 @@ pub fn focusable(ui: *Ui, id: FocusId, r: Rect, opts: FocusOpts) FocusResult {
     }
     res.focused = focused;
     res.gained = focused and reg.end_focus != ptr;
+    // One selection at a time: focusing a text widget (by Tab or code too, not only by a click)
+    // ends the selection of a read-only text.
+    if (res.gained and (opts.role == .text_field or opts.role == .text_area)) s.select = null;
     res.lost = !focused and (reg.end_focus == ptr or reg.lost_last == ptr);
     res.visible = focused and reg.visible and !opts.disabled;
     reg.seen_focus = s.focus;

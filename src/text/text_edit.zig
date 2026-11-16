@@ -64,6 +64,8 @@ pub const TextEdit = struct {
     max_len: usize = std.math.maxInt(usize),
     /// Holds the text returned by `cut`.
     scratch: std.ArrayList(u8) = .empty,
+    /// Bytes of text after the caret that `insertAs` has moved to make room, summed (tests only).
+    moved_bytes: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     /// Undo/redo history. Starts empty and is freed by `deinit`; tune `history.limits`
     /// (entry and byte caps, the typing pause) if the defaults do not suit.
     history: History = .{},
@@ -157,8 +159,8 @@ pub const TextEdit = struct {
 
     /// Reverts the newest step: restores the text, caret and selection from
     /// before it. Returns false if there is nothing to undo (or it cannot be done:
-    /// out of memory or `max_len`; if the text was changed behind the history's
-    /// back the history is dropped).
+    /// out of memory, or `max_len` is now too small to take the text back: the whole history
+    /// is dropped then, as it is when the text was changed behind its back).
     pub fn undo(e: *TextEdit) bool {
         const en = e.history.peekUndo() orelse return false;
         if (!e.matches(en.offset, en.inserted())) {
@@ -166,7 +168,10 @@ pub const TextEdit = struct {
             return false;
         }
         const len = e.buf.items.len - en.inserted().len + en.removed().len;
-        if (len > e.max_len and en.removed().len > en.inserted().len) return false;
+        if (len > e.max_len and en.removed().len > en.inserted().len) {
+            e.history.clear(e.gpa);
+            return false;
+        }
         e.history.reserve(e.gpa) catch return false;
         e.buf.replaceRange(e.gpa, en.offset, en.inserted().len, en.removed()) catch return false;
         e.history.moveToRedo();
@@ -174,7 +179,8 @@ pub const TextEdit = struct {
         return true;
     }
 
-    /// Re-applies the newest undone step. Returns false if there is nothing to redo.
+    /// Re-applies the newest undone step. Returns false if there is nothing to redo, or `max_len`
+    /// is now too small for it (the undone steps are dropped then; the undo steps stay).
     pub fn redo(e: *TextEdit) bool {
         const en = e.history.peekRedo() orelse return false;
         if (!e.matches(en.offset, en.removed())) {
@@ -182,7 +188,10 @@ pub const TextEdit = struct {
             return false;
         }
         const len = e.buf.items.len - en.removed().len + en.inserted().len;
-        if (len > e.max_len and en.inserted().len > en.removed().len) return false;
+        if (len > e.max_len and en.inserted().len > en.removed().len) {
+            e.history.dropRedo(e.gpa);
+            return false;
+        }
         e.history.reserve(e.gpa) catch return false;
         e.buf.replaceRange(e.gpa, en.offset, en.removed().len, en.inserted()) catch return false;
         e.history.moveToUndo();
@@ -314,27 +323,41 @@ pub const TextEdit = struct {
             } else |_| {}
         };
         e.deleteRangeRaw(e.selection().start, e.selection().end);
+        // Filter into a scratch copy (the result is never longer than `str`), then change the
+        // buffer once: inserting piece by piece would move the text after the caret each time.
+        var small: [256]u8 = undefined;
+        var big: []u8 = &.{};
+        defer if (big.len > 0) e.gpa.free(big);
+        var keep: []u8 = &small;
+        if (str.len > small.len) {
+            big = try e.gpa.alloc(u8, str.len);
+            keep = big;
+        }
+        var n: usize = 0;
         var i: usize = 0;
         while (i < str.len) {
-            const n = std.unicode.utf8ByteSequenceLength(str[i]) catch {
+            const len = std.unicode.utf8ByteSequenceLength(str[i]) catch {
                 i += 1;
                 continue;
             };
-            if (i + n > str.len or !std.unicode.utf8ValidateSlice(str[i .. i + n])) {
+            if (i + len > str.len or !std.unicode.utf8ValidateSlice(str[i .. i + len])) {
                 i += 1;
                 continue;
             }
-            const piece = str[i .. i + n];
-            i += n;
+            const piece = str[i .. i + len];
+            i += len;
             if (!e.multiline and (piece[0] == '\n' or piece[0] == '\r')) continue;
-            if (e.buf.items.len + n > e.max_len) {
+            if (e.buf.items.len + n + len > e.max_len) {
                 truncated = true;
                 cut_piece = piece;
                 break;
             }
-            try e.buf.insertSlice(e.gpa, e.cursor, piece);
-            e.cursor += n;
+            @memcpy(keep[n..][0..len], piece);
+            n += len;
         }
+        if (builtin.is_test) e.moved_bytes += e.buf.items.len - e.cursor;
+        try e.buf.insertSlice(e.gpa, e.cursor, keep[0..n]);
+        e.cursor += n;
     }
 
     fn deleteRangeRaw(e: *TextEdit, start: usize, end: usize) void {
@@ -560,7 +583,13 @@ pub fn wordRange(str: []const u8, pos: usize) TextEdit.Range {
 }
 
 /// The unit a mouse selection grows by.
-pub const Granularity = enum { char, word, line };
+pub const Granularity = enum {
+    char,
+    word,
+    line,
+    /// Everything, and a drag keeps it so (a password field has no words).
+    all,
+};
 
 /// Mouse selection by click count, shared by every text widget: a double click selects the word,
 /// a triple click the line (between newlines; a single-line field has one), and dragging after
@@ -588,8 +617,7 @@ pub const MultiClick = struct {
             wordRange(str, off)
         else
             .{ .start = lineStart(str, off), .end = lineEnd(str, off) };
-        // With `all` there is nothing to grow (a drag keeps everything selected).
-        m.* = .{ .gran = if (all) .char else if (clicks > 2) .line else .word, .start = r.start, .end = r.end };
+        m.* = .{ .gran = if (all) .all else if (clicks > 2) .line else .word, .start = r.start, .end = r.end };
         return r;
     }
 
@@ -598,6 +626,7 @@ pub const MultiClick = struct {
     pub fn extend(m: MultiClick, str: []const u8, off: usize) Sel {
         const unit: TextEdit.Range = switch (m.gran) {
             .char => .{ .start = off, .end = off },
+            .all => return .{ .anchor = m.start, .cursor = m.end },
             .word => wordRange(str, off),
             .line => .{ .start = lineStart(str, off), .end = lineEnd(str, off) },
         };
@@ -1253,10 +1282,7 @@ test "undo: max_len is respected when undo or redo would grow the text" {
     e.max_len = 3;
     try t.expect(!e.undo()); // would grow to 6 bytes
     try t.expectEqualStrings("ef", e.text());
-    try t.expect(e.canUndo());
-    e.max_len = 100;
-    try t.expect(e.undo());
-    try t.expectEqualStrings("abcdef", e.text());
+    try t.expect(!e.canUndo()); // dropped, not kept to fail on every Cmd+Z
 }
 
 test "undo: a failed insert is not recorded as text that is not there" {
@@ -1387,4 +1413,59 @@ test "undo: random edits undo to the start and redo to the end" {
         try t.expect(std.unicode.utf8ValidateSlice(e.text()));
     }
     try t.expectEqualStrings(final, e.text());
+}
+
+test "insert: a big paste is one buffer change, not one per character" {
+    var fa = std.testing.FailingAllocator.init(t.allocator, .{});
+    var e = TextEdit.init(fa.allocator());
+    defer e.deinit();
+    const big = try t.allocator.alloc(u8, 100_000);
+    defer t.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = if (i % 7 == 3) 0x20 else 'a' + @as(u8, @intCast(i % 20));
+    try e.insertAs(big, .paste);
+    try t.expectEqualStrings(big, e.text());
+    // The buffer grew once (plus the history's copy and a scratch copy), not ~25 times.
+    try t.expect(fa.alloc_index + fa.resize_index <= 8);
+
+    // In front of 100 KB of existing text the tail moves once, not once per pasted character
+    // (about 10 GB for 100 KB). The bound allows for the history's copy of the text being replaced.
+    var g = TextEdit.init(t.allocator);
+    defer g.deinit();
+    try g.insert(big);
+    g.moveTo(0, false);
+    g.moved_bytes = 0;
+    try g.insertAs(big, .paste);
+    try t.expectEqual(big.len * 2, g.text().len);
+    try t.expect(g.moved_bytes <= big.len);
+
+    // In front of existing text: the same result as typing it in piece by piece.
+    var f = TextEdit.init(t.allocator);
+    defer f.deinit();
+    try f.insert("tail");
+    f.moveTo(0, false);
+    try f.insertAs("é\xFFx\n中\xC3", .paste);
+    try expectText(&f, "éx中tail", 6, 6);
+    try t.expect(f.undo());
+    try t.expectEqualStrings("tail", f.text());
+}
+
+test "undo: a step blocked by max_len is dropped with the history, not kept dead" {
+    var e = try fresh("abcdef");
+    defer e.deinit();
+    e.clearHistory();
+    e.moveTo(0, false);
+    e.moveTo(4, true);
+    try t.expect(e.backspace(.char));
+    e.max_len = 3;
+    try t.expect(!e.undo()); // would grow to 6 bytes
+    try t.expectEqualStrings("ef", e.text());
+    // Nothing is left that Cmd+Z (or the menu's Undo) would silently fail on.
+    try t.expect(!e.canUndo());
+    // Redo that cannot be applied is dropped the same way.
+    e.max_len = 100;
+    try e.insert("xyz");
+    try t.expect(e.undo());
+    e.max_len = 3;
+    try t.expect(!e.redo());
+    try t.expect(!e.canRedo());
 }
