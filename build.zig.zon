@@ -30,6 +30,12 @@
             .hash = "N-V-__8AAKFQVQC4NjbzesYbaBSKdGJUM7BCrXWCSbndWXMK",
             .lazy = true,
         },
+        // Single-file MP3 decoder (dr_mp3, public domain / MIT-0), built from src/audio_impl.c.
+        .dr_libs = .{
+            .url = "https://github.com/mackron/dr_libs/archive/f12e197fd462e4c22873fbd70d11b1d2f2c1dc3c.tar.gz",
+            .hash = "N-V-__8AAAA2GwBCvgJQuQNemrXpKfBssBMn8IXWVEVs5R-I",
+            .lazy = true,
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "build", "src", "examples", "README.md" },
 }

@@ -68,7 +68,7 @@ const c = struct {
     const DialogCallback = *const fn (userdata: ?*anyopaque, filelist: ?[*:null]const ?[*:0]const u8, filter: c_int) callconv(.c) void;
 
     extern fn SDL_Init(flags: u32) bool;
-    extern fn SDL_Quit() void;
+    extern fn SDL_QuitSubSystem(flags: u32) void;
     extern fn SDL_GetError() [*:0]const u8;
     extern fn SDL_Delay(ms: u32) void;
     extern fn SDL_GetTicks() u64;
@@ -673,7 +673,8 @@ pub const Window = struct {
         live_windows -= 1;
         if (live_windows == 0) {
             c.TTF_Quit();
-            c.SDL_Quit();
+            // Only video: an `Audio` may still be using SDL (it quits its own subsystem).
+            c.SDL_QuitSubSystem(c.INIT_VIDEO);
         }
     }
 

@@ -20,6 +20,11 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
 - `src/raster.zig` — rasteriser for parsed SVGs: curve flattening, stroker, exact-area scanline
   fill, A8 masks and RGBA. Pure Zig.
 - `src/svg_cache.zig` — the bounded per-(icon, pixel size) texture cache policy. Pure.
+- `src/audio_pcm.zig` — `Pcm` (decoded float32 audio), WAV parse/encode, OGG Vorbis and MP3
+  decoding, waveform peaks, level metering helpers. Pure: no device.
+- `src/audio_mixer.zig` — the voice mixer (slots, linear resampling, gain ramps). Pure.
+- `src/audio.zig` — `vass.audio.Audio`: sounds, playback voices and microphone recording on SDL3
+  audio streams.
 - `src/backend_sdl.zig` — SDL3 windows, input, text measuring and the display-list
   renderer (text via SDL3_ttf + FreeType).
 - `src/macos.zig` — menu-bar item, overlay windows, Spaces behaviour and notch metrics,
@@ -29,7 +34,7 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
   from the castholm/SDL package).
 
 Layering rule: `geom`, `gfx`, `image`, `png`, `svg`, `raster` and `svg_cache` know nothing about the platform; only the backend
-and `macos` do.
+and `macos` do. (`audio_pcm` and `audio_mixer` are pure too; only `audio.zig` talks to SDL.)
 
 ## Using it
 
@@ -51,6 +56,12 @@ a pinned, hashed lazy dependency in `build.zig.zon` (commit 9600522) compiled as
 `src/stb_impl.c`, with only PNG, JPEG, BMP and GIF enabled. It is independent of SDL, so it is
 built with `-Dsystem-sdl=true` too. It adds roughly 75 KB of code to a binary that uses images
 (the linker drops it from apps that do not).
+
+Audio decoding uses two more single-file libraries, both pinned and hashed lazy dependencies
+compiled together as `src/audio_impl.c`: `stb_vorbis.c` from the same stb checkout (Ogg Vorbis,
+public domain / MIT) and [dr_mp3](https://github.com/mackron/dr_libs) (commit f12e197, public
+domain / MIT-0). Like stb_image they are dropped by the linker from apps that never decode audio.
+SDL's audio subsystem and CoreAudio were already part of the static SDL build.
 
 `-Dsystem-sdl=true` skips all that and links the Homebrew dylibs (`brew install sdl3
 sdl3_ttf`, looked up in /opt/homebrew/lib) as before. The source dependencies are lazy, so
@@ -368,3 +379,113 @@ a colour SVG, and icons at fractional positions. Licences: `LICENSE-lucide.txt`,
 `LICENSE-phosphor.txt` in that folder. The tests cover the path grammar, arcs, transforms,
 style inheritance, colours, malformed input, rasteriser areas (square, circle, round-capped line,
 joins, even-odd), gradients and the cache policy.
+
+## Audio, sliders and waveforms
+
+`vass.audio` plays and records sound; `Ui.slider` and `Ui.waveform` are the two widgets that go
+with it (the slider is general purpose). `zig build audio -- --snapshot DIR` draws
+`examples/audio.zig`: generated tones that overlap, an embedded WAV and OGG, a looped pad with
+pause and resume, a master-volume slider, a recorder with a live level meter, and a waveform of
+the recording with playback, click-to-seek and Save WAV. In snapshot mode it uses SDL's silent
+"dummy" audio driver and synthetic data (the level meter, the 0:06 length and the half-way
+playhead are staged), so the picture needs no sound card and no microphone.
+
+    var audio = vass.audio.Audio.init(gpa, .{});   // opens no device yet; declare it after the Window
+    defer audio.deinit();
+    const click = try audio.loadSound(@embedFile("click.wav"));   // WAV, OGG Vorbis or MP3, by content
+    const v = try audio.play(click, .{ .volume = 0.8, .loop = false, .start = 0 });
+    audio.pause(v); audio.resumeVoice(v); audio.seek(v, 1.5); audio.setVolume(v, 0.5); audio.stop(v);
+    audio.position(v); audio.duration(v); audio.isPlaying(v); audio.voiceState(v); // .playing .paused .ended
+    audio.setMasterVolume(0.7);
+
+- **Sounds** are decoded float32 PCM (mono or stereo, any sample rate up to 768 kHz, at most
+  256 MB) owned by the `Audio` and referred to by a small copyable `Sound` handle, like `Image`s:
+  `loadSound(bytes)`, `loadSoundFile(path)`, `soundFromSamples(samples, rate, channels)` (copies),
+  `soundFromPcm(pcm)` (takes ownership), `unloadSound(s)` (stops the sound's voices first, so it
+  is safe while playing), `soundDuration`, `soundPcm`. Stale handles are ignored everywhere.
+- **Formats.** WAV (a pure-Zig parser): integer PCM 8 (unsigned), 16, 24 and 32 bits and float
+  32 / 64 bits, mono or stereo, also WAVE_FORMAT_EXTENSIBLE; tolerant of unknown and odd-sized
+  chunks, streaming files whose `data` size is 0 / 0xFFFFFFFF / too big, a partial last frame and
+  wrong RIFF sizes; truncated or lying headers give `InvalidAudio` / `UnsupportedFormat`, never a
+  crash (tests truncate generated files at every length and feed random junk). OGG Vorbis through stb_vorbis (mono, stereo; 3 to 6
+  channels are mixed down by the decoder). MP3 through dr_mp3 (mono, stereo). More than two
+  channels in a WAV, A-law / mu-law and 12-bit samples are `UnsupportedFormat`. `isAudioName(name)`
+  tells the extensions (`.wav .ogg .mp3`).
+- **Voices.** Up to 32 at once (`play` returns `error.TooManyVoices` beyond); linear resampling
+  to the 48 kHz stereo mixer; every gain change, pause, stop and seek ramps over 6 ms so none
+  clicks. A `Voice` is a (slot, generation) handle: when the sound ends or is stopped it goes
+  stale and every call on it is a no-op (`voiceState` says `.ended`). Finished voices free their
+  own slot, so nothing needs reaping. `position()` is the mixer's read position: it runs ahead of
+  the speakers by about one device buffer (1024 frames, 21 ms) plus hardware latency.
+- **Recording.** `startRecording(.{ .sample_rate = 44100, .channels = 1, .max_seconds = 300 })`
+  opens the default input device lazily (`error.NoDevice`, `error.PermissionDenied` when macOS
+  reports the microphone as denied up front, `error.AlreadyRecording`). Then `isRecording()`,
+  `recordingState()` (`.recording`, `.limit_reached`), `recordingSeconds()`, `level()` (recent peak,
+  0..1 linear, with meter ballistics; `audio.meterScale(level, -50)` maps it to 0..1 on a dB scale)
+  and `recordingPeak()` (a recording that stays at exactly 0 after a couple of seconds is what a
+  denied or muted microphone looks like on macOS, which delivers silence instead of an error).
+  `stopRecording()` returns a `Sound` (`error.EmptyRecording` if nothing arrived),
+  `cancelRecording()` discards. After `max_seconds` samples are dropped and the state says so.
+- **Peaks and files.** `soundPeaks(gpa, s, n)` gives `n` absolute peaks (0..1) for a waveform;
+  `soundWav(gpa, s)` the sound as a 16-bit WAV; `saveWav(s, path)` writes it. The pure
+  functions `audio.peaks`, `audio.encodeWav(gpa, pcm, .pcm16 | .float32)`, `audio.decode*` work on
+  a `Pcm` without any `Audio`.
+- **Threads.** SDL runs one callback on its audio thread whenever the playback device wants data.
+  It takes a short spin lock, renders the mixer into a 512-frame stack buffer, releases the lock and
+  hands the buffer to SDL: no allocation, no frees, no callbacks into the app. Every public call
+  runs on the caller's thread and takes the same lock for a few instructions, so voice operations
+  are atomic. Sounds live in the `Audio`'s table and voices only borrow their samples under the
+  lock; `unloadSound` stops its voices first, so the audio thread never reads freed memory. Recording
+  is polled instead: SDL queues the microphone in a thread-safe stream and the UI thread drains it
+  in `level`, `recordingSeconds`, `update` and `stopRecording`, so the audio thread never touches
+  the recording buffer and a stalled UI loses nothing. `deinit` destroys the streams (which waits
+  for a callback in progress) before freeing anything.
+- **Redraws.** Vass has no blocking event wait: the app owns its loop (`pollEvent`, draw, sleep),
+  so progress bars and meters animate on their own as long as the app keeps drawing, which the
+  examples and Habor do every frame. For an app that redraws only on input, `audio.busy()` is
+  true while a sound is playing or the microphone is open: keep drawing frames while it is.
+  `audio.update()` is optional per-frame housekeeping (drains the microphone, pauses the output
+  device after 2 s of silence; the next `play` restarts it).
+- **Devices and drivers.** Nothing is opened until needed: the playback device on the first
+  `play`, the recording device on `startRecording`. `Options.driver = "dummy"` (or the
+  `SDL_AUDIO_DRIVER=dummy` environment variable) selects SDL's dummy driver: playback runs in real
+  time into nowhere and the microphone records silence. The tests use it, so `zig build test`
+  makes no sound and needs no hardware. `VASS_AUDIO_REAL=1 zig build test` additionally opens the
+  real output device and queues one silent (volume 0) sound as a smoke test; it never records.
+  `Window.deinit` now quits only SDL's video subsystem and `Audio.deinit` its audio one, so the
+  order of the two does not matter.
+- **macOS microphone permission.** An app bundle that records must have `NSMicrophoneUsageDescription`
+  in its Info.plist; without it macOS ends the process the moment it touches the microphone.
+  The first recording makes the system show the permission prompt and, until the user answers, no
+  samples arrive. `Audio.microphonePermission()` reads the authorisation status without prompting
+  (`.not_determined`, `.denied`, `.granted`, `.unknown`), and `startRecording` refuses with
+  `PermissionDenied` when it is `.denied`. A binary started from a terminal (`zig build run`) has no
+  Info.plist: macOS attributes the request to the terminal app, which must itself have microphone
+  access, and the permission is the terminal's, not the binary's; if the terminal has none the
+  recording is silent. The user changes it in System Settings > Privacy & Security > Microphone.
+
+`Ui.slider(r, &value, .{ .min, .max, .step, .disabled, .track, .thumb })` is a horizontal slider
+(a track filled to a round thumb, in the look of `toggle`). Click anywhere to jump, drag the thumb
+(it keeps following the pointer past the ends), and once clicked (focus lives in `ui.state`) Left /
+Down and Right / Up move one step (a twentieth of the range when `step` is 0) and Home / End jump to
+the ends. It returns `SliderResult{ hovered, dragging, changed, released, focused }`: use `changed`
+to react to every movement and `released` to commit at the end of a drag. Values snap to multiples
+of `step` from `min` (so an end that is off the grid is not reachable). Without `ui.state` a click
+still jumps but there is no drag or focus.
+
+`Ui.waveform(r, peaks, .{ .progress, .color, .played_color, .bar_width, .gap, .min_bar, .passive,
+.disabled, .id })` draws `peaks` (0..1 each) as centred rounded bars filling `r`, reduced to the
+bars that fit (the loudest peak in each bar's share), the bars up to `progress` in
+`played_color`. It returns `WaveformResult{ hovered, clicked, dragging, released, seek }`:
+`seek` is the 0..1 position under the pointer while the button went down on it or a drag that began
+there continues (clamped when the pointer leaves sideways), so `if (res.seek) |f| audio.seek(v,
+f * duration)` is click-to-seek and drag-to-scrub. `passive` makes it draw-only (a level history
+or clip thumbnail). Drag tracking uses the address of `peaks` as its id; pass `.id` when two
+waveforms share a slice.
+
+Tests: the pure parts are unit-tested without a device: WAV parse (every sample format,
+extensible, streaming sizes, odd chunks, truncation at every length, header lies, random junk),
+encode/round-trip, OGG and MP3 decoding of small real files (`src/testdata/tone.ogg`, `tone.mp3`:
+rate, length, pitch, truncations), peaks, levels and meter scale, the mixer (end of sound, stale
+handles, overlap and slot exhaustion, looping, resampling, pause / stop fades, seeking, volume
+ramps), slider and waveform behaviour. Device tests use the dummy driver.

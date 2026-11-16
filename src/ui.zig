@@ -313,6 +313,10 @@ pub const IconButtonOpts = struct {
 
 pub const CheckOpts = controls.CheckOpts;
 pub const ToggleOpts = controls.ToggleOpts;
+pub const SliderOpts = controls.SliderOpts;
+pub const SliderResult = controls.SliderResult;
+pub const WaveformOpts = controls.WaveformOpts;
+pub const WaveformResult = controls.WaveformResult;
 pub const Segment = controls.Segment;
 pub const SegmentedOpts = controls.SegmentedOpts;
 pub const TextAreaState = text_area.TextAreaState;
@@ -1010,6 +1014,18 @@ pub const Ui = struct {
     /// for animating `toggle` later.
     pub fn toggleAt(ui: *Ui, r: Rect, pos: f32, hovered: bool, opts: ToggleOpts) void {
         controls.toggleAt(ui, r, pos, hovered, opts);
+    }
+
+    /// A horizontal slider for `value` between `opts.min` and `opts.max`: click to jump, drag
+    /// the thumb, arrow keys when focused. See `controls.zig`.
+    pub fn slider(ui: *Ui, r: Rect, value: *f32, opts: SliderOpts) SliderResult {
+        return controls.slider(ui, r, value, opts);
+    }
+
+    /// Bars for `peaks` (0..1 each, see `audio.peaks`) filling `r`, coloured up to
+    /// `opts.progress`; the result carries the 0..1 position clicked or dragged to, for seeking.
+    pub fn waveform(ui: *Ui, r: Rect, peaks: []const f32, opts: WaveformOpts) WaveformResult {
+        return controls.waveform(ui, r, peaks, opts);
     }
 
     /// A round radio button with a label; reports the click, the caller sets its value.

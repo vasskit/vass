@@ -65,6 +65,17 @@ pub fn build(b: *std.Build) void {
             .flags = &.{ "-fno-sanitize=undefined", "-fno-strict-aliasing" },
         });
     }
+    // Audio decoders: stb_vorbis (from the same stb checkout) and dr_mp3, in one C file.
+    if (b.lazyDependency("stb", .{})) |stb_dep| {
+        if (b.lazyDependency("dr_libs", .{})) |dr_dep| {
+            vass.addIncludePath(dr_dep.path("."));
+            vass.addCSourceFile(.{
+                .file = b.path("src/audio_impl.c"),
+                .flags = &.{ "-fno-sanitize=undefined", "-fno-strict-aliasing" },
+            });
+            _ = stb_dep;
+        }
+    }
     addMacosSdkPaths(b, vass, target);
     vass.linkSystemLibrary("objc", .{});
     vass.linkFramework("AppKit", .{});
@@ -133,6 +144,21 @@ pub fn build(b: *std.Build) void {
     run_icons.addPassthruArgs();
     b.step("icons", "Run the SVG icons showcase").dependOn(&run_icons.step);
     test_step.dependOn(&icons_ex.step);
+
+    // Example: audio. `zig build audio -- --snapshot DIR`.
+    const audio_ex = b.addExecutable(.{
+        .name = "audio",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/audio.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_audio = b.addRunArtifact(audio_ex);
+    run_audio.addPassthruArgs();
+    b.step("audio", "Run the audio showcase").dependOn(&run_audio.step);
+    test_step.dependOn(&audio_ex.step);
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

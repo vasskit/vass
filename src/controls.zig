@@ -9,6 +9,7 @@
 const std = @import("std");
 const geom = @import("geom.zig");
 const icons = @import("icons.zig");
+const keys = @import("keys.zig");
 const ui_mod = @import("ui.zig");
 const Rect = geom.Rect;
 const Color = geom.Color;
@@ -249,6 +250,241 @@ pub fn segmented(ui: *Ui, r: Rect, items: []const Segment, selected: *usize, opt
     return changed;
 }
 
+// ---- slider -------------------------------------------------------------------------
+
+pub const SliderOpts = struct {
+    min: f32 = 0,
+    max: f32 = 1,
+    /// Values snap to multiples of `step` from `min`; 0 is continuous. Also the arrow-key
+    /// increment (a continuous slider moves by a twentieth of its range).
+    step: f32 = 0,
+    /// Dimmed, no hover, no input.
+    disabled: bool = false,
+    /// Thickness of the track and diameter of the thumb.
+    track: f32 = 4,
+    thumb: f32 = 16,
+};
+
+pub const SliderResult = struct {
+    hovered: bool = false,
+    /// The thumb is being dragged (the button is down on it).
+    dragging: bool = false,
+    /// `value` changed this frame (click, drag or key).
+    changed: bool = false,
+    /// The button was let go this frame at the end of a drag: commit the value now.
+    released: bool = false,
+    /// Has keyboard focus (arrow keys, Home and End work).
+    focused: bool = false,
+};
+
+/// Position of `value` in the range as 0..1 (0 for an empty range or a NaN).
+pub fn sliderFrac(value: f32, min: f32, max: f32) f32 {
+    if (!(max > min) or !std.math.isFinite(value)) return 0;
+    return std.math.clamp((value - min) / (max - min), 0, 1);
+}
+
+/// The value at position `frac` (0..1), snapped to `step` from `min` when step > 0.
+pub fn sliderValue(frac: f32, min: f32, max: f32, step: f32) f32 {
+    if (!(max > min)) return min;
+    var v = min + std.math.clamp(frac, 0, 1) * (max - min);
+    if (step > 0) v = min + @round((v - min) / step) * step;
+    return std.math.clamp(v, min, max);
+}
+
+/// A horizontal slider: a track filled up to a round thumb. Click anywhere on it to jump
+/// there, drag the thumb, or (once clicked, so it has focus) use Left/Right and Down/Up for
+/// one step, Home and End for the ends. `r` is the whole hit area; the track is centred in
+/// it and the thumb stays inside it. Writes the new value to `value` and reports it.
+/// Dragging and focus need `ui.state`; without one a click still jumps.
+pub fn slider(ui: *Ui, r: Rect, value: *f32, opts: SliderOpts) SliderResult {
+    const t = ui.theme;
+    const in = &ui.input;
+    const id: *const anyopaque = value;
+    const half = opts.thumb / 2;
+    const span = @max(r.w - opts.thumb, 1);
+    var res: SliderResult = .{};
+    const hv = interact(ui, r, opts.disabled);
+    res.hovered = hv.hovered;
+    const before = value.*;
+    const fracAt = struct {
+        fn f(x: f32, left: f32, w: f32) f32 {
+            return (x - left) / w;
+        }
+    }.f;
+
+    if (!opts.disabled) {
+        if (ui.state) |s| {
+            if (hv.clicked) {
+                s.drag = id;
+                s.focus = id;
+                s.select = null;
+            } else if (in.pressed and s.focus == id) {
+                s.focus = null; // a click elsewhere
+            }
+            if (s.drag == id) {
+                if (in.down or hv.clicked) {
+                    value.* = sliderValue(fracAt(in.mouse_x, r.x + half, span), opts.min, opts.max, opts.step);
+                    res.dragging = true;
+                } else {
+                    s.drag = null;
+                    res.released = true;
+                }
+            }
+            res.focused = s.focus == id;
+            if (res.focused) {
+                const inc = if (opts.step > 0) opts.step else (opts.max - opts.min) / 20;
+                for (in.events()) |ev| switch (ev) {
+                    .key => |k| {
+                        var v = value.*;
+                        switch (k.code) {
+                            keys.left, keys.down => v -= inc,
+                            keys.right, keys.up => v += inc,
+                            keys.home => v = opts.min,
+                            keys.end => v = opts.max,
+                            else => continue,
+                        }
+                        value.* = sliderValue(sliderFrac(v, opts.min, opts.max), opts.min, opts.max, opts.step);
+                    },
+                    else => {},
+                };
+            }
+        } else if (hv.clicked) {
+            value.* = sliderValue(fracAt(in.mouse_x, r.x + half, span), opts.min, opts.max, opts.step);
+        }
+    }
+    res.changed = value.* != before;
+
+    // Drawing.
+    const p = sliderFrac(value.*, opts.min, opts.max);
+    const active = res.dragging or res.hovered;
+    const trk = opts.track;
+    const track: Rect = .{ .x = r.x + half, .y = r.y + @round((r.h - trk) / 2), .w = span, .h = trk };
+    const cx = track.x + span * p;
+    const cy = r.y + r.h / 2;
+    var bg = t.track;
+    var fill = t.accent;
+    var knob = mix(t.text, t.dim, 0.1);
+    if (active) knob = t.text;
+    if (opts.disabled) {
+        bg = faded(bg);
+        fill = faded(fill);
+        knob = faded(knob);
+    }
+    ui.list.rrect(.{ .x = r.x + half - trk / 2, .y = track.y, .w = span + trk, .h = trk }, trk / 2, bg);
+    ui.list.rrect(.{ .x = r.x + half - trk / 2, .y = track.y, .w = span * p + trk, .h = trk }, trk / 2, fill);
+    if (res.focused and !opts.disabled) ui.list.circle(cx, cy, half + 3, t.accent.alpha(70));
+    ui.list.circle(cx, cy, if (res.dragging) half + 1 else half, knob);
+    return res;
+}
+
+// ---- waveform -----------------------------------------------------------------------
+
+pub const WaveformOpts = struct {
+    /// 0..1 how far playback is; bars before it use `played_color`. Null: none played.
+    progress: ?f32 = null,
+    /// Bars not yet played. Default: the theme's dim colour.
+    color: ?Color = null,
+    /// Bars already played. Default: the theme's accent.
+    played_color: ?Color = null,
+    bar_width: f32 = 3,
+    gap: f32 = 2,
+    /// Shortest a bar is drawn, so silence still reads as a line of dots.
+    min_bar: f32 = 2,
+    /// Dimmed, and clicks are ignored.
+    disabled: bool = false,
+    /// Draw only: no hover, click or drag tracking, and no dimming (a level history, a
+    /// thumbnail of a clip).
+    passive: bool = false,
+    /// Identifies this waveform for drag tracking. Default: the address of the peaks, so
+    /// two waveforms drawn from the same slice need different ids.
+    id: ?*const anyopaque = null,
+};
+
+pub const WaveformResult = struct {
+    hovered: bool = false,
+    /// The button went down on the waveform this frame.
+    clicked: bool = false,
+    /// A drag that began on the waveform is going on (also true on the click frame).
+    dragging: bool = false,
+    /// The button was let go this frame at the end of a drag.
+    released: bool = false,
+    /// While clicking or dragging: where along the waveform the pointer is, 0..1 (clamped
+    /// to the ends, also when the pointer has left sideways). Seek there.
+    seek: ?f32 = null,
+};
+
+/// How many bars fit `w` points.
+pub fn waveformBars(w: f32, bar_width: f32, gap: f32) usize {
+    if (w <= 0 or bar_width <= 0) return 0;
+    const n = @floor((w + gap) / (bar_width + gap));
+    return if (n < 1) 0 else @intFromFloat(n);
+}
+
+/// Peak for bar `i` of `bars`: the largest of the peaks that bar covers (a bar always
+/// covers at least one), 0 if there are none.
+pub fn waveformPeak(peaks: []const f32, i: usize, bars: usize) f32 {
+    if (peaks.len == 0 or bars == 0) return 0;
+    const a = i * peaks.len / bars;
+    const b = @min(peaks.len, @max(a + 1, (i + 1) * peaks.len / bars));
+    var m: f32 = 0;
+    for (peaks[a..b]) |v| m = @max(m, if (std.math.isFinite(v)) v else 0);
+    return std.math.clamp(m, 0, 1);
+}
+
+/// Draws `peaks` (0..1 each, e.g. from `audio.peaks`) as centred vertical bars filling `r`,
+/// the played part in another colour, and turns clicks and drags into a position to seek
+/// to. Reduces or stretches the peaks to the number of bars that fit.
+pub fn waveform(ui: *Ui, r: Rect, peaks: []const f32, opts: WaveformOpts) WaveformResult {
+    const t = ui.theme;
+    const in = &ui.input;
+    var res: WaveformResult = .{};
+    const hv = interact(ui, r, opts.disabled or opts.passive);
+    res.hovered = hv.hovered;
+    const id: *const anyopaque = opts.id orelse @ptrCast(peaks.ptr);
+    if (!opts.disabled and !opts.passive and r.w > 0) {
+        const at = std.math.clamp((in.mouse_x - r.x) / r.w, 0, 1);
+        if (ui.state) |s| {
+            if (hv.clicked) {
+                s.drag = id;
+                res.clicked = true;
+            }
+            if (s.drag == id) {
+                if (in.down or hv.clicked) {
+                    res.dragging = true;
+                    res.seek = at;
+                } else {
+                    s.drag = null;
+                    res.released = true;
+                }
+            }
+        } else if (hv.clicked) {
+            res.clicked = true;
+            res.seek = at;
+        }
+    }
+
+    const bars = waveformBars(r.w, opts.bar_width, opts.gap);
+    if (bars == 0) return res;
+    const used = @as(f32, @floatFromInt(bars)) * (opts.bar_width + opts.gap) - opts.gap;
+    const x0 = r.x + (r.w - used) / 2;
+    const mid = r.y + r.h / 2;
+    const prog = if (opts.progress) |p| std.math.clamp(if (std.math.isFinite(p)) p else 0, 0, 1) else 0;
+    var base = opts.color orelse t.dim.alpha(150);
+    var played = opts.played_color orelse t.accent;
+    if (opts.disabled) {
+        base = faded(base);
+        played = faded(played);
+    }
+    for (0..bars) |i| {
+        const x = x0 + @as(f32, @floatFromInt(i)) * (opts.bar_width + opts.gap);
+        const h = std.math.clamp(@max(opts.min_bar, waveformPeak(peaks, i, bars) * r.h), opts.min_bar, @max(r.h, opts.min_bar));
+        const centre = (x + opts.bar_width / 2 - r.x) / r.w;
+        const col = if (opts.progress != null and centre <= prog) played else base;
+        ui.list.rrect(.{ .x = x, .y = mid - h / 2, .w = opts.bar_width, .h = h }, @min(opts.bar_width / 2, h / 2), col);
+    }
+    return res;
+}
+
 // ---- tests ------------------------------------------------------------------------
 
 const DisplayList = @import("gfx.zig").DisplayList;
@@ -404,4 +640,203 @@ test "segmented raises the selected segment" {
         else => {},
     };
     try std.testing.expect(found);
+}
+
+fn dragUi(list: *DisplayList, st: *ui_mod.State, x: f32, pressed: bool, down: bool) Ui {
+    var ui = Ui.initHeadless(list, .{ .mouse_x = x, .mouse_y = 10, .pressed = pressed, .down = down }, .{}, fakeMeasure);
+    ui.state = st;
+    return ui;
+}
+
+test "slider math: fraction, value, snapping, degenerate ranges" {
+    try std.testing.expectEqual(@as(f32, 0.25), sliderFrac(2.5, 0, 10));
+    try std.testing.expectEqual(@as(f32, 0), sliderFrac(-5, 0, 10));
+    try std.testing.expectEqual(@as(f32, 1), sliderFrac(50, 0, 10));
+    try std.testing.expectEqual(@as(f32, 0), sliderFrac(5, 3, 3));
+    try std.testing.expectEqual(@as(f32, 0), sliderFrac(std.math.nan(f32), 0, 1));
+    try std.testing.expectEqual(@as(f32, 7.5), sliderValue(0.75, 0, 10, 0));
+    try std.testing.expectEqual(@as(f32, 8), sliderValue(0.77, 0, 10, 2)); // 7.7 snaps to 8
+    try std.testing.expectEqual(@as(f32, 9), sliderValue(2, 0, 10, 3)); // clamped, then on the step grid
+    try std.testing.expectEqual(@as(f32, 0), sliderValue(-1, 0, 10, 0));
+    try std.testing.expectEqual(@as(f32, 3), sliderValue(0.5, 3, 3, 1));
+}
+
+test "slider: click jumps, drag follows past the ends, release reports" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var st: ui_mod.State = .{};
+    var v: f32 = 0;
+    // 116 wide with a 16 thumb: the thumb centre travels x = 8 .. 108.
+    const r: Rect = .{ .x = 0, .y = 0, .w = 116, .h = 24 };
+    var ui = dragUi(&list, &st, 58, true, true);
+    var res = ui.slider(r, &v, .{ .min = 0, .max = 100 });
+    try std.testing.expect(res.changed and res.dragging and res.focused);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), v, 0.01);
+    // Drag to the right, beyond the control: pinned to max.
+    list.reset();
+    ui = dragUi(&list, &st, 400, false, true);
+    res = ui.slider(r, &v, .{ .min = 0, .max = 100 });
+    try std.testing.expect(res.changed and res.dragging);
+    try std.testing.expectEqual(@as(f32, 100), v);
+    // Same position again: no change.
+    list.reset();
+    ui = dragUi(&list, &st, 400, false, true);
+    try std.testing.expect(!ui.slider(r, &v, .{ .min = 0, .max = 100 }).changed);
+    // Let go: released, no longer dragging, value stays.
+    list.reset();
+    ui = dragUi(&list, &st, 400, false, false);
+    res = ui.slider(r, &v, .{ .min = 0, .max = 100 });
+    try std.testing.expect(res.released and !res.dragging and !res.changed);
+    try std.testing.expect(st.drag == null);
+    try std.testing.expectEqual(@as(f32, 100), v);
+    // Moving with the button up does nothing.
+    list.reset();
+    ui = dragUi(&list, &st, 20, false, false);
+    try std.testing.expect(!ui.slider(r, &v, .{ .min = 0, .max = 100 }).changed);
+}
+
+test "slider: step snapping, arrow keys when focused, a click elsewhere blurs" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var st: ui_mod.State = .{};
+    var v: f32 = 0;
+    const r: Rect = .{ .x = 0, .y = 0, .w = 116, .h = 24 };
+    const o: SliderOpts = .{ .min = 0, .max = 10, .step = 1 };
+    var ui = dragUi(&list, &st, 8 + 100 * 0.34, true, true); // 3.4 snaps to 3
+    _ = ui.slider(r, &v, o);
+    try std.testing.expectEqual(@as(f32, 3), v);
+    list.reset();
+    ui = dragUi(&list, &st, 8 + 34, false, false); // release
+    _ = ui.slider(r, &v, o);
+    // Keys.
+    list.reset();
+    ui = dragUi(&list, &st, 1000, false, false);
+    ui.input.pushKey(keys.right, .{});
+    ui.input.pushKey(keys.right, .{});
+    var res = ui.slider(r, &v, o);
+    try std.testing.expect(res.changed and res.focused);
+    try std.testing.expectEqual(@as(f32, 5), v);
+    list.reset();
+    ui = dragUi(&list, &st, 1000, false, false);
+    ui.input.pushKey(keys.down, .{});
+    ui.input.pushKey(keys.end, .{});
+    ui.input.pushKey(keys.right, .{}); // past the end: stays
+    _ = ui.slider(r, &v, o);
+    try std.testing.expectEqual(@as(f32, 10), v);
+    ui.input.pushKey(keys.home, .{});
+    list.reset();
+    ui = dragUi(&list, &st, 1000, false, false);
+    ui.input.pushKey(keys.home, .{});
+    _ = ui.slider(r, &v, o);
+    try std.testing.expectEqual(@as(f32, 0), v);
+    // A press elsewhere takes the focus away: keys then do nothing.
+    list.reset();
+    ui = dragUi(&list, &st, 1000, true, true);
+    res = ui.slider(r, &v, o);
+    try std.testing.expect(!res.focused);
+    list.reset();
+    ui = dragUi(&list, &st, 1000, false, false);
+    ui.input.pushKey(keys.right, .{});
+    try std.testing.expect(!ui.slider(r, &v, o).changed);
+    // Continuous sliders step by a twentieth of the range.
+    var w: f32 = 0.5;
+    st.focus = &w;
+    list.reset();
+    ui = dragUi(&list, &st, 1000, false, false);
+    ui.input.pushKey(keys.left, .{});
+    _ = ui.slider(r, &w, .{});
+    try std.testing.expectApproxEqAbs(@as(f32, 0.45), w, 1e-6);
+}
+
+test "slider: disabled ignores everything; without a state a click still jumps" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var st: ui_mod.State = .{};
+    var v: f32 = 0.2;
+    const r: Rect = .{ .x = 0, .y = 0, .w = 116, .h = 24 };
+    var ui = dragUi(&list, &st, 58, true, true);
+    var res = ui.slider(r, &v, .{ .disabled = true });
+    try std.testing.expect(!res.changed and !res.hovered and st.drag == null);
+    try std.testing.expectEqual(@as(f32, 0.2), v);
+    list.reset();
+    var bare = clickUi(&list, 108, 10, true);
+    res = bare.slider(r, &v, .{});
+    try std.testing.expect(res.changed);
+    try std.testing.expectEqual(@as(f32, 1), v);
+    // It draws a track, a fill and a thumb.
+    var circles: usize = 0;
+    for (list.cmds.items) |c| if (c == .ellipse) {
+        circles += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), circles);
+}
+
+test "waveform: bar layout and peak reduction" {
+    try std.testing.expectEqual(@as(usize, 20), waveformBars(100, 3, 2)); // 5 per bar, last gap trimmed
+    try std.testing.expectEqual(@as(usize, 0), waveformBars(2, 3, 2));
+    try std.testing.expectEqual(@as(usize, 0), waveformBars(0, 3, 2));
+    try std.testing.expectEqual(@as(usize, 1), waveformBars(3, 3, 2));
+    const pk = [_]f32{ 0.1, 0.9, 0.2, 0.3, 0.4, 0.5 };
+    // 3 bars over 6 peaks: pairs.
+    try std.testing.expectEqual(@as(f32, 0.9), waveformPeak(&pk, 0, 3));
+    try std.testing.expectEqual(@as(f32, 0.3), waveformPeak(&pk, 1, 3));
+    try std.testing.expectEqual(@as(f32, 0.5), waveformPeak(&pk, 2, 3));
+    // More bars than peaks repeats; no peaks is flat; NaN counts as 0.
+    try std.testing.expectEqual(@as(f32, 0.9), waveformPeak(&pk, 2, 12));
+    try std.testing.expectEqual(@as(f32, 0), waveformPeak(&.{}, 0, 4));
+    try std.testing.expectEqual(@as(f32, 0), waveformPeak(&.{std.math.nan(f32)}, 0, 1));
+}
+
+test "waveform: colours the played bars, reports click and drag positions" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var st: ui_mod.State = .{};
+    const pk = [_]f32{ 0.5, 1.0, 0.25, 0.75 };
+    const r: Rect = .{ .x = 10, .y = 0, .w = 100, .h = 40 };
+    // 20 bars; progress 0.5 colours the first ten.
+    var ui = dragUi(&list, &st, 1000, false, false);
+    _ = ui.waveform(r, &pk, .{ .progress = 0.5 });
+    var played: usize = 0;
+    var unplayed: usize = 0;
+    for (list.cmds.items) |c| switch (c) {
+        .rrect => |b| {
+            if (std.meta.eql(b.color, ui.theme.accent)) played += 1 else unplayed += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 10), played);
+    try std.testing.expectEqual(@as(usize, 10), unplayed);
+    // No progress: nothing is played.
+    list.reset();
+    _ = ui.waveform(r, &pk, .{});
+    for (list.cmds.items) |c| if (c == .rrect) try std.testing.expect(!std.meta.eql(c.rrect.color, ui.theme.accent));
+    // Click at 25 % then drag past the right edge and let go.
+    list.reset();
+    ui = dragUi(&list, &st, 35, true, true);
+    var res = ui.waveform(r, &pk, .{});
+    try std.testing.expect(res.clicked and res.dragging);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), res.seek.?, 1e-5);
+    list.reset();
+    ui = dragUi(&list, &st, 500, false, true);
+    res = ui.waveform(r, &pk, .{});
+    try std.testing.expect(!res.clicked and res.dragging);
+    try std.testing.expectEqual(@as(f32, 1), res.seek.?);
+    list.reset();
+    ui = dragUi(&list, &st, 500, false, false);
+    res = ui.waveform(r, &pk, .{});
+    try std.testing.expect(res.released and res.seek == null and st.drag == null);
+    // Passive never seeks or hovers; disabled never seeks; an empty waveform draws dots and does not crash.
+    list.reset();
+    ui = dragUi(&list, &st, 35, true, true);
+    try std.testing.expect(ui.waveform(r, &pk, .{ .disabled = true }).seek == null);
+    list.reset();
+    const pas = ui.waveform(r, &pk, .{ .passive = true });
+    try std.testing.expect(pas.seek == null and !pas.hovered and !pas.clicked);
+    list.reset();
+    _ = ui.waveform(r, &.{}, .{});
+    try std.testing.expect(list.cmds.items.len > 0);
+    // Too narrow for one bar: nothing drawn.
+    list.reset();
+    _ = ui.waveform(.{ .x = 0, .y = 0, .w = 1, .h = 20 }, &pk, .{});
+    try std.testing.expectEqual(@as(usize, 0), list.cmds.items.len);
 }

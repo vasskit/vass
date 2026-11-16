@@ -56,6 +56,13 @@ pub fn setDockIcon(png_bytes: []const u8) bool {
     return true;
 }
 
+/// `AVCaptureDevice` authorisation status for the microphone, without prompting: 0 not
+/// determined, 1 restricted, 2 denied, 3 authorised; null if AVFoundation is not loaded.
+pub fn microphoneStatus() ?c_long {
+    const cls = objc_getClass("AVCaptureDevice") orelse return null;
+    return send(c_long, cls, "authorizationStatusForMediaType:", .{nsString("soun")});
+}
+
 /// Run as a menu-bar style app: no Dock icon, no app menu.
 pub fn setAccessory() void {
     _ = send(bool, app(), "setActivationPolicy:", .{@as(c_long, 1)});
