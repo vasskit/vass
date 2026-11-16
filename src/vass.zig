@@ -9,6 +9,7 @@ pub const gfx = @import("gfx.zig");
 pub const ui = @import("ui.zig");
 pub const popup = @import("popup.zig");
 pub const focus = @import("focus.zig");
+pub const split = @import("split.zig");
 pub const keys = @import("keys.zig");
 pub const text_edit = @import("text_edit.zig");
 pub const png = @import("png.zig");
@@ -43,6 +44,10 @@ pub const MenuOpts = ui.MenuOpts;
 pub const DropdownState = ui.DropdownState;
 pub const DropdownOpts = ui.DropdownOpts;
 pub const TooltipOpts = ui.TooltipOpts;
+pub const Cursor = platform.Cursor;
+pub const SplitterOpts = split.SplitterOpts;
+pub const SplitterResult = split.SplitterResult;
+pub const SplitState = split.SplitState;
 pub const TextEdit = text_edit.TextEdit;
 
 test {
@@ -52,6 +57,7 @@ test {
     _ = @import("text_area.zig");
     _ = @import("popup.zig");
     _ = focus;
+    _ = split;
     _ = @import("focus_test.zig");
     _ = icons;
     _ = svg;

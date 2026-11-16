@@ -281,6 +281,7 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
     _ = ui.focusable(ui_mod.focusIdOf(id), r, .{ .role = .text_area, .label = opts.placeholder, .ring = false, .activate = false, .click_focus = false, .captures_tab = opts.tab_inserts });
     var focused = if (ui.state) |s| s.focus == id else false;
     const hv = ui.hit(r);
+    if (hv.hovered) ui.setCursor(.text);
     var dragging = false;
 
     if (ui.state) |s| {

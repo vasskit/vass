@@ -29,6 +29,8 @@ const text_area = @import("text_area.zig");
 const popup = @import("popup.zig");
 const layout = @import("layout.zig");
 const focus = @import("focus.zig");
+const split = @import("split.zig");
+pub const Cursor = backend.Cursor;
 pub const FocusId = focus.FocusId;
 pub const FocusOpts = focus.FocusOpts;
 pub const FocusResult = focus.FocusResult;
@@ -214,6 +216,29 @@ pub const Input = struct {
     }
 };
 
+/// Counts successive clicks from time and distance, for input that carries no OS click count
+/// (scripted input). A click within `window` seconds and `radius` points of the last one is the
+/// next of a series (capped at 3); anything else starts again at 1.
+pub const ClickTracker = struct {
+    /// Longest gap between two clicks of a series, in seconds (macOS default is about 0.5).
+    pub const window: f64 = 0.5;
+    /// Furthest the pointer may move between them, in points.
+    pub const radius: f32 = 4;
+
+    time: f64 = -1e9,
+    x: f32 = -1e9,
+    y: f32 = -1e9,
+    count: u8 = 0,
+
+    /// Registers a click at (`x`,`y`) at time `now` and returns its number in the series.
+    pub fn next(c: *ClickTracker, now: f64, x: f32, y: f32) u8 {
+        const near = @abs(x - c.x) <= radius and @abs(y - c.y) <= radius;
+        const n: u8 = if (c.count > 0 and near and now - c.time <= window and now >= c.time) @min(c.count + 1, 3) else 1;
+        c.* = .{ .time = now, .x = x, .y = y, .count = n };
+        return n;
+    }
+};
+
 /// What outlives a frame in the Ui itself: which widget has keyboard focus
 /// (identified by the address of its state struct) and which one is being
 /// dragged. Caller-owned; attach with `ui.state = &state`. Without one,
@@ -229,6 +254,12 @@ pub const State = struct {
     popups: popup.Tracker = .{},
     /// Tooltip timer; see `Ui.tooltip`.
     tip: popup.TipState = .{},
+    /// Where last frame's splitter grab areas were (they take the pointer from the widgets
+    /// beside them), and what the drag in progress started from; see `split.zig`.
+    grabs: split.Grabs = .{},
+    split_drag: split.Drag = .{},
+    /// The last left press, for counting clicks when the OS gives no count; see `Ui.clickCount`.
+    click: ClickTracker = .{},
     /// The focusable widgets of this frame and the last, and the focus-ring state; see `focus.zig`.
     reg: focus.Registry = .{},
 
@@ -414,6 +445,8 @@ pub const WaveformOpts = controls.WaveformOpts;
 pub const WaveformResult = controls.WaveformResult;
 pub const Segment = controls.Segment;
 pub const SegmentedOpts = controls.SegmentedOpts;
+pub const SplitterOpts = split.SplitterOpts;
+pub const SplitterResult = split.SplitterResult;
 pub const TextAreaState = text_area.TextAreaState;
 pub const TextAreaOpts = text_area.TextAreaOpts;
 pub const TextAreaResult = text_area.TextAreaResult;
@@ -501,6 +534,15 @@ pub const Ui = struct {
     focus_begun: bool = false,
     popup_stack: [popup.max_depth]popup.Frame = undefined,
     popup_n: usize = 0,
+    /// The window `init` was given, to hand it the mouse cursor (null for headless Uis).
+    win: ?*backend.Window = null,
+    /// The cursor requested this frame by `setCursor` (null: nobody asked). Headless Uis
+    /// record it without any platform call, so tests can read it.
+    cursor: ?Cursor = null,
+    /// Splitter bookkeeping for this frame has started (see `split.splitter`).
+    grabs_begun: bool = false,
+    /// This frame's press, counted (see `clickCount`).
+    click_n: ?u8 = null,
 
     /// A Ui that draws into `list` and measures text with `win`.
     pub fn init(list: *DisplayList, win: *backend.Window, input: Input, theme: Theme) Ui {
@@ -510,6 +552,7 @@ pub const Ui = struct {
             .input = input,
             .theme = theme,
             .bounds = .{ .x = 0, .y = 0, .w = sz.w, .h = sz.h },
+            .win = win,
             .measure_ctx = win,
             .measure_fn = measureWindow,
             .measure_w_fn = measureWindowWeighted,
@@ -550,7 +593,7 @@ pub const Ui = struct {
     /// outside the current clip (`pushClip`, `beginScroll`) hits nothing.
     pub fn hit(ui: *const Ui, r: Rect) Interaction {
         const over = r.contains(ui.input.mouse_x, ui.input.mouse_y) and ui.clipContains(ui.input.mouse_x, ui.input.mouse_y) and
-            !popup.pointerBlocked(ui);
+            !popup.pointerBlocked(ui) and !split.blocks(ui);
         return .{ .hovered = over, .clicked = over and ui.pressedNow() };
     }
 
@@ -559,6 +602,38 @@ pub const Ui = struct {
     /// Widgets use this instead of `input.pressed`.
     pub fn pressedNow(ui: *const Ui) bool {
         return ui.input.pressed and !popup.pressSwallowed(ui);
+    }
+
+    /// How many clicks the press of this frame is in a series: 1 single, 2 double, 3 triple; 0 if
+    /// there is no press for the layer being drawn (`pressedNow`). Uses the OS count
+    /// (`Input.mouse_clicks`); scripted input that leaves it 0 is counted from `Input.time` and
+    /// the pointer position instead (`ClickTracker`: within half a second and 4 points). Counted
+    /// once per frame, so every widget sees the same number.
+    pub fn clickCount(ui: *Ui) u8 {
+        if (!ui.pressedNow()) return 0;
+        if (ui.click_n) |n| return n;
+        const in = &ui.input;
+        var n: u8 = if (in.mouse_clicks > 0) in.mouse_clicks else 1;
+        if (ui.state) |s| {
+            const counted = s.click.next(in.time, in.mouse_x, in.mouse_y);
+            if (in.mouse_clicks == 0) n = counted else s.click = .{ .time = in.time, .x = in.mouse_x, .y = in.mouse_y, .count = @min(in.mouse_clicks, 3) };
+        }
+        ui.click_n = n;
+        return n;
+    }
+
+    // ---- mouse cursor --------------------------------------------------------------------------
+
+    /// Asks for the mouse cursor `cur` for this frame: the last request wins (widgets are drawn
+    /// bottom to top, so the topmost one), and a request while the pointer is over a popup above the
+    /// layer being drawn is ignored. Nothing is applied here: the window applies it in
+    /// `Window.render` (so it works for apps that never call `finish`) and then goes back to the
+    /// arrow, so a widget only has to keep asking while the pointer is over it. A headless Ui
+    /// just records it in `cursor`.
+    pub fn setCursor(ui: *Ui, cur: Cursor) void {
+        if (popup.pointerBlocked(ui)) return;
+        ui.cursor = cur;
+        if (ui.win) |w| w.setCursor(cur);
     }
 
     /// This frame's key presses and typed text for the layer being drawn: empty while a popup
@@ -1289,6 +1364,7 @@ pub const Ui = struct {
         _ = ui.focusable(focusIdOf(id), r, .{ .role = .text_field, .label = opts.placeholder, .ring = false, .activate = false, .click_focus = false });
         var focused = if (ui.state) |s| s.focus == id else false;
         const hv = ui.hit(r);
+        if (hv.hovered) ui.setCursor(.text);
 
         if (ui.state) |s| {
             if (hv.clicked) {
@@ -1407,6 +1483,23 @@ pub const Ui = struct {
         return controls.slider(ui, r, value, opts);
     }
 
+    // ---- split panes (see split.zig) -------------------------------------------------------------
+
+    /// A draggable divider whose line is `r`; reads and writes the pane size `size`. See `split.zig`.
+    pub fn splitter(ui: *Ui, r: Rect, size: *f32, opts: SplitterOpts) SplitterResult {
+        return split.splitter(ui, r, size, opts);
+    }
+
+    /// Draws a splitter's line (for `SplitterOpts.draw = false`); see `split.drawLine`.
+    pub fn splitterLine(ui: *Ui, r: Rect, res: SplitterResult, opts: SplitterOpts) void {
+        split.drawLine(ui, r, res, opts);
+    }
+
+    /// True while the splitter that controls `size` is being dragged.
+    pub fn splitterDragging(ui: *const Ui, size: *const f32) bool {
+        return split.isDragging(ui, size);
+    }
+
     /// Bars for `peaks` (0..1 each, see `audio.peaks`) filling `r`, coloured up to
     /// `opts.progress`; the result carries the 0..1 position clicked or dragged to, for seeking.
     pub fn waveform(ui: *Ui, r: Rect, peaks: []const f32, opts: WaveformOpts) WaveformResult {
@@ -1448,6 +1541,7 @@ pub const Ui = struct {
     /// remembers this frame's popup rectangles for next frame's input routing. Call after the
     /// last widget, before `Window.render`. Without it popups are not drawn.
     pub fn finish(ui: *Ui) void {
+        if (ui.state) |s| s.grabs.rotate();
         popup.finish(ui);
     }
 

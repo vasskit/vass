@@ -15,6 +15,8 @@ This is the first vertical slice, driven by [Claude Buddy](../ClaudeBuddy).
   key handling, undo/redo). No rendering, no SDL.
 - `src/undo.zig` — `History`: the delta-based undo/redo stacks and the typing coalescing rules
   behind `TextEdit`. Pure data.
+- `src/split.zig` — split panes: `Ui.splitter` (a draggable divider), `split.two` / `split.three` (pane
+  rectangles from stored sizes) and `SplitState`. Depends on `ui` and `focus`, like `popup.zig`.
 - `src/popup.zig` — popups, menus, the dropdown and tooltips (the implementation behind the `Ui`
   methods), the overlay input routing and the placement maths. Depends on `ui`, like `controls.zig`.
 - `src/png.zig` — minimal PNG writer, for handing generated images to the OS.
@@ -165,6 +167,114 @@ Use rect cutting for a fixed strip or two; use `Layout` for forms, rows that ada
 size, wrapping chips, text-driven heights and scrolling columns. They mix freely: any `Rect` from a
 layout can be cut further. `zig build layout` is a resizable demo (`-- --snapshot DIR` for images).
 
+## Split panes
+
+A `splitter` is a divider the user drags to resize the pane on one side of it. The size lives in
+the app (an `f32`, or a `vass.SplitState`); the splitter reads and writes it, and `split.two` /
+`split.three` turn it into the rectangles of the panes and of the divider, so the app computes
+nothing by hand.
+
+    var side = vass.SplitState.init(270);        // across frames: the size, and what it was before a collapse
+    // per frame:
+    const sh = vass.split.two(area, side.size, .{ .min_other = 420, .gap = 8 });   // first | second
+    // ... draw the panes in sh.first and sh.second ...
+    const res = ui.splitter(sh.divider, &side.size, .{
+        .min = 160, .max = 420, .default = 270, .collapse_below = 110,
+        .shown = sh.size,                        // what is on screen, if the window squeezed it
+    });
+    side.remember();                             // keeps the last open size for side.toggle()
+
+    // A right-hand pane grows when the divider moves left:
+    const rt = vass.split.two(area, right_w, .{ .side = .second, .min_other = 420 });
+    _ = ui.splitter(rt.divider, &right_w, .{ .invert = true, .min = 240, .max = 480, .shown = rt.size });
+
+    // Left | centre | right is two of them (the left pane is served first, the right one gives way):
+    const t3 = vass.split.three(area, left_w, right_w, .{ .min_centre = 420, .gap = 8 });
+    // t3.left, t3.centre, t3.right, t3.left_divider, t3.right_divider, t3.left_size, t3.right_size
+
+`SplitterOpts`: `axis` (`.vertical` = a vertical bar dragged left / right; `.horizontal` = a horizontal
+bar dragged up / down), `min` / `max` (clamp of the size), `default` (double-click and Enter reset to
+it), `collapse_below` (dragging below it snaps the size to 0; dragging back out restores at least
+`min`; stepping down from `min` with the keyboard collapses too), `invert`, `thickness` (the visible
+line, default 1) and `hit` (the grab area centred on it, default 8), `step` (arrow key, Shift = 5x),
+`id`, `disabled`, `shown`, `color` (the line at rest; `.alpha(0)` hides it, e.g. over a panel border
+that is already drawn), `draw` and `tab_stop` (below). `SplitterResult`: `changed`, `dragging`,
+`hovered`, `collapsed` (size is 0), `reset`, `released`, `focused`.
+
+- **Dragging.** The press records the pointer and the size; the size is then
+  `start + pointer movement`, clamped, so the divider never jumps under the pointer, also when it
+  was grabbed off-centre. The drag is captured in `State.drag` (the splitter keeps tracking when the
+  pointer leaves the grab area or the window) and nothing else hovers or is clicked until the button
+  is up. Needs `ui.state`. A double click (the OS click count, `Input.mouse_clicks`; scripted input
+  that leaves it 0 is counted from `Input.time` and position: within 0.5 s and 4 points, see
+  `ui.clickCount()`) resets to `default`.
+- **The grab area wins over the panels beside it.** Panels are usually declared before the divider
+  that sits on top of them, so their widgets have already looked at the pointer when it runs. Like
+  popups, splitters therefore work from last frame: each records its grab area in `State.grabs`,
+  `Ui.finish` keeps last frame's list, and `Ui.hit` (which every widget uses, the focus click
+  handling included) reports no hover and no click for a pointer inside one of them, or anywhere
+  while a splitter is being dragged. It applies to widgets of the same or a lower layer: a popup
+  above the splitter is not blocked by it, and a popup *over* the splitter blocks the splitter
+  (`popup.pointerBlocked`). So the call needs `ui.state` and `ui.finish()` every frame; a frame that
+  skips `finish` still works (the first splitter of the frame rotates the records). The blocked area is where the
+  divider was last frame, which is within the grab width of where it is now while dragging.
+- **Keyboard.** A Tab stop (`FocusRole.splitter` for a vertical bar, `.splitter_horizontal`): Left /
+  Right (Up / Down for a horizontal bar) move the divider by `step`, Shift by 5x, Home / End go to `min` / `max`, Enter
+  resets. Consumed with `ui.takeKey`; `keyClaimed` reports them for a focused splitter. The focus
+  ring is the line drawn in the ring colour.
+- **Squeezed windows.** `split.two` clamps the size it *uses* to what fits (leaving `min_other`) and
+  returns it as `.size`; the stored size is untouched, so it comes back when there is room. Pass
+  `.size` as `SplitterOpts.shown` so that a drag or key press starts from what the user sees and
+  stores that.
+- **No lag.** The rectangles are computed from the size, then the splitter writes the size, so a
+  frame that draws the panes before calling the splitter shows the new size one frame later. Either
+  call the splitter first and compute the rectangles after, or feed the size to `vass.Layout`
+  and run the splitter on the solved divider before drawing anything: the same-frame result.
+  For a divider that must be drawn on top of panels and sit last in the Tab order, call it twice:
+  early with `.draw = false, .tab_stop = false` (only the mouse), late with the defaults. Both calls
+  see the same pointer and agree on the size (`examples/split.zig`, HaborDesktop).
+
+With `vass.Layout` the size is a fixed width next to a growing centre, and the divider is the
+leaf between them. The layout is solved after the splitter has run, so the pane follows the
+pointer in the same frame: call the splitter first, with the divider rectangle the layout gave
+last frame (the splitter only needs it to know where the grab area is):
+
+    // app state: side_w: f32 = 270, side_div: Rect = .{ 0, 0, 0, 0 } (zero on the first frame)
+    _ = ui.splitter(app.side_div, &app.side_w, .{ .min = 160, .max = 420, .default = 270 });
+
+    var lay = vass.Layout.init(arena);
+    _ = lay.begin(.{ .dir = .row, .w = .grow(1), .h = .grow(1) });
+    const side = lay.leaf(.{ .w = .fixed(app.side_w), .h = .grow(1) });
+    const gap  = lay.leaf(.{ .w = .fixed(8), .h = .grow(1) });       // the divider sits in here
+    const main = lay.leaf(.{ .w = .grow(1), .h = .grow(1), .min_w = 420 });
+    lay.end();
+    lay.solve(ui.bounds);
+    app.side_div = lay.rect(gap);                  // for next frame's splitter
+    // draw the panes in lay.rect(side) and lay.rect(main)
+
+This is tested (`split.zig`, "feeds a Layout with no lag"). Without that, call it after the panes
+are drawn and the new size shows a frame later. `zig build split` is a runnable example: a
+resizable window with a three-pane shell, a horizontal split in the centre, a collapsing sidebar and
+toggle buttons; `-- --snapshot DIR` writes six pictures after scripted input.
+
+## Mouse cursors
+
+`vass.Cursor` is `arrow, text, pointer, resize_h, resize_v, resize_nwse, resize_nesw, grab, grabbing,
+move, crosshair, wait, not_allowed`: SDL system cursors, created lazily, cached and freed with the
+last window. (SDL has no open-hand cursor: `grab` and `grabbing` are its "move" cursor, the closed
+hand on macOS.) A widget asks for one while the pointer is over it:
+
+    if (hv.hovered) ui.setCursor(.pointer);
+
+The last request of the frame wins (widgets are drawn bottom to top, so the topmost one), and a
+request made while the pointer is over a popup above the layer being drawn is ignored. Nothing is
+set at the time of the call: the window applies the request in `Window.render` and then falls back
+to the arrow, so a widget only has to keep asking, and apps that never call `ui.finish()` get cursors
+too. A headless Ui (`initHeadless`) records the request in `ui.cursor` (null when nobody asked)
+without touching SDL, which is what the tests read. Text fields and text areas ask for `text` while
+hovered, splitters for `resize_h` / `resize_v` while hovered and for the whole drag. Custom widgets
+call `ui.setCursor` themselves; `Window.setCursor` does the same without a Ui.
+
 ## Text input, scrolling, wrapping
 
 Widgets that need memory across frames take a caller-owned state struct; there is no hidden
@@ -239,6 +349,12 @@ per-widget state. Keyboard focus lives in a caller-owned `vass.ui.State`:
 - **Backend**: events `mouse_up`, `mouse_wheel` (lines), `text_input`, `text_editing`,
   `key_down`/`key_up` (a `Key` with `code`, `mods`, `repeat`), plus
   `Window.startTextInput/stopTextInput/setTextInputArea` and `clipboardText`/`setClipboardText`.
+
+## Example: split panes
+
+`examples/split.zig`: `zig build split` (`-- --snapshot DIR` saves `split-default.bmp`,
+`split-dragged.bmp`, `split-collapsed.bmp`, `split-hover.bmp`, `split-inspector-hidden.bmp` and
+`split-narrow.bmp` from a hidden window). See "Split panes" above.
 
 ## Example: notes
 

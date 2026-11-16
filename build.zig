@@ -189,6 +189,21 @@ pub fn build(b: *std.Build) void {
     run_layout.addPassthruArgs();
     b.step("layout", "Run the layout showcase").dependOn(&run_layout.step);
     test_step.dependOn(&layout_ex.step);
+
+    // Example: resizable split panes. `zig build split -- --snapshot DIR`.
+    const split_ex = b.addExecutable(.{
+        .name = "split",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/split.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vass", .module = vass }},
+        }),
+    });
+    const run_split = b.addRunArtifact(split_ex);
+    run_split.addPassthruArgs();
+    b.step("split", "Run the split panes example").dependOn(&run_split.step);
+    test_step.dependOn(&split_ex.step);
 }
 
 /// castholm/SDL only auto-detects the macOS SDK when the target is exactly the

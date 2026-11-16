@@ -20,6 +20,7 @@ const c = struct {
     const Texture = opaque {};
     const Surface = opaque {};
     const Font = opaque {};
+    const SdlCursor = opaque {};
     const FRect = extern struct { x: f32, y: f32, w: f32, h: f32 };
     const FPoint = extern struct { x: f32, y: f32 };
     const FColor = extern struct { r: f32, g: f32, b: f32, a: f32 };
@@ -76,6 +77,11 @@ const c = struct {
     extern fn SDL_GetError() [*:0]const u8;
     extern fn SDL_Delay(ms: u32) void;
     extern fn SDL_GetTicks() u64;
+    // SDL_mouse.h (SDL 3.4): SDL_SystemCursor ids are DEFAULT 0, TEXT 1, WAIT 2, CROSSHAIR 3, PROGRESS 4,
+    // NWSE_RESIZE 5, NESW_RESIZE 6, EW_RESIZE 7, NS_RESIZE 8, MOVE 9, NOT_ALLOWED 10, POINTER 11.
+    extern fn SDL_CreateSystemCursor(id: c_int) ?*SdlCursor;
+    extern fn SDL_SetCursor(cursor: ?*SdlCursor) bool;
+    extern fn SDL_DestroyCursor(cursor: *SdlCursor) void;
     extern fn SDL_CreateWindow(title: [*:0]const u8, w: c_int, h: c_int, flags: u64) ?*SdlWindow;
     extern fn SDL_DestroyWindow(w: *SdlWindow) void;
     extern fn SDL_GetWindowPixelDensity(w: *SdlWindow) f32;
@@ -608,6 +614,58 @@ pub fn sleepMs(ms: u32) void {
     c.SDL_Delay(ms);
 }
 
+/// A mouse cursor shape. Apps ask for one with `Ui.setCursor` (or `Window.setCursor`); the
+/// backend creates the system cursor lazily, caches it and frees it with the last window.
+/// SDL has no open-hand cursor, so `grab` and `grabbing` are both SDL's "move" cursor (on
+/// macOS the closed hand).
+pub const Cursor = enum {
+    arrow,
+    text,
+    pointer,
+    resize_h,
+    resize_v,
+    resize_nwse,
+    resize_nesw,
+    grab,
+    grabbing,
+    move,
+    crosshair,
+    wait,
+    not_allowed,
+
+    fn sdlId(cur: Cursor) c_int {
+        return switch (cur) {
+            .arrow => 0,
+            .text => 1,
+            .wait => 2,
+            .crosshair => 3,
+            .resize_nwse => 5,
+            .resize_nesw => 6,
+            .resize_h => 7,
+            .resize_v => 8,
+            .move, .grab, .grabbing => 9,
+            .not_allowed => 10,
+            .pointer => 11,
+        };
+    }
+};
+
+/// Created system cursors, one per `Cursor`; SDL cursors are process-wide, not per window.
+var cursor_cache: [std.enums.values(Cursor).len]?*c.SdlCursor = @splat(null);
+
+fn systemCursor(cur: Cursor) ?*c.SdlCursor {
+    const i = @intFromEnum(cur);
+    if (cursor_cache[i] == null) cursor_cache[i] = c.SDL_CreateSystemCursor(cur.sdlId());
+    return cursor_cache[i];
+}
+
+fn freeCursors() void {
+    for (&cursor_cache) |*slot| {
+        if (slot.*) |cur| c.SDL_DestroyCursor(cur);
+        slot.* = null;
+    }
+}
+
 /// Milliseconds since the platform was initialised.
 pub fn ticks() u64 {
     return c.SDL_GetTicks();
@@ -642,6 +700,10 @@ pub const Window = struct {
     drawn_key: [4]c_int = .{ 0, 0, 0, 0 },
     in_render: bool = false,
     live_busy: bool = false,
+    /// The cursor the app asked for this frame (`setCursor`); `render` applies it and goes back to arrow.
+    cursor_wanted: Cursor = .arrow,
+    /// The cursor SDL was last told to show (null: none yet), to skip redundant calls.
+    cursor_applied: ?Cursor = null,
 
     pub fn init(gpa: std.mem.Allocator, opts: WindowOptions) !Window {
         if (live_windows == 0) {
@@ -691,6 +753,7 @@ pub const Window = struct {
         c.SDL_DestroyWindow(w.win);
         live_windows -= 1;
         if (live_windows == 0) {
+            freeCursors();
             c.TTF_Quit();
             // Only video: an `Audio` may still be using SDL (it quits its own subsystem).
             c.SDL_QuitSubSystem(c.INIT_VIDEO);
@@ -1137,11 +1200,26 @@ pub const Window = struct {
         _ = c.SDL_SetWindowAlwaysOnTop(w.win, on);
     }
 
+    /// Asks for `cur` for the frame being drawn. Applied (and reset to arrow) by the next
+    /// `render`, so a widget that stops asking gets the arrow back. `Ui.setCursor` calls this.
+    pub fn setCursor(w: *Window, cur: Cursor) void {
+        w.cursor_wanted = cur;
+    }
+
+    fn applyCursor(w: *Window) void {
+        const want = w.cursor_wanted;
+        w.cursor_wanted = .arrow;
+        if (w.cursor_applied == want) return;
+        w.cursor_applied = want;
+        if (systemCursor(want)) |cur| _ = c.SDL_SetCursor(cur);
+    }
+
     /// Draws the display list and presents the frame.
     pub fn render(w: *Window, list: *const gfx.DisplayList, clear: Color) void {
         if (w.in_render) return;
         w.in_render = true;
         defer w.in_render = false;
+        w.applyCursor();
         w.syncMetrics();
         w.drawn_key = w.sizeKey();
         w.frame += 1;

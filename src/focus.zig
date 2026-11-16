@@ -69,6 +69,10 @@ pub const Role = enum {
     /// Tabs and segmented controls: one stop, Left/Right change the selection.
     tab,
     slider,
+    /// A split-pane divider: a vertical bar (Left / Right move it) ...
+    splitter,
+    /// ... or a horizontal one (Up / Down move it). Both: Home, End, Enter.
+    splitter_horizontal,
     text_field,
     text_area,
     dropdown,
@@ -428,6 +432,8 @@ fn roleClaims(role: Role, code: u32, m: keys.Mods) bool {
     return switch (role) {
         .tab => code == keys.left or code == keys.right or code == keys.home or code == keys.end,
         .slider => code == keys.left or code == keys.right or code == keys.up or code == keys.down or code == keys.home or code == keys.end,
+        .splitter => code == keys.left or code == keys.right or code == keys.home or code == keys.end or code == keys.@"return",
+        .splitter_horizontal => code == keys.up or code == keys.down or code == keys.home or code == keys.end or code == keys.@"return",
         .dropdown => code == keys.up or code == keys.down or code == keys.@"return" or code == keys.space,
         else => code == keys.@"return" or code == keys.space,
     };
