@@ -141,6 +141,35 @@ pub const DisplayList = struct {
         if (closed and pts.len > 2) l.line(pts[pts.len - 1][0], pts[pts.len - 1][1], pts[0][0], pts[0][1], width, color);
     }
 
+    /// The outline of a rounded rectangle: a stroke of `width` centred on the edge of `r`,
+    /// with corner `radius` (clamped to half the shorter side), made of lines and arcs. Draw
+    /// it with an opaque colour: the joints overlap.
+    pub fn rrectStroke(l: *DisplayList, r: Rect, radius: f32, width: f32, color: Color) void {
+        if (r.w <= 0 or r.h <= 0 or width <= 0) return;
+        const rad = std.math.clamp(radius, 0, @min(r.w, r.h) / 2);
+        const x0 = r.x;
+        const y0 = r.y;
+        const x1 = r.x + r.w;
+        const y1 = r.y + r.h;
+        if (rad < 0.5) {
+            l.polyline(&.{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } }, width, color, true);
+            return;
+        }
+        if (r.w - 2 * rad > 0.01) {
+            l.line(x0 + rad, y0, x1 - rad, y0, width, color);
+            l.line(x0 + rad, y1, x1 - rad, y1, width, color);
+        }
+        if (r.h - 2 * rad > 0.01) {
+            l.line(x0, y0 + rad, x0, y1 - rad, width, color);
+            l.line(x1, y0 + rad, x1, y1 - rad, width, color);
+        }
+        const pi = std.math.pi;
+        l.arc(x1 - rad, y0 + rad, rad, -pi / 2.0, 0, width, color);
+        l.arc(x1 - rad, y1 - rad, rad, 0, pi / 2.0, width, color);
+        l.arc(x0 + rad, y1 - rad, rad, pi / 2.0, pi, width, color);
+        l.arc(x0 + rad, y0 + rad, rad, pi, 3.0 * pi / 2.0, width, color);
+    }
+
     /// Draws `img` into `r` as `opts` says (fit, rounded corners, opacity, tint).
     pub fn image(l: *DisplayList, r: Rect, img: Image, opts: ImageOpts) void {
         l.push(.{ .image = .{ .rect = r, .image = img, .opts = opts } });

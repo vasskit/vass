@@ -81,6 +81,9 @@ pub const TextAreaOpts = struct {
     size: ?f32 = null,
     /// Draw only the text and caret: no border or fill, no inner padding.
     bare: bool = false,
+    /// Tab inserts a tab character instead of moving keyboard focus to the next widget.
+    /// Shift+Tab still moves focus back, so the area can always be left with the keyboard.
+    tab_inserts: bool = false,
     /// Return reports `submitted` instead of inserting a line break; Shift+Return
     /// inserts one. Off: Return inserts a line break and never submits.
     submit_on_enter: bool = false,
@@ -191,6 +194,15 @@ fn moveVertical(ui: *const Ui, st: *TextAreaState, size: f32, w: f32, down: bool
 
 fn handleKey(ui: *Ui, st: *TextAreaState, code: u32, m: keys.Mods, opts: TextAreaOpts, size: f32, w: f32, res: *TextAreaResult, s: *ui_mod.State, focused: *bool) void {
     const ed = &st.edit;
+    if (code == keys.tab) {
+        // Plain Tab only reaches a text area that asked for it (`tab_inserts`).
+        if (opts.tab_inserts and !m.shift and !m.cmd and !m.ctrl and !m.alt) {
+            st.want_x = null;
+            insertClean(st, "\t", .typing);
+            res.changed = true;
+        }
+        return;
+    }
     const vertical = code == keys.up or code == keys.down;
     if (!vertical) st.want_x = null;
 
@@ -265,6 +277,8 @@ pub fn textArea(ui: *Ui, r: Rect, st: *TextAreaState, opts: TextAreaOpts) TextAr
     const id: *const anyopaque = st;
     var res: TextAreaResult = .{};
     const in = &ui.input;
+    // A Tab stop; the area handles the mouse itself. Tab is taken before the area sees keys.
+    _ = ui.focusable(ui_mod.focusIdOf(id), r, .{ .role = .text_area, .label = opts.placeholder, .ring = false, .activate = false, .click_focus = false, .captures_tab = opts.tab_inserts });
     var focused = if (ui.state) |s| s.focus == id else false;
     const hv = ui.hit(r);
     var dragging = false;

@@ -3,9 +3,15 @@
 //! text area has Undo / Redo buttons beside its heading (Cmd+Z / Cmd+Shift+Z work too).
 //!
 //!     zig build controls                      run it
-//!     zig build controls -- --snapshot DIR    draw a few frames, save DIR/controls.bmp, exit
-//!                                             (the first text area is focused with a
-//!                                             selection across lines)
+//!     zig build controls -- --snapshot DIR    draw a few frames, save DIR/controls.bmp, then
+//!                                             DIR/controls-focus.bmp (nine Tab presses: the
+//!                                             focus ring on the second segmented control), exit
+//!                                             (in controls.bmp the first text area is focused
+//!                                             with a selection across lines)
+//!
+//! Keyboard: Tab / Shift+Tab move between all controls; Space / Enter toggle checkboxes and
+//! switches and select radios; Left / Right (Home / End) change a focused segmented control;
+//! the text areas take Tab out of the way (the first two keep it as focus movement).
 const std = @import("std");
 const vass = @import("vass");
 
@@ -184,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
     try app.notes.edit.setText(sample);
     try app.composer.edit.setText("First line\nSecond line");
 
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Controls", .width = win_w, .height = win_h });
+    var win = try vass.platform.Window.init(gpa, .{ .title = "Controls", .width = win_w, .height = win_h, .hidden = snapshot_dir != null });
     defer win.deinit();
     win.startTextInput();
     var list = vass.DisplayList.init(gpa);
@@ -212,10 +218,18 @@ pub fn main(init: std.process.Init) !void {
         };
         input.time = if (snapshot_dir != null) 0 else @as(f64, @floatFromInt(vass.platform.ticks())) / 1000.0;
 
+        // Second snapshot: no focus, then nine Tabs through the controls in call order
+        // (two checkboxes, two switches, three radios, two segmented controls).
+        if (snapshot_dir != null and n == 4) {
+            app.state.blur();
+            for (0..9) |_| input.pushKey(vass.keys.tab, .{});
+        }
         const snap = if (snapshot_dir) |dir| n == 3 and dir.len > 0 else false;
+        const snap_focus = if (snapshot_dir) |dir| n == 7 and dir.len > 0 else false;
         if (snap) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/controls.bmp", .{snapshot_dir.?}, 0);
+        if (snap_focus) win.snapshot_path = try std.fmt.allocPrintSentinel(arena, "{s}/controls-focus.bmp", .{snapshot_dir.?}, 0);
         live.draw(input);
-        if (snap) running = false;
+        if (snap_focus) running = false;
         input.endFrame();
         vass.platform.sleepMs(16);
     }
@@ -235,6 +249,7 @@ const Live = struct {
         var ui = Ui.init(l.list, l.win, in, l.theme);
         ui.state = &l.app.state;
         frame(l.app, &ui, l.win);
+        ui.finish();
         l.win.render(l.list, l.theme.bg);
     }
 

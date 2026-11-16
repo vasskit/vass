@@ -195,8 +195,8 @@ per-widget state. Keyboard focus lives in a caller-owned `vass.ui.State`:
   alt for words, cmd for line ends, shift to select, cmd+A/C/X/V, cmd+Z / cmd+shift+Z for
   undo/redo, backspace/delete (with alt or cmd for word/line). Scrolls horizontally to keep the caret visible, blinks off
   `Input.time`, and is clipped to its rectangle. Typed text arrives through
-  `Input.events()` in order with key presses; apps with their own shortcuts should ignore
-  keys while `ustate.focus != null`.
+  `Input.events()` in order with key presses; apps with their own shortcuts should skip the
+  keys the focused widget wants: `ui.keyClaimed(code, mods)` (see Keyboard focus below).
 - **`TextEdit`** (`vass.TextEdit`) is the editor behind it and usable on its own:
   `insert`, `backspace`, `delete`, `move`, `moveTo`, `selectAll`, `copy`/`cut`, and
   `handleKey(code, mods) -> Action` (changed / copy / cut / paste / submit / cancel ...).
@@ -260,8 +260,8 @@ adds a note; in memory only).
   grapheme-cluster-aware caret movement (combining marks and ZWJ emoji take several presses),
   Selecting across several separate texts is not possible (one text at a time).
 - Scrollbar dragging and keyboard scrolling; horizontal scrolling.
-- Accessibility (no screen-reader tree), hover styling, Tab focus traversal, retained
-  widgets, and any platform other than macOS.
+- Accessibility (no screen-reader tree: the focus list carries roles and labels, nothing calls the
+  OS yet), hover styling, retained widgets, and any platform other than macOS.
 
 ## Custom fonts, weights, resizing, list helpers
 
@@ -324,11 +324,11 @@ Immediate mode like the rest: the value lives in the app. Implementations are in
   follows the caret, the wheel when the content overflows, scrollbar thumb, placeholder,
   `bare`. `ui.measureTextArea(&area, width, opts)` returns the height for an auto-growing box
   (`min_lines`/`max_lines`). `TextAreaResult.input_area` and `caret_x` are for
-  `Window.setTextInputArea` while it is focused. A focused text area holds `State.focus`, so
-  enclosing scroll areas leave the arrow keys alone.
+  `Window.setTextInputArea` while it is focused. A focused text area claims the arrow keys, so
+  enclosing scroll areas leave them alone. Tab leaves it unless `opts.tab_inserts`.
 
 `zig build controls -- --snapshot DIR` draws `examples/controls.zig` (all of the above in
-various states) to `DIR/controls.bmp`.
+various states) to `DIR/controls.bmp`, and `DIR/controls-focus.bmp` after nine Tab presses.
 
 Rough edges: when a word longer than the line is broken between characters, the caret at the
 break shows on the next line's start (no caret affinity), so End on such a line appears to
@@ -393,13 +393,94 @@ Not there yet: two sibling popups at the same depth do not block each other; the
 opens and dismisses (no right-click drag); a popup that is closed by assigning `st.open = false` instead of
 `closePopup` leaves popups opened from it flagged open (they are never drawn, and close when it reopens); no animation, no type-ahead in
 dropdowns, no submenus (a menu item cannot open a menu, though a popover can contain widgets that open
-popups), no keyboard focus ring or Tab traversal inside popups.
+popups). Menu items are not Tab stops (see Keyboard focus).
 
 `zig build popups -- --snapshot DIR` writes `DIR/popups-1-tooltip.bmp`, `popups-2-menus.bmp` (a
 dropdown, a menu with icons, shortcuts, separators and disabled and danger items, and a context menu,
 all open), `popups-3-popover.bmp` (a dropdown inside a popover) and `popups-4-modal.bmp` (a confirm
-dialog). Interactive behaviour is covered by headless multi-frame tests; the real mouse and keyboard
+dialog), then `popups-focus.bmp` (the modal after two Tab presses: the focus ring on its Delete
+button). Interactive behaviour is covered by headless multi-frame tests; the real mouse and keyboard
 path was not exercised by a human.
+
+## Keyboard focus
+
+Tab / Shift+Tab walk the focusable widgets, Space / Enter activate, arrows adjust. A focus ring is
+drawn only when focus arrived by keyboard (a mouse press hides it until the next Tab or key).
+Everything needs `ui.state` (a caller-owned `vass.ui.State`) and one `ui.finish()` per frame
+(frames without `finish` work too, but then a vanished focused widget is noticed a frame late).
+
+**Ids.** A focus id is a `u64` (`vass.FocusId`). Widgets with state use the address of their state
+struct (`textField`, `textArea`, `dropdown`), value-bound ones the address of the value
+(`checkbox`, `toggle`, `slider`, `segmented`, `tabs`: the `*bool`, `*f32`, `*usize`), so
+`State.focus` is still a plain pointer and `state.focusOn(&field)` / `state.blur()` work as before.
+Stateless widgets (`button`, `pill`, `chip`, `iconButton`, `radio`, `listRow`) derive an id:
+`hash(id stack, widget kind, key)` plus the occurrence number when the same hash appears again in the
+frame. The key is `opts.id` (an `idKey(x)`) if given, else the label (the icon for `iconButton`).
+Rectangles are never hashed, so ids survive resizing and scrolling. Same label twice in one scope
+is fine while the order is stable; wrap lists in `ui.pushId(group)` / `ui.popId()`, and give rows
+that can reorder, or whose label changes, `.id = vass.ui.idKey(row.key)` (a `listRow` without an id is
+numbered by position in its scope). Derived ids have bit 63 set (no address does); `State.focus` holds
+them as pseudo pointers that are never dereferenced. If two widgets register the same id in a frame
+the first one wins and the other is inert for the keyboard (it still works with the mouse).
+
+**Traversal.** Every focusable widget registers itself each frame, in call order
+(`ui.focusEntries()` / `State.focusEntries()`: id, rect, role, label, disabled, layer, copied labels,
+up to 256 per frame). Tab moves through the *previous* frame's list, wrapping, skipping disabled
+ones; with no focus Tab goes to the first and Shift+Tab to the last. The Tab key is removed from the
+frame's events, so text widgets never see it. Focus on a widget that was not declared in the frame
+is cleared, so a widget that is culled (an off-screen row you skip drawing) cannot be reached by Tab.
+When focus moves by keyboard (or `ui.setFocus`) into scroll areas, `ScrollState.reveal` scrolls each
+one (innermost first) so the widget is visible: the offset changes during that frame and shows the
+next one. The tab order is the call order: draw (or at least declare) widgets in reading order.
+`ui.focusNext()`, `focusPrev()`, `setFocus(id)`, `isFocused(id)`, `focusedId()`, `focusVisible()`.
+
+**Keys.** A widget that acts on a key removes that event from the frame (`ui.takeKey`), so `ui.events()`
+read afterwards does not contain it; keys it ignores stay. Code that runs before the widgets (a
+shortcut handler at the top of the frame, `beginScroll` for its arrow keys) asks
+`ui.keyClaimed(code, mods)`: true if the focused widget wants that key. Text widgets claim every key
+without Cmd (and a, c, x, v, z, arrows, delete with it); typed text only ever goes to them.
+
+| Widget | Focused keys |
+| --- | --- |
+| `button`, `pill`, `chip` (opt in, see below), `iconButton`, `listRow` | Space / Enter = click (`clicked` / true) |
+| `checkbox`, `toggle` | Space / Enter flip the value |
+| `radio` | Space / Enter = click (you set your value). No arrow-key group navigation: each radio is a Tab stop |
+| `segmented`, `tabs` | one Tab stop; Left / Right (Home / End) change the selection and return changed |
+| `slider` | Left / Down, Right / Up one step (`step`, or a twentieth); Shift = five steps; Home / End. Consumed |
+| `waveform` | Left / Right seek by 5% (Shift 20%) through `res.seek`; Home / End |
+| `dropdown` | Up / Down change the selection, Space / Enter open the menu |
+| `textField` | Tab / Shift+Tab leave it |
+| `textArea` | Tab leaves it; `opts.tab_inserts` makes plain Tab insert a tab (Shift+Tab still leaves) |
+
+A `chip` is usually a plain label, so it only joins the Tab order with `ChipOpts.focusable = true` (the
+default when `hover_fill` is set). `ButtonOpts`, `IconButtonOpts`, `ChipOpts`, `RowOpts`, `PillOpts`,
+`TabsOpts`, `CheckOpts`, `ToggleOpts`, `SegmentedOpts`, `SliderOpts` have an optional `id`;
+`ButtonOpts`/`RowOpts` and friends take `disabled`, `label` (for assistive technology).
+
+**Popups.** While a popup is open Tab cycles through the widgets declared inside the topmost one
+(a modal dialog: its buttons and fields); the layers beneath already get no keys. `openPopup`
+remembers the focused id and the close (Escape, an outside press, `closePopup`) restores it. A menu
+(and the menu of a dropdown) has no Tab stops, its items follow the Up / Down highlight: Tab is
+ignored there, as in macOS menus. Tooltips never take focus.
+
+**Ring.** `Theme.focus_ring` (default: the accent mixed with the text colour, `theme.ringColor()`),
+2 pt wide, 2 pt outside the widget with a matching corner radius, drawn on top of the widget by the
+widget itself (after its drawing), under the current clip. Text fields and areas keep their accent
+border; the slider shows its halo until focus is visible.
+
+**Custom widgets.** Draw, then call the primitive, which registers it and draws the ring:
+
+    const id = ui.widgetId(1, vass.ui.idKey("Delete"), null);   // or focus.idOfPtr(&my_state)
+    const f = ui.focusable(id, r, .{ .role = .button, .label = "Delete", .ring_radius = 10 });
+    if (hv.clicked or f.activated) doIt();   // f.focused, f.gained, f.lost, f.visible
+
+`FocusOpts` also has `disabled`, `ring` (false: draw `ui.focusRing(r, radius, offset)` yourself),
+`activate`, `click_focus` (false when you handle the mouse), `captures_tab`. For keys other than
+Space and Enter use `ui.takeKey(&.{ vass.keys.left, ... })` while `f.focused`.
+
+Not done: radio-group arrow navigation, Tab stops or roles for menu items, a Tab order other than
+call order, no accessibility calls into the OS. Tested headlessly over multiple frames
+(`src/focus_test.zig`); the real keyboard was not exercised by a human.
 
 ## Images, file drops and the open-file dialog
 

@@ -11,6 +11,7 @@ const geom = @import("geom.zig");
 const icons = @import("icons.zig");
 const keys = @import("keys.zig");
 const ui_mod = @import("ui.zig");
+const focus = @import("focus.zig");
 const Rect = geom.Rect;
 const Color = geom.Color;
 const Ui = ui_mod.Ui;
@@ -23,6 +24,9 @@ pub const CheckOpts = struct {
     size: ?f32 = null,
     /// Side of the box (or diameter of a radio) in points.
     box: f32 = 16,
+    /// Focus id key (`idKey(x)`). Checkbox: default is the address of the value. Radio: default
+    /// is derived from the label.
+    id: ?u64 = null,
 };
 
 pub const ToggleOpts = struct {
@@ -30,6 +34,10 @@ pub const ToggleOpts = struct {
     /// Size of the pill. It is centred in the rectangle (and shrunk to fit it).
     width: f32 = 34,
     height: f32 = 20,
+    /// Focus id key (`idKey(x)`); default: the address of the value.
+    id: ?u64 = null,
+    /// Name for assistive technology.
+    label: []const u8 = "",
 };
 
 pub const Segment = struct {
@@ -48,6 +56,8 @@ pub const SegmentedOpts = struct {
     /// All segments the same width. If false each is as wide as its content,
     /// with the spare width shared out equally.
     equal_width: bool = true,
+    /// Focus id key (`idKey(x)`); default: the address of the selected index.
+    id: ?u64 = null,
 };
 
 /// Most segments `segmented` lays out (more are ignored).
@@ -88,7 +98,10 @@ fn textY(r: Rect, size: f32) f32 {
 /// value was just flipped.
 pub fn checkbox(ui: *Ui, r: Rect, value: *bool, label: []const u8, opts: CheckOpts) Interaction {
     const t = ui.theme;
-    const hv = interact(ui, r, opts.disabled);
+    var hv = interact(ui, r, opts.disabled);
+    const fid = if (opts.id) |e| ui.widgetId(8, 0, e) else focus.idOfPtr(value);
+    const f = ui.focusable(fid, r, .{ .role = .checkbox, .label = label, .disabled = opts.disabled, .ring = false });
+    if (f.activated) hv.clicked = true;
     if (hv.clicked) value.* = !value.*;
     const on = value.*;
     const b = opts.box;
@@ -115,7 +128,15 @@ pub fn checkbox(ui: *Ui, r: Rect, value: *bool, label: []const u8, opts: CheckOp
     const size = opts.size orelse t.font_body;
     const col = if (opts.disabled) faded(t.text) else t.text;
     ui.labelAt(box.x + b + 8, textY(r, size), label, .{ .size = size, .color = col });
+    if (f.visible) ui.focusRing(tightRow(ui, r, b, label, size), rad, 2);
     return hv;
+}
+
+/// The part of a checkbox or radio row that holds something: the box and its label.
+fn tightRow(ui: *const Ui, r: Rect, box: f32, label: []const u8, size: f32) Rect {
+    const w = @min(r.w, box + 8 + ui.measure(label, size));
+    const h = @min(r.h, @max(box, size * 1.22) + 4);
+    return .{ .x = r.x, .y = r.y + (r.h - h) / 2, .w = w, .h = h };
 }
 
 /// Draws a switch with the knob at `pos` (0 = off, 1 = on, anything between
@@ -145,9 +166,16 @@ pub fn toggleAt(ui: *Ui, r: Rect, pos: f32, hovered: bool, opts: ToggleOpts) voi
 /// pill is centred in it. Returns the interaction; `clicked` means the value
 /// was just flipped.
 pub fn toggle(ui: *Ui, r: Rect, value: *bool, opts: ToggleOpts) Interaction {
-    const hv = interact(ui, r, opts.disabled);
+    var hv = interact(ui, r, opts.disabled);
+    const fid = if (opts.id) |e| ui.widgetId(9, 0, e) else focus.idOfPtr(value);
+    const f = ui.focusable(fid, r, .{ .role = .toggle, .label = opts.label, .disabled = opts.disabled, .ring = false });
+    if (f.activated) hv.clicked = true;
     if (hv.clicked) value.* = !value.*;
     toggleAt(ui, r, if (value.*) 1 else 0, hv.hovered, opts);
+    if (f.visible) {
+        const pill = r.center(@min(opts.width, r.w), @min(opts.height, r.h));
+        ui.focusRing(pill, pill.h / 2, 2);
+    }
     return hv;
 }
 
@@ -156,7 +184,9 @@ pub fn toggle(ui: *Ui, r: Rect, value: *bool, opts: ToggleOpts) Interaction {
 /// `clicked`.
 pub fn radio(ui: *Ui, r: Rect, selected: bool, label: []const u8, opts: CheckOpts) Interaction {
     const t = ui.theme;
-    const hv = interact(ui, r, opts.disabled);
+    var hv = interact(ui, r, opts.disabled);
+    const f = ui.focusable(ui.widgetId(6, focus.idKey(label), opts.id), r, .{ .role = .radio, .label = label, .disabled = opts.disabled, .ring = false });
+    if (f.activated) hv.clicked = true;
     const d = opts.box;
     const cx = r.x + d / 2;
     const cy = r.y + r.h / 2;
@@ -173,6 +203,10 @@ pub fn radio(ui: *Ui, r: Rect, selected: bool, label: []const u8, opts: CheckOpt
     const size = opts.size orelse t.font_body;
     const col = if (opts.disabled) faded(t.text) else t.text;
     ui.labelAt(r.x + d + 8, textY(r, size), label, .{ .size = size, .color = col });
+    if (f.visible) {
+        const row = tightRow(ui, r, d, label, size);
+        ui.focusRing(row, row.h / 2, 2);
+    }
     return hv;
 }
 
@@ -218,7 +252,20 @@ pub fn segmented(ui: *Ui, r: Rect, items: []const Segment, selected: *usize, opt
     const size = opts.size orelse t.font_button;
     ui.list.rrect(r, rad, if (opts.disabled) faded(t.card) else t.card);
     var changed = false;
+    // One Tab stop for the whole control; Left / Right / Home / End change the selection.
+    const fid = if (opts.id) |e| ui.widgetId(10, 0, e) else focus.idOfPtr(selected);
+    const f = ui.focusable(fid, r, .{ .role = .tab, .disabled = opts.disabled, .activate = false, .ring = false });
+    if (f.focused and n > 0) {
+        while (ui.takeKey(&.{ keys.left, keys.right, keys.home, keys.end })) |k| {
+            const nxt = ui_mod.stepSelection(selected.*, n, k.code);
+            if (nxt != selected.*) {
+                selected.* = nxt;
+                changed = true;
+            }
+        }
+    }
     const current = selected.*;
+    defer if (f.visible) ui.focusRing(r, rad, 2);
     for (items[0..n], 0..) |s, i| {
         const seg = segmentRect(ui, r, items, i, opts);
         const hv = interact(ui, seg, opts.disabled);
@@ -263,6 +310,8 @@ pub const SliderOpts = struct {
     /// Thickness of the track and diameter of the thumb.
     track: f32 = 4,
     thumb: f32 = 16,
+    /// Focus id key (`idKey(x)`); default: the address of the value.
+    id: ?u64 = null,
 };
 
 pub const SliderResult = struct {
@@ -312,14 +361,14 @@ pub fn slider(ui: *Ui, r: Rect, value: *f32, opts: SliderOpts) SliderResult {
         }
     }.f;
 
+    const fid = if (opts.id) |e| ui.widgetId(11, 0, e) else focus.idOfPtr(value);
+    const fr = ui.focusable(fid, r, .{ .role = .slider, .disabled = opts.disabled, .activate = false, .ring = false });
+    var ring = false;
     if (!opts.disabled) {
         if (ui.state) |s| {
             if (hv.clicked) {
                 s.drag = id;
-                s.focus = id;
                 s.select = null;
-            } else if (ui.pressedNow() and s.focus == id) {
-                s.focus = null; // a click elsewhere
             }
             if (s.drag == id) {
                 if (in.down or hv.clicked) {
@@ -330,24 +379,22 @@ pub fn slider(ui: *Ui, r: Rect, value: *f32, opts: SliderOpts) SliderResult {
                     res.released = true;
                 }
             }
-            res.focused = s.focus == id;
+            res.focused = s.focus == focus.ptrOfId(fid);
             if (res.focused) {
                 const inc = if (opts.step > 0) opts.step else (opts.max - opts.min) / 20;
-                for (ui.events()) |ev| switch (ev) {
-                    .key => |k| {
-                        var v = value.*;
-                        switch (k.code) {
-                            keys.left, keys.down => v -= inc,
-                            keys.right, keys.up => v += inc,
-                            keys.home => v = opts.min,
-                            keys.end => v = opts.max,
-                            else => continue,
-                        }
-                        value.* = sliderValue(sliderFrac(v, opts.min, opts.max), opts.min, opts.max, opts.step);
-                    },
-                    else => {},
-                };
+                while (ui.takeKey(&.{ keys.left, keys.right, keys.up, keys.down, keys.home, keys.end })) |k| {
+                    var v = value.*;
+                    const mult: f32 = if (k.mods.shift) 5 else 1;
+                    switch (k.code) {
+                        keys.left, keys.down => v -= inc * mult,
+                        keys.right, keys.up => v += inc * mult,
+                        keys.home => v = opts.min,
+                        else => v = opts.max,
+                    }
+                    value.* = sliderValue(sliderFrac(v, opts.min, opts.max), opts.min, opts.max, opts.step);
+                }
             }
+            ring = fr.visible or (ui.focusVisible() and res.focused);
         } else if (hv.clicked) {
             value.* = sliderValue(fracAt(in.mouse_x, r.x + half, span), opts.min, opts.max, opts.step);
         }
@@ -372,8 +419,9 @@ pub fn slider(ui: *Ui, r: Rect, value: *f32, opts: SliderOpts) SliderResult {
     }
     ui.list.rrect(.{ .x = r.x + half - trk / 2, .y = track.y, .w = span + trk, .h = trk }, trk / 2, bg);
     ui.list.rrect(.{ .x = r.x + half - trk / 2, .y = track.y, .w = span * p + trk, .h = trk }, trk / 2, fill);
-    if (res.focused and !opts.disabled) ui.list.circle(cx, cy, half + 3, t.accent.alpha(70));
+    if (res.focused and !opts.disabled and !ring) ui.list.circle(cx, cy, half + 3, t.accent.alpha(70));
     ui.list.circle(cx, cy, if (res.dragging) half + 1 else half, knob);
+    if (ring and res.focused and !opts.disabled) ui.focusRing(.{ .x = cx - half, .y = cy - half, .w = 2 * half, .h = 2 * half }, half, 2);
     return res;
 }
 
@@ -441,6 +489,25 @@ pub fn waveform(ui: *Ui, r: Rect, peaks: []const f32, opts: WaveformOpts) Wavefo
     const hv = interact(ui, r, opts.disabled or opts.passive);
     res.hovered = hv.hovered;
     const id: *const anyopaque = opts.id orelse @ptrCast(peaks.ptr);
+    // Focusable like a slider: Left / Right seek by 5% (Shift: 20%), Home / End to the ends.
+    var ring_vis = false;
+    defer if (ring_vis) ui.focusRing(r, @min(4, r.h / 2), 2);
+    if (!opts.disabled and !opts.passive and r.w > 0) {
+        const f = ui.focusable(focus.idOfPtr(id), r, .{ .role = .slider, .label = "", .activate = false, .ring = false });
+        ring_vis = f.visible;
+        if (f.focused) {
+            const at = opts.progress orelse 0;
+            while (ui.takeKey(&.{ keys.left, keys.right, keys.home, keys.end })) |k| {
+                const step: f32 = if (k.mods.shift) 0.2 else 0.05;
+                res.seek = std.math.clamp(switch (k.code) {
+                    keys.left => (res.seek orelse at) - step,
+                    keys.right => (res.seek orelse at) + step,
+                    keys.home => 0,
+                    else => 1,
+                }, 0, 1);
+            }
+        }
+    }
     if (!opts.disabled and !opts.passive and r.w > 0) {
         const at = std.math.clamp((in.mouse_x - r.x) / r.w, 0, 1);
         if (ui.state) |s| {

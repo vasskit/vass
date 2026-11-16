@@ -31,6 +31,7 @@ const gfx = @import("gfx.zig");
 const icons = @import("icons.zig");
 const keys = @import("keys.zig");
 const ui_mod = @import("ui.zig");
+const focus = @import("focus.zig");
 const Rect = geom.Rect;
 const Color = geom.Color;
 const Ui = ui_mod.Ui;
@@ -94,6 +95,9 @@ pub const PopupState = struct {
     last_mouse: [2]f32 = .{ std.math.nan(f32), 0 },
     /// The popup most recently drawn inside this one, closed together with it.
     child: ?*PopupState = null,
+    /// Keyboard focus when it was opened, given back when it closes (see `openPopup`).
+    return_focus: ?*const anyopaque = null,
+    has_return: bool = false,
 
     /// A zero-size anchor at the point a context menu was opened at.
     pub fn pointAnchor(st: *const PopupState) Rect {
@@ -137,6 +141,7 @@ pub const Frame = struct {
     rect: Rect,
     saved_layer: u8,
     saved_clip_base: usize,
+    saved_scroll_base: usize,
 };
 
 // ---- input routing -------------------------------------------------------------------------
@@ -263,6 +268,11 @@ pub fn openPopup(ui: *Ui, st: *PopupState) void {
     st.scroll = 0;
     st.last_mouse = .{ std.math.nan(f32), 0 };
     st.parent_serial = if (ui.popup_n > 0) ui.popup_stack[ui.popup_n - 1].st.serial else 0;
+    // Remember what had keyboard focus, to give it back on close.
+    if (ui.state) |s| {
+        st.return_focus = s.focus;
+        st.has_return = true;
+    }
 }
 
 /// Closes `st` and any popup opened from inside it.
@@ -270,15 +280,21 @@ pub fn closePopup(ui: *Ui, st: *PopupState) void {
     for (ui.popup_stack[0..ui.popup_n], 0..) |f, i| {
         if (f.st == st and i > 0 and ui.popup_stack[i - 1].st.child == st) ui.popup_stack[i - 1].st.child = null;
     }
-    closeTree(st);
+    closeTree(ui, st);
 }
 
-fn closeTree(st: *PopupState) void {
+fn closeTree(ui: *Ui, st: *PopupState) void {
     st.open = false;
     st.fresh = false;
     if (st.child) |c| {
         st.child = null;
-        if (c.open) closeTree(c);
+        if (c.open) closeTree(ui, c);
+    }
+    // Focus goes back to what had it before the popup opened (children first, so the
+    // outermost popup's value wins).
+    if (st.has_return) {
+        st.has_return = false;
+        if (ui.state) |s| s.focus = st.return_focus;
     }
 }
 
@@ -288,13 +304,15 @@ fn closeSelf(ui: *Ui, st: *PopupState) void {
         const parent = ui.popup_stack[ui.popup_n - 1].st;
         if (parent.child == st) parent.child = null;
     }
-    closeTree(st);
+    closeTree(ui, st);
 }
 
 pub fn beginPopup(ui: *Ui, st: *PopupState, anchor: Rect, size: [2]f32, opts: PopupOpts) ?Rect {
     if (!st.open) return null;
     if (ui.popup_n >= max_depth) return null;
     const layer: u8 = @intCast(ui.popup_n + 1);
+    // Tab is handled (and removed from the events) even if no widget has been drawn yet.
+    if (ui.state) |s| focus.frameBegin(ui, s);
 
     // A popup opened inside another is stale once that one has been reopened.
     if (ui.popup_n > 0) {
@@ -339,10 +357,11 @@ pub fn beginPopup(ui: *Ui, st: *PopupState, anchor: Rect, size: [2]f32, opts: Po
     if (ui.popup_n > 0) ui.popup_stack[ui.popup_n - 1].st.child = st;
     if (ui.state) |s| s.popups.record(.{ .rect = rect, .layer = layer, .modal = opts.modal, .swallow = swallow });
 
-    ui.popup_stack[ui.popup_n] = .{ .st = st, .rect = rect, .saved_layer = ui.layer, .saved_clip_base = ui.clip_base };
+    ui.popup_stack[ui.popup_n] = .{ .st = st, .rect = rect, .saved_layer = ui.layer, .saved_clip_base = ui.clip_base, .saved_scroll_base = ui.scroll_base };
     ui.popup_n += 1;
     ui.layer = layer;
     ui.clip_base = ui.clip_n;
+    ui.scroll_base = ui.scroll_n;
     ui.list.setLayer(layer);
 
     const t = ui.theme;
@@ -363,6 +382,7 @@ pub fn endPopup(ui: *Ui) void {
     const f = ui.popup_stack[ui.popup_n];
     ui.layer = f.saved_layer;
     ui.clip_base = f.saved_clip_base;
+    ui.scroll_base = f.saved_scroll_base;
     ui.list.setLayer(f.saved_layer);
 }
 
@@ -371,6 +391,7 @@ pub fn finish(ui: *Ui) void {
     std.debug.assert(ui.popup_n == 0);
     if (ui.state) |s| {
         s.popups.rotate();
+        focus.rotate(s, true);
         s.tip.waiting = s.tip.waiting_next;
         s.tip.waiting_next = false;
     }
@@ -636,6 +657,8 @@ pub fn dropdown(ui: *Ui, r: Rect, st: *DropdownState, items: []const []const u8,
     var changed = false;
     if (opts.disabled and st.popup.open) st.popup.open = false;
     const hv = if (opts.disabled) ui_mod.Interaction{ .hovered = false, .clicked = false } else ui.hit(r);
+    // A Tab stop; the dropdown handles the mouse and its keys itself.
+    _ = ui.focusable(focus.idOfPtr(id), r, .{ .role = .dropdown, .label = if (items.len > 0 and selected.* < items.len) items[selected.*] else opts.placeholder, .disabled = opts.disabled, .ring = false, .activate = false, .click_focus = false });
     var focused = if (ui.state) |s| s.focus == id else false;
 
     if (!opts.disabled) {
@@ -651,8 +674,9 @@ pub fn dropdown(ui: *Ui, r: Rect, st: *DropdownState, items: []const []const u8,
             focused = false;
         }
         if (focused and !st.popup.open and items.len > 0) {
-            for (ui.events()) |ev| switch (ev) {
-                .key => |k| switch (k.code) {
+            while (!st.popup.open) {
+                const k = ui.takeKey(&.{ keys.down, keys.up, keys.@"return", keys.space }) orelse break;
+                switch (k.code) {
                     keys.down => {
                         const n = if (selected.* >= items.len) 0 else @min(selected.* + 1, items.len - 1);
                         if (n != selected.*) {
@@ -667,11 +691,9 @@ pub fn dropdown(ui: *Ui, r: Rect, st: *DropdownState, items: []const []const u8,
                             changed = true;
                         }
                     },
-                    keys.@"return", keys.space => ui.openPopup(&st.popup),
-                    else => {},
-                },
-                else => {},
-            };
+                    else => if (!k.repeat) ui.openPopup(&st.popup),
+                }
+            }
         }
     }
 
@@ -688,6 +710,7 @@ pub fn dropdown(ui: *Ui, r: Rect, st: *DropdownState, items: []const []const u8,
     const shown = ui.fitText(&buf, str, size, @max(0, r.w - 20 - 26));
     ui.labelAt(r.x + 12, r.y + @round((r.h - size * 1.22) / 2), shown, .{ .size = size, .color = col });
     icons.draw(ui.list, .chevron_down, .{ .x = r.x + r.w - 26, .y = r.y + (r.h - 14) / 2, .w = 14, .h = 14 }, if (opts.disabled) t.dim.alpha(90) else t.dim, 1);
+    if (focused and !opts.disabled and ui.focusVisible()) ui.focusRing(r, 9, 2);
 
     if (st.popup.open) {
         const arena = ui.list.arena.allocator();

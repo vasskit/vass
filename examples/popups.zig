@@ -6,7 +6,12 @@
 //!     zig build popups                      run it
 //!     zig build popups -- --snapshot DIR    save DIR/popups-1-tooltip.bmp, popups-2-menus.bmp,
 //!                                           popups-3-popover.bmp and popups-4-modal.bmp
-//!                                           (each scripted into its open state), and exit
+//!                                           (each scripted into its open state), then
+//!                                           popups-focus.bmp (the modal after two Tab presses:
+//!                                           the focus ring on its Delete button), and exit
+//!
+//! Keyboard: Tab / Shift+Tab move between the controls (inside an open popup only those of the
+//! popup), Space / Enter activate, Up / Down change a focused dropdown, Escape closes a popup.
 const std = @import("std");
 const vass = @import("vass");
 
@@ -73,7 +78,9 @@ fn dangerButton(ui: *Ui, r: Rect, str: []const u8) bool {
     const hv = ui.hit(r);
     ui.list.rrect(r, 10, if (hv.hovered) vass.ui.mixColor(t.bad, t.text, 0.12) else t.bad);
     ui.list.textWeighted(r.x + r.w / 2, r.y + @round((r.h - 14.5) / 2), 12, t.accent_text, .center, .semibold, str);
-    return hv.clicked;
+    // A hand-drawn widget joins the Tab order with `focusable`; Enter / Space act like a click.
+    const f = ui.focusable(ui.widgetId(1, vass.ui.idKey(str), null), r, .{ .role = .button, .label = str, .ring_radius = 10 });
+    return hv.clicked or f.activated;
 }
 
 fn frame(app: *App, ui: *Ui) void {
@@ -197,7 +204,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var app: App = .{};
-    var win = try vass.platform.Window.init(gpa, .{ .title = "Popups", .width = win_w, .height = win_h });
+    var win = try vass.platform.Window.init(gpa, .{ .title = "Popups", .width = win_w, .height = win_h, .hidden = snapshot_dir != null });
     defer win.deinit();
     var list = vass.DisplayList.init(gpa);
     defer list.deinit();
@@ -209,7 +216,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Snapshot script: scene 0..3, each drawn for a few frames on a fake clock so the tooltip
     // timer runs, then saved. The scenes put the state of the popups by hand.
-    const scene_names = [_][]const u8{ "1-tooltip", "2-menus", "3-popover", "4-modal" };
+    const scene_names = [_][]const u8{ "1-tooltip", "2-menus", "3-popover", "4-modal", "focus" };
     const frames_per_scene = 5;
 
     var n: u32 = 0;
@@ -246,9 +253,15 @@ pub fn main(init: std.process.Init) !void {
                         app.popover = .{ .open = true };
                         app.sort_dd.popup = .{ .open = true };
                     },
+                    // 4 is the keyboard focus scene: the modal with Tab pressed twice below.
                     else => app.modal = .{ .open = true },
                 }
             }
+        }
+        // The focus scene: Tab twice inside the open modal, so the ring lands on "Delete".
+        if (snapshot_dir != null and scene == 4 and scene_frame == 2) {
+            input.pushKey(vass.keys.tab, .{});
+            input.pushKey(vass.keys.tab, .{});
         }
         // Scene 0 rests the pointer on the second icon button once its position is known.
         if (snapshot_dir != null and scene == 0 and scene_frame == 1) {

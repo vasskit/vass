@@ -28,6 +28,14 @@ const controls = @import("controls.zig");
 const text_area = @import("text_area.zig");
 const popup = @import("popup.zig");
 const layout = @import("layout.zig");
+const focus = @import("focus.zig");
+pub const FocusId = focus.FocusId;
+pub const FocusOpts = focus.FocusOpts;
+pub const FocusResult = focus.FocusResult;
+pub const FocusEntry = focus.Entry;
+pub const FocusRole = focus.Role;
+pub const idKey = focus.idKey;
+pub const focusIdOf = focus.idOfPtr;
 pub const TextEdit = text_edit.TextEdit;
 pub const mixColor = controls.mix;
 const Rect = geom.Rect;
@@ -221,6 +229,8 @@ pub const State = struct {
     popups: popup.Tracker = .{},
     /// Tooltip timer; see `Ui.tooltip`.
     tip: popup.TipState = .{},
+    /// The focusable widgets of this frame and the last, and the focus-ring state; see `focus.zig`.
+    reg: focus.Registry = .{},
 
     /// True while something animates on its own and the app should keep drawing frames even
     /// without input: a tooltip waiting for its delay.
@@ -234,6 +244,21 @@ pub const State = struct {
 
     pub fn focusOn(s: *State, widget_state: *const anyopaque) void {
         s.focus = widget_state;
+    }
+
+    /// The focused widget's id (its state's address, or a derived id), if any.
+    pub fn focusId(s: *const State) ?FocusId {
+        return if (s.focus) |f| focus.idOfPtr(f) else null;
+    }
+
+    /// The focusable widgets declared in the last completed frame, in call order (read only).
+    pub fn focusEntries(s: *const State) []const FocusEntry {
+        return s.reg.last();
+    }
+
+    /// Whether the focus ring is currently shown (focus came from the keyboard).
+    pub fn focusRingVisible(s: *const State) bool {
+        return s.reg.visible;
     }
 };
 
@@ -282,6 +307,13 @@ pub const Theme = struct {
     scroll_step: f32 = 24,
     /// Line spacing for wrapped text, as a multiple of the font size.
     line_spacing: f32 = 1.4,
+    /// Colour of the keyboard focus ring. Null: a light tint of `accent` (see `ringColor`).
+    focus_ring: ?Color = null,
+
+    /// The focus ring colour: `focus_ring`, or the accent mixed a third of the way to the text colour.
+    pub fn ringColor(t: Theme) Color {
+        return t.focus_ring orelse controls.mix(t.accent, t.text, 0.3);
+    }
 };
 
 pub const Interaction = struct { hovered: bool, clicked: bool };
@@ -297,7 +329,24 @@ pub const LabelOpts = struct {
     weight: gfx.Weight = .regular,
 };
 
-pub const ButtonOpts = struct { on: bool = false };
+pub const ButtonOpts = struct {
+    on: bool = false,
+    /// Dimmed; never clicked, activated or focused.
+    disabled: bool = false,
+    /// Focus id key (`idKey(x)`); default: derived from the label. See `focus.zig`.
+    id: ?u64 = null,
+};
+
+pub const PillOpts = struct {
+    disabled: bool = false,
+    id: ?u64 = null,
+};
+
+pub const TabsOpts = struct {
+    disabled: bool = false,
+    /// Overrides the default id, the address of the `selected` value.
+    id: ?u64 = null,
+};
 
 pub const MeterOpts = struct {
     /// Small dim caption at the left, and the value text at the right.
@@ -330,6 +379,14 @@ pub const ChipOpts = struct {
     weight: gfx.Weight = .medium,
     /// Corner radius; null is fully rounded.
     radius: ?f32 = null,
+    /// Takes keyboard focus (Tab) and reports Enter / Space as a click. Null: only when
+    /// `hover_fill` is set, since a chip is usually a plain label and only clickable ones belong
+    /// in the Tab order.
+    focusable: ?bool = null,
+    /// Focus id key (`idKey(x)`); default: derived from the text.
+    id: ?u64 = null,
+    /// Name for assistive technology when the chip has no text of its own.
+    label: []const u8 = "",
 };
 
 pub const IconButtonOpts = struct {
@@ -343,6 +400,10 @@ pub const IconButtonOpts = struct {
     color: ?Color = null,
     /// Stroke weight multiplier.
     weight: f32 = 1,
+    /// Name for assistive technology (icon buttons have no text).
+    label: []const u8 = "",
+    /// Focus id key (`idKey(x)`); default: derived from the icon.
+    id: ?u64 = null,
 };
 
 pub const CheckOpts = controls.CheckOpts;
@@ -373,7 +434,41 @@ pub const RowOpts = struct {
     /// Defaults to the theme's `button_on`.
     selected_fill: ?Color = null,
     radius: f32 = 8,
+    /// Dimmed by the caller; skipped by Tab and never activated.
+    disabled: bool = false,
+    /// Takes keyboard focus (Tab) and reports Enter / Space as a click.
+    focusable: bool = true,
+    /// Focus id key (`idKey(row.key)`). Without one the id is the row's position among the
+    /// rows of its id scope, which breaks when rows are reordered: pass one for dynamic lists.
+    id: ?u64 = null,
+    /// Name for assistive technology.
+    label: []const u8 = "",
 };
+
+/// Widget kinds mixed into derived focus ids, so a button and a chip with one label differ.
+const tag_button: u64 = 1;
+const tag_pill: u64 = 2;
+const tag_chip: u64 = 3;
+const tag_icon_button: u64 = 4;
+const tag_row: u64 = 5;
+const tag_radio: u64 = 6;
+const tag_tabs: u64 = 7;
+const tag_check: u64 = 8;
+const tag_toggle: u64 = 9;
+const tag_segmented: u64 = 10;
+
+/// The selection after Left / Right / Home / End in a row of `n` items (no wrapping).
+pub fn stepSelection(cur: usize, n: usize, code: u32) usize {
+    if (n == 0) return cur;
+    const c = @min(cur, n - 1);
+    return switch (code) {
+        keys.left => if (cur >= n) n - 1 else c -| 1,
+        keys.right => @min(c + 1, n - 1),
+        keys.home => 0,
+        keys.end => n - 1,
+        else => cur,
+    };
+}
 
 pub const Ui = struct {
     list: *DisplayList,
@@ -396,6 +491,14 @@ pub const Ui = struct {
     layer: u8 = 0,
     /// Clips below this index belong to the layer below (popups are not clipped by it).
     clip_base: usize = 0,
+    /// Scroll frames below this index belong to the layer below (see `clip_base`).
+    scroll_base: usize = 0,
+    /// Id scope (`pushId`): the hash widget ids are derived from, and the saved outer ones.
+    id_base: u64 = 0,
+    id_stack: [16]u64 = undefined,
+    id_n: usize = 0,
+    /// Focus bookkeeping for this frame has started (see `focus.frameBegin`).
+    focus_begun: bool = false,
     popup_stack: [popup.max_depth]popup.Frame = undefined,
     popup_n: usize = 0,
 
@@ -462,6 +565,88 @@ pub const Ui = struct {
     /// above it was open last frame. Widgets use this instead of `input.events()`.
     pub fn events(ui: *const Ui) []const InEvent {
         return popup.eventsFor(ui, ui.layer);
+    }
+
+    // ---- keyboard focus (see focus.zig) --------------------------------
+
+    /// Registers a focusable widget occupying `r` under `id` and handles focus for it (click to
+    /// focus, Enter / Space, scroll into view, the focus ring). Call after drawing the widget.
+    /// `id` is the address of the widget's state (`focus.idOfPtr(&state)`) or derived
+    /// (`ui.widgetId`). Without `ui.state` nothing is ever focused.
+    pub fn focusable(ui: *Ui, id: FocusId, r: Rect, opts: FocusOpts) FocusResult {
+        return focus.focusable(ui, id, r, opts);
+    }
+
+    /// A derived focus id for a custom stateless widget: from the id stack, `kind` (any integer
+    /// naming the kind of widget), `key` (a label hash: `idKey("Save")`) and the occurrence of that
+    /// combination so far this frame. Pass `explicit` (an `idKey`) to name the widget yourself.
+    pub fn widgetId(ui: *Ui, kind: u64, key: u64, explicit: ?u64) FocusId {
+        return focus.autoId(ui, 0x100 + kind, key, explicit);
+    }
+
+    /// Opens an id scope: widget ids derived inside it differ from the same widgets elsewhere.
+    /// `key` is any integer, enum, string or pointer. Up to 16 deep; pair with `popId`.
+    pub fn pushId(ui: *Ui, key: anytype) void {
+        if (ui.id_n >= ui.id_stack.len) return;
+        ui.id_stack[ui.id_n] = ui.id_base;
+        ui.id_n += 1;
+        ui.id_base = focus.hashInto(ui.id_base, key);
+    }
+
+    pub fn popId(ui: *Ui) void {
+        if (ui.id_n == 0) return;
+        ui.id_n -= 1;
+        ui.id_base = ui.id_stack[ui.id_n];
+    }
+
+    /// Focus moves to the next / previous focusable widget (as Tab / Shift+Tab do), wrapping.
+    pub fn focusNext(ui: *Ui) void {
+        focus.focusNext(ui);
+    }
+
+    pub fn focusPrev(ui: *Ui) void {
+        focus.focusPrev(ui);
+    }
+
+    /// Focuses the widget with this id (it must be declared this or next frame); scrolls it into view.
+    pub fn setFocus(ui: *Ui, id: FocusId) void {
+        focus.setFocus(ui, id);
+    }
+
+    pub fn isFocused(ui: *const Ui, id: FocusId) bool {
+        return focus.isFocused(ui, id);
+    }
+
+    pub fn focusedId(ui: *const Ui) ?FocusId {
+        return focus.focusedId(ui);
+    }
+
+    /// True while the focus ring is shown: focus came from the keyboard and no mouse press since.
+    pub fn focusVisible(ui: *const Ui) bool {
+        return focus.focusVisible(ui);
+    }
+
+    /// The focusable widgets declared in the last completed frame, in call order.
+    pub fn focusEntries(ui: *const Ui) []const FocusEntry {
+        const s = ui.state orelse return &.{};
+        return s.reg.last();
+    }
+
+    /// Draws the focus ring around `r` (a widget with corner `radius`), `offset` points outside it.
+    pub fn focusRing(ui: *Ui, r: Rect, radius: f32, offset: f32) void {
+        focus.drawRing(ui, r, radius, offset);
+    }
+
+    /// Removes the first key press of this frame whose code is in `codes` (modifiers: at most
+    /// Shift) from `events()` and returns it. For a focused widget that acts on keys.
+    pub fn takeKey(ui: *Ui, codes: []const u32) ?backend.Key {
+        return focus.takeKey(ui, codes);
+    }
+
+    /// True if the focused widget wants this key: for shortcut code that runs before the widgets
+    /// of the frame. See `focus.zig`.
+    pub fn keyClaimed(ui: *const Ui, code: u32, mods: keys.Mods) bool {
+        return focus.keyClaimed(ui, code, mods);
     }
 
     // ---- clipping ------------------------------------------------------
@@ -535,34 +720,85 @@ pub const Ui = struct {
         ui.list.rrect(r, ui.theme.card_radius, ui.theme.card);
     }
 
-    /// A fully rounded toggle chip; returns true on the frame it is clicked.
+    /// A fully rounded toggle chip; returns true on the frame it is clicked (or activated with
+    /// Enter / Space while it has keyboard focus).
     pub fn pill(ui: *Ui, r: Rect, str: []const u8, selected: bool) bool {
+        return ui.pillWith(r, str, selected, .{});
+    }
+
+    /// `pill` with options (a focus id, disabled).
+    pub fn pillWith(ui: *Ui, r: Rect, str: []const u8, selected: bool, opts: PillOpts) bool {
+        const clicked = ui.pillDraw(r, str, selected, opts.disabled);
+        const f = ui.focusable(focus.autoId(ui, tag_pill, focus.idKey(str), opts.id), r, .{
+            .role = .button,
+            .label = str,
+            .disabled = opts.disabled,
+            .ring_radius = r.h / 2,
+        });
+        return clicked or f.activated;
+    }
+
+    /// Draws a pill and reports the click; registers nothing for focus.
+    fn pillDraw(ui: *Ui, r: Rect, str: []const u8, selected: bool, disabled: bool) bool {
         const t = ui.theme;
-        ui.list.rrect(r, r.h / 2, if (selected) t.accent else t.card);
-        ui.list.text(r.x + r.w / 2, r.y + (r.h - 15) / 2, t.font_button, if (selected) t.accent_text else t.dim, .center, str);
-        return ui.hit(r).clicked;
+        const fill = if (selected) t.accent else t.card;
+        const col = if (selected) t.accent_text else t.dim;
+        ui.list.rrect(r, r.h / 2, if (disabled) fill.alpha(90) else fill);
+        ui.list.text(r.x + r.w / 2, r.y + (r.h - 15) / 2, t.font_button, if (disabled) col.alpha(90) else col, .center, str);
+        return !disabled and ui.hit(r).clicked;
     }
 
     /// A row of pills sharing `r` equally, one per label. Clicking one stores
-    /// its index in `selected`; returns true if that changed anything.
+    /// its index in `selected`; returns true if that changed anything. One Tab stop for the
+    /// whole row: Left / Right (and Home / End) change the selection while it has focus.
     pub fn tabs(ui: *Ui, r: Rect, labels: []const []const u8, selected: *usize) bool {
+        return ui.tabsWith(r, labels, selected, .{});
+    }
+
+    /// `tabs` with options.
+    pub fn tabsWith(ui: *Ui, r: Rect, labels: []const []const u8, selected: *usize, opts: TabsOpts) bool {
         var changed = false;
+        const id = if (opts.id) |e| focus.autoId(ui, tag_tabs, 0, e) else focus.idOfPtr(selected);
+        const f = ui.focusable(id, r, .{ .role = .tab, .disabled = opts.disabled, .activate = false, .ring = false });
+        if (f.focused and labels.len > 0) {
+            while (ui.takeKey(&.{ keys.left, keys.right, keys.home, keys.end })) |k| {
+                const n = stepSelection(selected.*, labels.len, k.code);
+                if (n != selected.*) {
+                    selected.* = n;
+                    changed = true;
+                }
+            }
+        }
         const current = selected.*;
         for (labels, 0..) |str, i| {
-            if (ui.pill(r.column(labels.len, ui.theme.gap, i), str, i == current) and i != current) {
+            if (ui.pillDraw(r.column(labels.len, ui.theme.gap, i), str, i == current, opts.disabled) and i != current) {
                 selected.* = i;
                 changed = true;
             }
         }
+        if (f.visible and labels.len > 0) {
+            const sel = r.column(labels.len, ui.theme.gap, @min(selected.*, labels.len - 1));
+            ui.focusRing(sel, sel.h / 2, 2);
+        }
         return changed;
     }
 
-    /// A rounded button, filled when `opts.on`; returns true when clicked.
+    /// A rounded button, filled when `opts.on`; returns true when clicked (or activated with
+    /// Enter / Space while it has keyboard focus).
     pub fn button(ui: *Ui, r: Rect, str: []const u8, opts: ButtonOpts) bool {
         const t = ui.theme;
-        ui.list.rrect(r, t.card_radius, if (opts.on) t.button_on else t.card);
-        ui.list.text(r.x + r.w / 2, r.y + (r.h - 14) / 2, t.font_button, if (opts.on) t.text else t.dim, .center, str);
-        return ui.hit(r).clicked;
+        const fill = if (opts.on) t.button_on else t.card;
+        const col = if (opts.on) t.text else t.dim;
+        ui.list.rrect(r, t.card_radius, if (opts.disabled) fill.alpha(90) else fill);
+        ui.list.text(r.x + r.w / 2, r.y + (r.h - 14) / 2, t.font_button, if (opts.disabled) col.alpha(90) else col, .center, str);
+        const clicked = !opts.disabled and ui.hit(r).clicked;
+        const f = ui.focusable(focus.autoId(ui, tag_button, focus.idKey(str), opts.id), r, .{
+            .role = .button,
+            .label = str,
+            .disabled = opts.disabled,
+            .ring_radius = t.card_radius,
+        });
+        return clicked or f.activated;
     }
 
     /// A game-style segmented meter, 30 points tall: caption and value on the
@@ -628,6 +864,10 @@ pub const Ui = struct {
         } else ui.list.rrect(r, rad, fill);
         // A font's line box is about 1.2 times its size; centre that in the chip.
         ui.list.textWeighted(r.x + r.w / 2, r.y + (r.h - opts.size * 1.22) / 2, opts.size, opts.color orelse t.text, .center, opts.weight, str);
+        if (opts.focusable orelse (opts.hover_fill != null)) {
+            const f = ui.focusable(focus.autoId(ui, tag_chip, focus.idKey(str), opts.id), r, .{ .role = .button, .label = if (str.len > 0) str else opts.label, .ring_radius = rad });
+            return .{ .hovered = hv.hovered, .clicked = hv.clicked or f.activated };
+        }
         return hv;
     }
 
@@ -651,8 +891,15 @@ pub const Ui = struct {
         }
         const base = opts.color orelse t.dim;
         const color = if (opts.disabled) base.alpha(90) else if (hv.hovered or opts.active) t.text else base;
-        icons.drawSource(ui.list, icons.Source.from(icon), r.center(opts.icon_size, opts.icon_size), color, opts.weight);
-        return hv;
+        const src = icons.Source.from(icon);
+        icons.drawSource(ui.list, src, r.center(opts.icon_size, opts.icon_size), color, opts.weight);
+        const f = ui.focusable(focus.autoId(ui, tag_icon_button, focus.iconKey(src), opts.id), r, .{
+            .role = .button,
+            .label = opts.label,
+            .disabled = opts.disabled,
+            .ring_radius = 7,
+        });
+        return .{ .hovered = hv.hovered, .clicked = hv.clicked or f.activated };
     }
 
     /// A selectable list row: draws a highlight when `opts.selected` or hovered
@@ -664,6 +911,15 @@ pub const Ui = struct {
             ui.list.rrect(r, opts.radius, opts.selected_fill orelse t.button_on);
         } else if (hv.hovered) {
             ui.list.rrect(r, opts.radius, opts.hover orelse t.text.alpha(14));
+        }
+        if (opts.focusable) {
+            const f = ui.focusable(focus.autoId(ui, tag_row, 0, opts.id), r, .{
+                .role = .list_row,
+                .label = opts.label,
+                .disabled = opts.disabled,
+                .ring_radius = opts.radius,
+            });
+            return .{ .hovered = hv.hovered, .clicked = (hv.clicked and !opts.disabled) or f.activated };
         }
         return hv;
     }
@@ -1029,6 +1285,8 @@ pub const Ui = struct {
         const id: *const anyopaque = st;
         var res: TextFieldResult = .{};
         const in = &ui.input;
+        // A Tab stop; the field handles the mouse itself. Tab is taken before the field sees keys.
+        _ = ui.focusable(focusIdOf(id), r, .{ .role = .text_field, .label = opts.placeholder, .ring = false, .activate = false, .click_focus = false });
         var focused = if (ui.state) |s| s.focus == id else false;
         const hv = ui.hit(r);
 
@@ -1255,27 +1513,29 @@ pub const Ui = struct {
             st.offset -= ui.input.wheel_y * ui.theme.scroll_step;
             ui.input.wheel_y = 0; // consumed, so an enclosing scroll area doesn't also move
         }
-        // Keys: Page Up/Down always; arrows and Home/End only while no text
-        // field has focus, since a field uses those itself.
+        // Keys: Page Up/Down always; arrows and Home/End only while the focused widget (a text
+        // field, a slider...) does not want them (`keyClaimed`).
         if (st.key_scroll or ui.hit(r).hovered) {
-            const free = st.arrow_keys and (if (ui.state) |s| s.focus == null else true);
             for (ui.events()) |ev| switch (ev) {
-                .key => |k| switch (k.code) {
-                    keys.page_up => st.offset -= r.h * 0.9,
-                    keys.page_down => st.offset += r.h * 0.9,
-                    keys.up => if (free) {
-                        st.offset -= ui.theme.scroll_step * 2;
-                    },
-                    keys.down => if (free) {
-                        st.offset += ui.theme.scroll_step * 2;
-                    },
-                    keys.home => if (free) {
-                        st.offset = 0;
-                    },
-                    keys.end => if (free) {
-                        st.offset = max;
-                    },
-                    else => {},
+                .key => |k| {
+                    const free = st.arrow_keys and !ui.keyClaimed(k.code, k.mods);
+                    switch (k.code) {
+                        keys.page_up => st.offset -= r.h * 0.9,
+                        keys.page_down => st.offset += r.h * 0.9,
+                        keys.up => if (free) {
+                            st.offset -= ui.theme.scroll_step * 2;
+                        },
+                        keys.down => if (free) {
+                            st.offset += ui.theme.scroll_step * 2;
+                        },
+                        keys.home => if (free) {
+                            st.offset = 0;
+                        },
+                        keys.end => if (free) {
+                            st.offset = max;
+                        },
+                        else => {},
+                    }
                 },
                 else => {},
             };
