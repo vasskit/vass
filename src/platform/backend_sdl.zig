@@ -150,6 +150,7 @@ const c = struct {
     extern fn SDL_UpdateTexture(t: *Texture, rect: ?*const SdlRect, pixels: *const anyopaque, pitch: c_int) bool;
     extern fn SDL_SetTextureBlendMode(t: *Texture, mode: u32) bool;
     extern fn SDL_SetTextureScaleMode(t: *Texture, mode: c_int) bool;
+    extern fn SDL_GetTextureBlendMode(t: *Texture, mode: *u32) bool;
     const PathInfo = extern struct { kind: c_int, size: u64, create_time: i64, modify_time: i64, access_time: i64 };
     const PATHTYPE_FILE: c_int = 1;
     extern fn SDL_GetPathInfo(path: [*:0]const u8, info: *PathInfo) bool;
@@ -883,8 +884,12 @@ fn rendererMaxTexture(ren: *c.Renderer) u32 {
 /// except the last.
 const CachedText = struct {
     tex: *c.Texture,
+    /// Size in points (pixels / density).
     w: f32,
     h: f32,
+    /// Size in device pixels, whole numbers. Strips included in the width.
+    pw: f32,
+    ph: f32,
     last_frame: u64,
     more: []const *c.Texture = &.{},
 };
@@ -2152,13 +2157,13 @@ pub const Window = struct {
         const hdr: *const c.SurfaceHeader = @ptrCast(@alignCast(surf));
         if (hdr.w > 0 and @as(u32, @intCast(hdr.w)) > w.maxTextureSize()) {
             if (hdr.pixels == null or hdr.format != c.PIXELFORMAT_ARGB8888 or hdr.h <= 0 or hdr.pitch < hdr.w * 4) return null;
-            return w.stripTexture(c.PIXELFORMAT_ARGB8888, hdr.pixels.?, @intCast(hdr.pitch), @intCast(hdr.w), @intCast(hdr.h));
+            return w.stripTexture(c.PIXELFORMAT_ARGB8888, c.BLENDMODE_BLEND, hdr.pixels.?, @intCast(hdr.pitch), @intCast(hdr.w), @intCast(hdr.h));
         }
         const tex = c.SDL_CreateTextureFromSurface(w.ren, surf) orelse return null;
         var tw: f32 = 0;
         var th: f32 = 0;
         _ = c.SDL_GetTextureSize(tex, &tw, &th);
-        return .{ .tex = tex, .w = tw / w.density, .h = th / w.density, .last_frame = w.frame };
+        return .{ .tex = tex, .w = tw / w.density, .h = th / w.density, .pw = tw, .ph = th, .last_frame = w.frame };
     }
 
     fn maxTextureSize(w: *const Window) u32 {
@@ -2167,7 +2172,7 @@ pub const Window = struct {
 
     /// Uploads a line of pixels wider than the renderer's maximum texture as side-by-side strips.
     /// `pixels` is `height` rows of `pitch` bytes, 4 bytes per pixel in `format`.
-    fn stripTexture(w: *Window, format: u32, pixels: [*]const u8, pitch: usize, width: usize, height: usize) ?CachedText {
+    fn stripTexture(w: *Window, format: u32, blend: u32, pixels: [*]const u8, pitch: usize, width: usize, height: usize) ?CachedText {
         const max: usize = w.maxTextureSize();
         const n = (width + max - 1) / max;
         const texs = w.gpa.alloc(*c.Texture, n) catch return null;
@@ -2180,7 +2185,7 @@ pub const Window = struct {
                 c.SDL_DestroyTexture(tex);
                 break;
             }
-            _ = c.SDL_SetTextureBlendMode(tex, c.BLENDMODE_BLEND);
+            _ = c.SDL_SetTextureBlendMode(tex, blend);
             texs[made] = tex;
         }
         if (made < n) {
@@ -2199,6 +2204,8 @@ pub const Window = struct {
             .more = rest.?,
             .w = @as(f32, @floatFromInt(width)) / w.density,
             .h = @as(f32, @floatFromInt(height)) / w.density,
+            .pw = @floatFromInt(width),
+            .ph = @floatFromInt(height),
             .last_frame = w.frame,
         };
     }
@@ -2267,17 +2274,22 @@ pub const Window = struct {
     fn composeText(w: *Window, i: usize, str: []const u8, col: Color, px: u32) ?CachedText {
         const line = w.composeBuffer(i, str, col, px) orelse return null;
         defer w.gpa.free(line.rgba);
-        if (line.w > w.maxTextureSize()) return w.stripTexture(c.PIXELFORMAT_RGBA32, line.rgba.ptr, line.w * 4, line.w, line.h);
+        compose.premultiply(line.rgba);
+        if (line.w > w.maxTextureSize()) return w.stripTexture(c.PIXELFORMAT_RGBA32, c.BLENDMODE_BLEND_PREMULTIPLIED, line.rgba.ptr, line.w * 4, line.w, line.h);
         const tex = c.SDL_CreateTexture(w.ren, c.PIXELFORMAT_RGBA32, c.TEXTUREACCESS_STATIC, @intCast(line.w), @intCast(line.h)) orelse return null;
         if (!c.SDL_UpdateTexture(tex, null, line.rgba.ptr, @intCast(line.w * 4))) {
             c.SDL_DestroyTexture(tex);
             return null;
         }
-        _ = c.SDL_SetTextureBlendMode(tex, c.BLENDMODE_BLEND);
+        // Premultiplied, like images: linear filtering at an edge then never mixes in the
+        // colour of a transparent texel, which would darken light text.
+        _ = c.SDL_SetTextureBlendMode(tex, c.BLENDMODE_BLEND_PREMULTIPLIED);
         return .{
             .tex = tex,
             .w = @as(f32, @floatFromInt(line.w)) / w.density,
             .h = @as(f32, @floatFromInt(line.h)) / w.density,
+            .pw = @floatFromInt(line.w),
+            .ph = @floatFromInt(line.h),
             .last_frame = w.frame,
         };
     }
@@ -2328,25 +2340,41 @@ pub const Window = struct {
             break :blk w.texts.getPtr(key).?;
         };
         entry.last_frame = w.frame;
-        const dx = switch (alignment) {
-            .left => x,
-            .center => x - entry.w / 2,
-            .right => x - entry.w,
-        };
-        const dst: c.FRect = .{ .x = dx, .y = y, .w = entry.w, .h = entry.h };
-        _ = c.SDL_RenderTexture(w.ren, entry.tex, null, &dst);
-        if (entry.more.len > 0) {
+        const o = textOrigin(x, y, entry.pw, alignment, w.density);
+        const d = w.density;
+        const first_w = if (entry.more.len > 0) blk: {
             var tw: f32 = 0;
             var th: f32 = 0;
             _ = c.SDL_GetTextureSize(entry.tex, &tw, &th);
-            var sx = dx + tw / w.density;
-            for (entry.more) |m| {
-                _ = c.SDL_GetTextureSize(m, &tw, &th);
-                const part: c.FRect = .{ .x = sx, .y = y, .w = tw / w.density, .h = entry.h };
-                _ = c.SDL_RenderTexture(w.ren, m, null, &part);
-                sx += tw / w.density;
-            }
+            break :blk tw;
+        } else entry.pw;
+        const dst: c.FRect = .{ .x = o.x / d, .y = o.y / d, .w = first_w / d, .h = entry.ph / d };
+        _ = c.SDL_RenderTexture(w.ren, entry.tex, null, &dst);
+        // Strips continue by whole texels from the snapped origin: no gap, no overlap.
+        var sx = o.x + first_w;
+        for (entry.more) |m| {
+            var tw: f32 = 0;
+            var th: f32 = 0;
+            _ = c.SDL_GetTextureSize(m, &tw, &th);
+            const part: c.FRect = .{ .x = sx / d, .y = o.y / d, .w = tw / d, .h = entry.ph / d };
+            _ = c.SDL_RenderTexture(w.ren, m, null, &part);
+            sx += tw;
         }
+    }
+
+    /// Where the top-left of a text texture `pw` pixels wide goes, in device pixels, whole numbers.
+    /// The texture is never scaled, so on whole pixels its texels map 1:1 onto the screen's and
+    /// the glyphs stay as sharp as the rasteriser made them. Carets, selections and underlines
+    /// are shapes at fractional positions and are not moved: a shape edge rounds the same way
+    /// (to the nearest pixel), so it stays within half a pixel of the glyph it belongs to.
+    fn textOrigin(x: f32, y: f32, pw: f32, alignment: gfx.Align, density: f32) struct { x: f32, y: f32 } {
+        const px = x * density;
+        const left = switch (alignment) {
+            .left => px,
+            .center => px - pw / 2,
+            .right => px - pw,
+        };
+        return .{ .x = @round(left), .y = @round(y * density) };
     }
 
     /// Text pixel height for a size in points, or null for sizes that draw nothing (not a
@@ -2573,6 +2601,143 @@ test "text wider than the largest texture is drawn in strips, measured as one li
     win.drawText(0, 0, huge, size, white, .left, .regular);
     try std.testing.expectEqual(@as(u32, 1), win.text_misses.count());
     try std.testing.expectEqual(@as(u32, 1), win.texts.count());
+}
+
+/// The window's current render target as bytes (rows of `pitch`). Test helper.
+fn readBack(win: *Window) ![]u8 {
+    const surf = c.SDL_RenderReadPixels(win.ren, null) orelse return error.TestUnexpectedResult;
+    defer c.SDL_DestroySurface(surf);
+    const hdr: *const c.SurfaceHeader = @ptrCast(@alignCast(surf));
+    const n: usize = @intCast(hdr.pitch * hdr.h);
+    return std.testing.allocator.dupe(u8, hdr.pixels.?[0..n]);
+}
+
+fn clearTo(win: *Window, v: u8) void {
+    _ = c.SDL_SetRenderDrawColor(win.ren, v, v, v, 255);
+    _ = c.SDL_RenderClear(win.ren);
+}
+
+test "text origin is on whole device pixels at any density and alignment, within half a pixel" {
+    for ([_]f32{ 1, 1.5, 2, 3 }) |d| {
+        for ([_]gfx.Align{ .left, .center, .right }) |al| {
+            for ([_]f32{ 51, 52, 7, 1 }) |pw| {
+                var x: f32 = 10.0;
+                while (x < 11.0) : (x += 0.125) {
+                    const o = Window.textOrigin(x, x * 1.3, pw, al, d);
+                    try std.testing.expectEqual(@round(o.x), o.x);
+                    try std.testing.expectEqual(@round(o.y), o.y);
+                    const ideal: f32 = switch (al) {
+                        .left => x * d,
+                        .center => x * d - pw / 2,
+                        .right => x * d - pw,
+                    };
+                    try std.testing.expect(@abs(o.x - ideal) <= 0.5);
+                    try std.testing.expect(@abs(o.y - x * 1.3 * d) <= 0.5);
+                }
+            }
+        }
+    }
+}
+
+test "text drawn at a fractional position is pixel-identical to the same text on the snapped pixel" {
+    const win = try dummyWindow(.{ .title = "snap", .width = 120, .height = 40 });
+    defer win.destroy();
+    for ([_]f32{ 1, 2 }) |d| {
+        win.density = d;
+        _ = c.SDL_SetRenderScale(win.ren, d, d);
+        for ([_]gfx.Align{ .left, .center, .right }) |al| {
+            for ([_]f32{ 0, 0.25, 0.5, 0.75 }) |fr| {
+                const x = 60 + fr;
+                const y = 10 + fr;
+                clearTo(win, 40);
+                win.drawText(x, y, "Hello", 13, white, al, .regular);
+                const got = try readBack(win);
+                defer std.testing.allocator.free(got);
+                // Reference: left aligned at the pixel the origin should round to.
+                const pw = win.measureText("Hello", 13) * d;
+                const left = switch (al) {
+                    .left => x * d,
+                    .center => x * d - pw / 2,
+                    .right => x * d - pw,
+                };
+                clearTo(win, 40);
+                win.drawText(@round(left) / d, @round(y * d) / d, "Hello", 13, white, .left, .regular);
+                const want = try readBack(win);
+                defer std.testing.allocator.free(want);
+                try std.testing.expectEqualSlices(u8, want, got);
+            }
+        }
+    }
+}
+
+test "a line drawn in strips is as wide as the measure and contiguous at a fractional position" {
+    const win = try dummyWindow(.{ .title = "strip snap", .width = 120, .height = 40 });
+    defer win.destroy();
+    const size: f32 = 14;
+    const per = win.measureText("m", size);
+    const n: usize = @intFromFloat(@ceil(2.5 * 2048 / per));
+    const long = try std.testing.allocator.alloc(u8, n);
+    defer std.testing.allocator.free(long);
+    @memset(long, 'm');
+    // Left of the window so that the seams between strips (2048 px apart) are on screen.
+    const x: f32 = 50.5 - 2048;
+    var shots: [2][]u8 = undefined;
+    for (&shots, [_]u32{ 2048, 1 << 20 }) |*shot, max| {
+        win.max_tex = max;
+        var it = win.texts.iterator();
+        while (it.next()) |e| win.destroyText(e.value_ptr.*);
+        win.texts.clearRetainingCapacity();
+        clearTo(win, 40);
+        win.drawText(x, 10.5, long, size, white, .left, .regular);
+        shot.* = try readBack(win);
+    }
+    defer for (shots) |s| std.testing.allocator.free(s);
+    const stripped = win.texts.count() == 1;
+    try std.testing.expect(stripped);
+    try std.testing.expectEqualSlices(u8, shots[1], shots[0]);
+    // And the drawn width is the measured width, in whole pixels.
+    win.max_tex = 2048;
+    const i = win.fontIndex(@intFromFloat(@round(size * win.density)), .regular).?;
+    const t = win.textTexture(i, long, white, @intFromFloat(@round(size * win.density))).?;
+    defer win.destroyText(t);
+    try std.testing.expect(t.more.len >= 2);
+    try std.testing.expectEqual(win.measureText(long, size) * win.density, t.pw);
+    try std.testing.expectEqual(@round(t.pw), t.pw);
+}
+
+test "composed (emoji) text is premultiplied, so a transparent texel carries no colour" {
+    const win = try emojiWindow(.{ .title = "premul", .width = 80, .height = 60 });
+    defer win.destroy();
+    const px: u32 = 20;
+    const i = win.fontIndex(px, .regular).?;
+    const str = "ab \u{1F600}";
+    const t = win.composeText(i, str, white, px) orelse return error.TestUnexpectedResult;
+    defer win.destroyText(t);
+    var mode: u32 = 0;
+    try std.testing.expect(c.SDL_GetTextureBlendMode(t.tex, &mode));
+    try std.testing.expectEqual(c.BLENDMODE_BLEND_PREMULTIPLIED, mode);
+    // Also for a line wider than a texture.
+    win.max_tex = 40;
+    const s = win.composeText(i, str, white, px) orelse return error.TestUnexpectedResult;
+    defer win.destroyText(s);
+    try std.testing.expect(s.more.len > 0);
+    try std.testing.expect(c.SDL_GetTextureBlendMode(s.more[0], &mode));
+    try std.testing.expectEqual(c.BLENDMODE_BLEND_PREMULTIPLIED, mode);
+    // The buffer it is made from keeps straight alpha, with the emoji's own colours and the text
+    // alpha as opacity (unchanged).
+    const half: Color = .{ .r = 255, .g = 255, .b = 255, .a = 128 };
+    const line = win.composeBuffer(i, "ab", half, px) orelse return error.TestUnexpectedResult;
+    defer win.gpa.free(line.rgba);
+    var seen = false;
+    var k: usize = 0;
+    while (k < line.rgba.len) : (k += 4) {
+        if (line.rgba[k + 3] != 0) {
+            seen = true;
+            try std.testing.expect(line.rgba[k + 3] <= 128);
+            try std.testing.expectEqual(@as(u8, 255), line.rgba[k]);
+        }
+    }
+    try std.testing.expect(seen);
 }
 
 test "R8: a line is limited by its area, not only its width" {

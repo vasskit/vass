@@ -111,6 +111,16 @@ pub fn overRgba(dst: []u8, dw: usize, dh: usize, src: []const u8, sw: usize, sh:
     }
 }
 
+/// Straight-alpha RGBA to premultiplied, in place.
+pub fn premultiply(rgba: []u8) void {
+    var i: usize = 0;
+    while (i + 4 <= rgba.len) : (i += 4) {
+        const a: u32 = rgba[i + 3];
+        if (a == 255) continue;
+        for (0..3) |k| rgba[i + k] = @intCast((@as(u32, rgba[i + k]) * a + 127) / 255);
+    }
+}
+
 /// Copies a little-endian ARGB8888 surface (bytes B, G, R, A, straight alpha) over `dst` like
 /// `overRgba`, for text drawn by SDL_ttf. The alpha is used as it is (the colour was chosen
 /// when SDL_ttf drew it).
@@ -182,4 +192,10 @@ test "overArgb swizzles B,G,R,A to R,G,B,A" {
     var dst: [4]u8 = @splat(0);
     overArgb(&dst, 1, 1, &.{ 1, 2, 3, 4 }, 1, 1, 4, 0, 0);
     try t.expectEqualSlices(u8, &.{ 3, 2, 1, 4 }, &dst);
+}
+
+test "premultiply scales colour by alpha and leaves opaque and transparent pixels sane" {
+    var px = [_]u8{ 200, 100, 50, 255, 255, 255, 255, 0, 255, 128, 0, 128, 90, 90, 90, 1 };
+    premultiply(&px);
+    try t.expectEqualSlices(u8, &.{ 200, 100, 50, 255, 0, 0, 0, 0, 128, 64, 0, 128, 0, 0, 0, 1 }, &px);
 }
