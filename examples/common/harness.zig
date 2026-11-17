@@ -99,6 +99,8 @@ pub const Config = struct {
     /// Start the input method (text fields and areas need it).
     text_input: bool = false,
     theme: ui_mod.Theme = .{ .card_radius = 12 },
+    /// What the frame is cleared with; null is `theme.bg`. Alpha 0 lets a vibrancy view show.
+    background: ?vass.Color = null,
     /// The frame at which a snapshot run saves `DIR/<snapshot_name>.bmp` and ends. Null: the
     /// example's `step` names the snapshots and ends the run itself.
     snapshot_frame: ?u32 = 3,
@@ -243,6 +245,7 @@ pub fn run(comptime Ex: type, env: Env, cfg: Config, app: anytype) !void {
     try vass.app.run(Host, &host, .{
         .window = window,
         .theme = cfg.theme,
+        .background = cfg.background,
         .text_input = cfg.text_input,
         .gpa = env.gpa,
         .script = if (snapshot) .{

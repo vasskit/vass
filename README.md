@@ -63,7 +63,7 @@ Run it from a clone: `zig build hello`.
   (`Config.script`). The screenshots above were made this way.
 - **Window plumbing.** Live-resize redraw, mouse cursors (`ui.setCursor`), dropped files, the
   system open-file dialog.
-- **macOS extras.** Menu-bar items, overlay windows, a unified title bar, the Dock icon.
+- **macOS extras.** Menu-bar items, overlay windows, a unified title bar, window vibrancy, the Dock icon.
 - **Widgets.** `label`, `labelWrapped`, `textSelectable`, `button`, `pill`, `chip`, `tabs`,
   `checkbox`, `toggle`, `radio`, `segmented`, `slider`, `waveform`, `listRow`, `iconButton`, `card`,
   `meter`, `bar`, and scroll areas (`beginScroll`/`endScroll`).
@@ -150,7 +150,7 @@ zig build test                      # unit tests; also compiles every example
 ```
 
 There are examples for `hello`, `controls`, `layout`, `split`, `popups`, `windows` (several windows),
-`notes`, `images`, `icons` and `audio`.
+`notes`, `images`, `icons`, `audio` and `vibrancy`.
 
 ## Repository layout
 

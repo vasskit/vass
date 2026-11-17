@@ -184,6 +184,101 @@ pub fn unifiedTitleBar(ns_window: ?*anyopaque) void {
     send(void, w, "setTitleVisibility:", .{@as(c_long, 1)}); // NSWindowTitleHidden
 }
 
+/// `NSVisualEffectMaterial` values that are not deprecated.
+pub const Material = enum(c_long) {
+    titlebar = 3,
+    selection = 4,
+    menu = 5,
+    popover = 6,
+    sidebar = 7,
+    header_view = 10,
+    sheet = 11,
+    window_background = 12,
+    hud_window = 13,
+    fullscreen_ui = 15,
+    tooltip = 17,
+    content_background = 18,
+    under_window_background = 21,
+    under_page_background = 22,
+};
+
+/// `system` follows the window; the others force a vibrant dark or light look.
+pub const VibrancyAppearance = enum { system, dark, light };
+
+const vibrancy_id = "vass.vibrancy";
+
+/// The effect view `setVibrancy` installed next to the window's content view, if any.
+fn findVibrancy(superview: Id) Id {
+    const subs = send(Id, superview, "subviews", .{});
+    const n = send(c_ulong, subs, "count", .{});
+    const want = nsString(vibrancy_id);
+    var i: c_ulong = 0;
+    while (i < n) : (i += 1) {
+        const v = send(Id, subs, "objectAtIndex:", .{i});
+        const ident = send(Id, v, "identifier", .{});
+        if (ident != null and send(bool, ident, "isEqualToString:", .{want})) return v;
+    }
+    return null;
+}
+
+/// Shows the blurred desktop behind the window's content: an `NSVisualEffectView` is placed
+/// below the content view, so wherever the app leaves pixels transparent or semi-transparent
+/// the blur shows through. Calling it again changes the material and appearance of the view
+/// already installed. Returns false if there is no window or AppKit has no such view.
+///
+/// The window must have been created with `WindowOptions.transparent = true`, otherwise the
+/// renderer's layer is opaque and nothing shows. The app must also clear with alpha 0 (the app
+/// loop's `Config.background`) and paint its own opaque or semi-transparent panels; whatever is
+/// left transparent shows the blur.
+pub fn setVibrancy(ns_window: ?*anyopaque, material: Material, appearance: VibrancyAppearance) bool {
+    const w = ns_window orelse return false;
+    const pool = Pool.begin();
+    defer pool.end();
+    const cls = objc_getClass("NSVisualEffectView") orelse return false;
+    const content = send(Id, w, "contentView", .{});
+    const superview = send(Id, content, "superview", .{});
+    if (content == null or superview == null) return false;
+    // SDL sets these for a transparent window; do it here too in case it did not.
+    send(void, w, "setOpaque:", .{false});
+    send(void, w, "setBackgroundColor:", .{send(Id, objc_getClass("NSColor"), "clearColor", .{})});
+    var effect = findVibrancy(superview);
+    if (effect == null) {
+        const alloc = send(Id, cls, "alloc", .{});
+        // The whole frame view, not the content view's frame: the content view moves on its own
+        // (a full-size title bar, full screen) and the blur must still be behind all of it.
+        effect = send(Id, alloc, "initWithFrame:", .{send(Rect, superview, "bounds", .{})});
+        if (effect == null) return false;
+        send(void, effect, "setIdentifier:", .{nsString(vibrancy_id)});
+        send(void, effect, "setAutoresizingMask:", .{@as(c_ulong, 2 | 16)}); // width | height sizable
+        send(void, effect, "setBlendingMode:", .{@as(c_long, 0)}); // behind the window
+        send(void, effect, "setState:", .{@as(c_long, 1)}); // active, so it stays blurred unfocused
+        send(void, superview, "addSubview:positioned:relativeTo:", .{ effect, @as(c_long, -1), content });
+        send(void, effect, "release", .{}); // the superview retains it
+    }
+    send(void, effect, "setMaterial:", .{@intFromEnum(material)});
+    const name: ?[*:0]const u8 = switch (appearance) {
+        .system => null,
+        .dark => "NSAppearanceNameVibrantDark",
+        .light => "NSAppearanceNameVibrantLight",
+    };
+    const look = if (name) |n| send(Id, objc_getClass("NSAppearance"), "appearanceNamed:", .{nsString(n)}) else null;
+    send(void, effect, "setAppearance:", .{look});
+    return true;
+}
+
+/// Removes the view `setVibrancy` installed, if any. The window stays see-through: pixels the app
+/// still leaves transparent now show the desktop unblurred and let clicks through, so paint the
+/// whole window or clear with an opaque colour afterwards.
+pub fn clearVibrancy(ns_window: ?*anyopaque) void {
+    const w = ns_window orelse return;
+    const pool = Pool.begin();
+    defer pool.end();
+    const superview = send(Id, send(Id, w, "contentView", .{}), "superview", .{});
+    if (superview == null) return;
+    const effect = findVibrancy(superview);
+    if (effect != null) send(void, effect, "removeFromSuperview", .{});
+}
+
 /// Positions the close/minimise/zoom buttons `left` points from the window's
 /// left edge, vertically centred in a header `bar_h` points tall, keeping
 /// their native spacing. Cheap and idempotent; call every frame because AppKit
@@ -338,6 +433,11 @@ test "objc_msgSend_stret is used for structs returned in memory on x86_64 only" 
     try std.testing.expect(!needsStret(c_long, .x86_64));
     try std.testing.expect(!needsStret(Rect, .aarch64));
     try std.testing.expect(!needsStret(EdgeInsets, .aarch64));
+}
+
+test "vibrancy without a window is a no-op" {
+    try std.testing.expect(!setVibrancy(null, .sidebar, .system));
+    clearVibrancy(null);
 }
 
 test "the primary screen is the first of NSScreen.screens, not the focused one" {
