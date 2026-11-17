@@ -31,7 +31,8 @@ pub const svg_cache = @import("image/svg_cache.zig");
 pub const audio = @import("audio/audio.zig");
 pub const platform = @import("platform/backend_sdl.zig");
 /// macOS-only extras: menu-bar item, overlay window behaviour, notch metrics.
-pub const macos = @import("platform/macos.zig");
+/// Empty off macOS, so using it there is a compile error rather than a silent no-op.
+pub const macos = if (@import("builtin").os.tag == .macos) @import("platform/macos.zig") else struct {};
 /// The application loop: windows, events, frames, redraw policy, scripted runs.
 pub const app = @import("app/app.zig");
 
