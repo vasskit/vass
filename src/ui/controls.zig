@@ -940,7 +940,7 @@ test "waveform: two with empty peaks are told apart, and a rebuilt buffer keeps 
     try std.testing.expect(res.seek != null);
 }
 
-test "R1: a click that presses and releases in one frame still gets its release frame" {
+test "a click that presses and releases in one frame still gets its release frame" {
     var list = DisplayList.init(std.testing.allocator);
     defer list.deinit();
     var st: ui_mod.State = .{};

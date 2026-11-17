@@ -1421,9 +1421,9 @@ fn checkNode(lay: *const Layout, idx: usize) !void {
     }
 }
 
-// ---- audit fixes -------------------------------------------------------------------------
+// ---- edge cases ---------------------------------------------------------------------------
 
-test "P8: row and col sugar with wrap give each line a share of the area, not zero height" {
+test "row and col sugar with wrap give each line a share of the area, not zero height" {
     var out: [2]Rect = undefined;
     row(.{ .x = 0, .y = 0, .w = 100, .h = 40 }, .{ .wrap = true }, &.{ fixed(60), fixed(60) }, &out);
     try testing.expect(out[0].h > 0 and out[1].h > 0);
@@ -1435,7 +1435,7 @@ test "P8: row and col sugar with wrap give each line a share of the area, not ze
     try expectRect(r4(60, 0, 60, 40), out[1]);
 }
 
-test "P9: a grow-width aspect leaf in a column takes the column's width and derives its height" {
+test "a grow-width aspect leaf in a column takes the column's width and derives its height" {
     var lay = Layout.init(testing.allocator);
     defer lay.deinit();
     _ = lay.begin(.{ .dir = .col, .w = .grow(1), .h = .grow(1) });
@@ -1445,7 +1445,7 @@ test "P9: a grow-width aspect leaf in a column takes the column's width and deri
     try expectRect(r4(0, 0, 160, 90), lay.rect(a));
 }
 
-test "P10: line breaking uses the sizes after min and max" {
+test "line breaking uses the sizes after min and max" {
     var lay = Layout.init(testing.allocator);
     defer lay.deinit();
     _ = lay.begin(.{ .dir = .row, .wrap = true, .w = .fixed(200), .h = .hug });

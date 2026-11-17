@@ -2740,7 +2740,7 @@ test "composed (emoji) text is premultiplied, so a transparent texel carries no 
     try std.testing.expect(seen);
 }
 
-test "R8: a line is limited by its area, not only its width" {
+test "a line is limited by its area, not only its width" {
     try std.testing.expect(textSurfaceOk(1000, 100));
     try std.testing.expect(textSurfaceOk(max_line_px, 20));
     // Within the width limit, but a gigabyte of pixels at the largest text size.
@@ -2748,7 +2748,7 @@ test "R8: a line is limited by its area, not only its width" {
     try std.testing.expect(!textSurfaceOk(max_line_px + 1, 1));
 }
 
-test "R9: only a failure that cannot pass is remembered for good; others are retried, at a bounded rate" {
+test "only a failure that cannot pass is remembered for good; others are retried, at a bounded rate" {
     const first = TextMiss.failed(null, 100, false);
     try std.testing.expectEqual(@as(u64, 130), first.retry_at);
     const second = TextMiss.failed(first, 130, false);
@@ -2764,7 +2764,7 @@ test "R9: only a failure that cannot pass is remembered for good; others are ret
     try std.testing.expect(TextMiss.failed(first, 130, true).retry_at == TextMiss.never);
 }
 
-test "R9: a string that is too big is a permanent miss, one that merely failed is retried later" {
+test "a string that is too big is a permanent miss, one that merely failed is retried later" {
     const win = try dummyWindow(.{ .title = "misses", .width = 80, .height = 60 });
     defer win.destroy();
     const size: f32 = 14;
@@ -2785,7 +2785,7 @@ test "R9: a string that is too big is a permanent miss, one that merely failed i
     try std.testing.expectEqual(@as(u8, 1), win.text_misses.get(key).?.tries);
 }
 
-test "R10: a failed icon render is reported once per icon" {
+test "a failed icon render is reported once per icon" {
     const win = try dummyWindow(.{ .title = "svg log", .width = 80, .height = 60 });
     defer win.destroy();
     const icon = try win.loadSvg("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\"/></svg>");
@@ -2819,7 +2819,7 @@ test "clip rects: push and pop stay balanced past the depth, and odd numbers do 
     try std.testing.expectEqual(@as(usize, 0), win.clip_n);
 }
 
-test "R5: an infinite or NaN clip rectangle never widens what is drawn" {
+test "an infinite or NaN clip rectangle never widens what is drawn" {
     const inf = std.math.inf(f32);
     const a = Window.clipInts(.{ .x = 100, .y = 0, .w = inf, .h = 50 });
     try std.testing.expectEqual(@as(c_int, 100), a.x);

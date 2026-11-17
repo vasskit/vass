@@ -1,5 +1,5 @@
-//! Vass — a GUI toolkit for Zig. This is the first vertical slice:
-//! geometry, a display list, and one platform backend (SDL3).
+//! Vass — a GUI toolkit for Zig: geometry, a display list, an immediate-mode `Ui`,
+//! an application loop and one platform backend (SDL3).
 //!
 //! Layering rule: `geom` depends on nothing, `gfx` depends only on `geom`,
 //! and only the backend knows about the windowing/rendering library.

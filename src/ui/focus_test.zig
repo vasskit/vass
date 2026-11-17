@@ -945,13 +945,13 @@ test "modal dialog: Tab cycles through its buttons and a text field" {
     }
 }
 
-// ---- audit fixes ---------------------------------------------------------------------------------------
+// ---- edge cases -----------------------------------------------------------------------------------------
 
 fn farRow(i: usize) Rect {
     return .{ .x = 0, .y = @as(f32, @floatFromInt(i)) * 30, .w = 200, .h = 26 };
 }
 
-test "P2: a text field declared after max_entries other widgets keeps the focus a click gave it" {
+test "a text field declared after max_entries other widgets keeps the focus a click gave it" {
     var rig = try Rig.init();
     defer rig.deinit();
     var field = ui_mod.TextFieldState.init(t.allocator);
@@ -966,7 +966,7 @@ test "P2: a text field declared after max_entries other widgets keeps the focus 
     try t.expect(rig.state.focus == @as(?*const anyopaque, &field));
 }
 
-test "P2: derived ids stay distinct past max_entries" {
+test "derived ids stay distinct past max_entries" {
     var rig = try Rig.init();
     defer rig.deinit();
     var ui = rig.ui(.{});
@@ -978,7 +978,7 @@ test "P2: derived ids stay distinct past max_entries" {
     ui.finish();
 }
 
-test "P3: setFocus for a widget that is declared next frame, not this one, still focuses it" {
+test "setFocus for a widget that is declared next frame, not this one, still focuses it" {
     for ([_]bool{ false, true }) |before_widgets| {
         var rig = try Rig.init();
         defer rig.deinit();
@@ -1010,7 +1010,7 @@ test "P3: setFocus for a widget that is declared next frame, not this one, still
     }
 }
 
-test "P6: closing a popup does not take focus back from a widget the app moved it to" {
+test "closing a popup does not take focus back from a widget the app moved it to" {
     var rig = try Rig.init();
     defer rig.deinit();
     var s = PopScene.init();
@@ -1033,7 +1033,7 @@ test "P6: closing a popup does not take focus back from a widget the app moved i
     try t.expectEqualStrings("Main1", rig.focusedLabel());
 }
 
-test "P16: focusing a text field by Tab or by code ends the selection of a read-only text" {
+test "focusing a text field by Tab or by code ends the selection of a read-only text" {
     for ([_]bool{ false, true }) |by_code| {
         var rig = try Rig.init();
         defer rig.deinit();
@@ -1059,7 +1059,7 @@ test "P16: focusing a text field by Tab or by code ends the selection of a read-
     }
 }
 
-test "P17: text typed before a Tab goes to the field that had focus, text after it to the next" {
+test "text typed before a Tab goes to the field that had focus, text after it to the next" {
     var rig = try Rig.init();
     defer rig.deinit();
     var a = ui_mod.TextFieldState.init(t.allocator);
@@ -1090,7 +1090,7 @@ test "P17: text typed before a Tab goes to the field that had focus, text after 
     try t.expect(rig.state.focus == @as(?*const anyopaque, &b));
 }
 
-test "R6: events lost when parked ones and the new frame's do not fit are counted" {
+test "events lost when parked ones and the new frame's do not fit are counted" {
     var rig = try Rig.init();
     defer rig.deinit();
     var a = ui_mod.TextFieldState.init(t.allocator);

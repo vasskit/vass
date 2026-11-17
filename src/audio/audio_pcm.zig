@@ -915,7 +915,7 @@ test "ogg: a lying length in the header allocates nothing and is not 'too long'"
     try testing.expectEqual(@as(usize, 1000), q.frames());
 }
 
-test "R7: a header that claims a huge length does not fail a file that decodes within the limit" {
+test "a header that claims a huge length does not fail a file that decodes within the limit" {
     const a = testing.allocator;
     const good = @embedFile("testdata/tone.ogg");
     const real = try decodeOgg(a, good);

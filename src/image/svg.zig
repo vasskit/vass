@@ -1716,7 +1716,7 @@ test "document: no viewBox falls back to width/height; neither is an error" {
     try testing.expectError(error.InvalidSvg, parseOne("<svg><rect width=\"1\" height=\"1\"/></svg>"));
 }
 
-test "document: stylesheet classes, ids and tags (the Habor logo style)" {
+test "document: stylesheet classes, ids and tags (a logo exported with a style sheet)" {
     var d = try parseOne(
         \\<?xml version="1.0"?><svg viewBox="0 0 10 10"><defs><style>
         \\ /* c */ .a { fill: #ff0000; } .b, #x { stroke: #00f; stroke-width: 3 } rect { opacity: .5 }

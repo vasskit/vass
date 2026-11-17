@@ -397,7 +397,7 @@ fn systemClipSet(gpa: std.mem.Allocator, str: []const u8) void {
     backend.setClipboardText(gpa, str) catch {};
 }
 
-/// Colours and sizes the widgets draw with. Defaults are Claude Buddy's look.
+/// Colours and sizes the widgets draw with. The defaults are one dark palette.
 pub const Theme = struct {
     bg: Color = Color.hex(0x201E1C),
     card: Color = Color.hex(0x2C2A27),
@@ -3643,7 +3643,7 @@ test "a caret asks for the frame where it next turns on or off, a hair after the
     }
 }
 
-// ---- tests: audit batch (scrolling, queue, wrapping cost, labels) -----------------
+// ---- tests: scrolling, the event queue, wrapping cost, labels -----------------------
 
 /// `s` repeated `n` times, at compile time.
 fn rep(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
@@ -3839,7 +3839,7 @@ test "labelFmt: long output is shortened on a character boundary, not dropped" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(got));
 }
 
-test "R13: labelFmt cuts on a cluster boundary, not between a letter and its marks" {
+test "labelFmt cuts on a cluster boundary, not between a letter and its marks" {
     var list = DisplayList.init(std.testing.allocator);
     defer list.deinit();
     var ui = wrapUi(&list);

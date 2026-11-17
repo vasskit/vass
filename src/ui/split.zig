@@ -1145,9 +1145,9 @@ test "feeds a Layout with no lag: the splitter runs first with last frame's divi
     try t.expectEqual(@as(f32, 400), side_rect.w);
 }
 
-// ---- audit fixes ---------------------------------------------------------------------------------------
+// ---- edge cases -----------------------------------------------------------------------------------------
 
-test "P7: a splitter that is not drawn on the release frame does not leave the drag stuck" {
+test "a splitter that is not drawn on the release frame does not leave the drag stuck" {
     var rig = try Rig.init();
     defer rig.deinit();
     var a: f32 = 100;
@@ -1169,7 +1169,7 @@ test "P7: a splitter that is not drawn on the release frame does not leave the d
     try t.expectEqual(@as(f32, 140), b);
 }
 
-test "P7: a slider hidden mid-drag does not follow the pointer when it comes back" {
+test "a slider hidden mid-drag does not follow the pointer when it comes back" {
     var rig = try Rig.init();
     defer rig.deinit();
     var v: f32 = 0.5;
@@ -1188,7 +1188,7 @@ test "P7: a slider hidden mid-drag does not follow the pointer when it comes bac
     try t.expectEqual(before, v);
 }
 
-test "P11: three keeps the centre at min_centre when there is a gap" {
+test "three keeps the centre at min_centre when there is a gap" {
     const s = three(.{ .x = 0, .y = 0, .w = 500, .h = 100 }, 1000, 0, .{ .min_centre = 200, .gap = 10 });
     try t.expect(s.centre.w >= 200);
     try t.expectEqual(@as(f32, 200), s.centre.w);
@@ -1200,7 +1200,7 @@ test "P11: three keeps the centre at min_centre when there is a gap" {
     try t.expectEqual(@as(f32, 280), s2.centre.w);
 }
 
-test "P12: several arrow presses in one frame all count when a shown size is given" {
+test "several arrow presses in one frame all count when a shown size is given" {
     var rig = try Rig.init();
     defer rig.deinit();
     var size: f32 = 200;
@@ -1215,7 +1215,7 @@ test "P12: several arrow presses in one frame all count when a shown size is giv
     try t.expectEqual(@as(f32, 132), size);
 }
 
-test "P14: more grab areas than fit keep the one being dragged" {
+test "more grab areas than fit keep the one being dragged" {
     var g: Grabs = .{};
     const r: Rect = .{ .x = 0, .y = 0, .w = 8, .h = 8 };
     for (0..max_grabs + 3) |i| g.record(.{ .rect = r, .layer = 0, .active = i == max_grabs + 2 });

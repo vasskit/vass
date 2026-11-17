@@ -955,7 +955,7 @@ test "fitText and wrapping never split a cluster" {
     try t.expectEqual(@as(usize, 5), n);
 }
 
-// ---- audit batch ---------------------------------------------------------------------------------
+// ---- edge cases -----------------------------------------------------------------------------------
 
 test "password: a double click keeps everything selected while the button is held" {
     var rig = Rig.init();

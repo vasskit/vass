@@ -1087,7 +1087,7 @@ test "textArea: a fixed box still scrolls the caret into view the frame the text
     try std.testing.expectEqual(@as(f32, 5 * 14), f.st.scroll_y);
 }
 
-test "R4: an empty box that grows with its text does not scroll away on the first Return" {
+test "an empty box that grows with its text does not scroll away on the first Return" {
     var f: Fixture = undefined;
     try f.setup("");
     defer f.deinit();
@@ -1105,7 +1105,7 @@ test "R4: an empty box that grows with its text does not scroll away on the firs
     try std.testing.expectEqual(@as(f32, 0), f.st.scroll_y);
 }
 
-test "R4: a fixed box as tall as the text reveals the caret at once" {
+test "a fixed box as tall as the text reveals the caret at once" {
     var f: Fixture = undefined;
     try f.setup("1\n2\n3");
     defer f.deinit();

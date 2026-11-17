@@ -1849,9 +1849,9 @@ test "two windows: a popup open in one does not block, close or steal input from
     try testing.expect(pst.open);
 }
 
-// ---- audit fixes ---------------------------------------------------------------------------------
+// ---- edge cases -----------------------------------------------------------------------------------
 
-test "P1: a highlight past the end of a shrunk list is dropped; arrows and Home do not index out of bounds" {
+test "a highlight past the end of a shrunk list is dropped; arrows and Home do not index out of bounds" {
     var rig = Rig.init();
     defer rig.deinit();
     var st: PopupState = .{};
@@ -1881,7 +1881,7 @@ test "P1: a highlight past the end of a shrunk list is dropped; arrows and Home 
     try testing.expectEqual(@as(?usize, 0), st.highlight);
 }
 
-test "P1: a dropdown whose list shrinks while it is open, and one with no items, stay in bounds" {
+test "a dropdown whose list shrinks while it is open, and one with no items, stay in bounds" {
     var rig = Rig.init();
     defer rig.deinit();
     var st: DropdownState = .{};
@@ -1923,7 +1923,7 @@ fn twoSiblings(rig: *Rig, a: *PopupState, b: *PopupState, hit_a: *bool, hit_b: *
     rig.end(&u);
 }
 
-test "P4: of two overlapping popups at one depth the later one gets the click and the Escape" {
+test "of two overlapping popups at one depth the later one gets the click and the Escape" {
     var rig = Rig.init();
     defer rig.deinit();
     var a: PopupState = .{ .open = true, .fresh = true };
@@ -1941,7 +1941,7 @@ test "P4: of two overlapping popups at one depth the later one gets the click an
     try testing.expect(a.open and !b.open);
 }
 
-test "P5: a child that stopped being drawn and was freed is not touched when the parent closes" {
+test "a child that stopped being drawn and was freed is not touched when the parent closes" {
     var rig = Rig.init();
     defer rig.deinit();
     var parent: PopupState = .{};
@@ -1977,7 +1977,7 @@ test "P5: a child that stopped being drawn and was freed is not touched when the
     try testing.expect(!parent.open);
 }
 
-test "P5: a link older than the last frame is not followed by a close from outside a frame" {
+test "a link older than the last frame is not followed by a close from outside a frame" {
     var rig = Rig.init();
     defer rig.deinit();
     var parent: PopupState = .{};
@@ -2009,7 +2009,7 @@ test "P5: a link older than the last frame is not followed by a close from outsi
     try testing.expect(!parent.open);
 }
 
-test "P6 (popup side): a popup closed by Escape gives focus back when focus is inside it" {
+test "a popup closed by Escape gives focus back when focus is inside it" {
     var rig = Rig.init();
     defer rig.deinit();
     var st: PopupState = .{};
@@ -2043,7 +2043,7 @@ test "P6 (popup side): a popup closed by Escape gives focus back when focus is i
     try testing.expect(rig.state.focus == opener);
 }
 
-test "P13: a popup nested deeper than max_depth is closed, not left open and unseen" {
+test "a popup nested deeper than max_depth is closed, not left open and unseen" {
     var rig = Rig.init();
     defer rig.deinit();
     var ps: [max_depth + 1]PopupState = undefined;
@@ -2064,7 +2064,7 @@ test "P13: a popup nested deeper than max_depth is closed, not left open and uns
     try testing.expect(!ps[max_depth].open);
 }
 
-test "P14: more popups than the tracker holds keep the topmost ones' blocking" {
+test "more popups than the tracker holds keep the topmost ones' blocking" {
     var t_: Tracker = .{};
     const r: Rect = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
     for (0..max_recs + 2) |i| t_.record(.{ .rect = r, .layer = if (i == max_recs + 1) 4 else 1, .modal = false, .swallow = true });
@@ -2075,7 +2075,7 @@ test "P14: more popups than the tracker holds keep the topmost ones' blocking" {
     try testing.expectEqual(@as(u8, 4), top);
 }
 
-test "P15: after a menu activation the popup's rectangle no longer blocks the next frame" {
+test "after a menu activation the popup's rectangle no longer blocks the next frame" {
     var rig = Rig.init();
     defer rig.deinit();
     var st: PopupState = .{};
@@ -2100,7 +2100,7 @@ test "P15: after a menu activation the popup's rectangle no longer blocks the ne
     rig.end(&u);
 }
 
-test "R2: a menu whose state is freed by the item's own action leaves nothing behind" {
+test "a menu whose state is freed by the item's own action leaves nothing behind" {
     var rig = Rig.init();
     defer rig.deinit();
     const st = try testing.allocator.create(PopupState);
@@ -2129,7 +2129,7 @@ test "R2: a menu whose state is freed by the item's own action leaves nothing be
     rig.end(&u);
 }
 
-test "R2: closing a child with closePopup between frames, then freeing it, leaves the parent's close safe" {
+test "closing a child with closePopup between frames, then freeing it, leaves the parent's close safe" {
     var rig = Rig.init();
     defer rig.deinit();
     var parent: PopupState = .{ .open = true, .fresh = true };
@@ -2161,7 +2161,7 @@ test "R2: closing a child with closePopup between frames, then freeing it, leave
     try testing.expect(rig.state.focus == null);
 }
 
-test "R2: a closed child is never linked from its parent" {
+test "a closed child is never linked from its parent" {
     var rig = Rig.init();
     defer rig.deinit();
     var parent: PopupState = .{ .open = true, .fresh = true };
@@ -2181,7 +2181,7 @@ test "R2: a closed child is never linked from its parent" {
     rig.end(&u);
 }
 
-test "R3: a sibling is not blocked by its own record when the popup declared before it stops being drawn" {
+test "a sibling is not blocked by its own record when the popup declared before it stops being drawn" {
     var rig = Rig.init();
     defer rig.deinit();
     var a: PopupState = .{ .open = true, .fresh = true };
@@ -2207,7 +2207,7 @@ test "R3: a sibling is not blocked by its own record when the popup declared bef
     try testing.expect(hb);
 }
 
-test "R13: a modal record is never replaced by a non-modal one when the tracker is full" {
+test "a modal record is never replaced by a non-modal one when the tracker is full" {
     var t_: Tracker = .{};
     const r: Rect = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
     t_.record(.{ .rect = r, .layer = 1, .modal = true, .swallow = true });
@@ -2219,7 +2219,7 @@ test "R13: a modal record is never replaced by a non-modal one when the tracker 
     try testing.expect(modal);
 }
 
-test "R13: focus that moved into a sibling popup on the same layer is not taken back when the other closes" {
+test "focus that moved into a sibling popup on the same layer is not taken back when the other closes" {
     var rig = Rig.init();
     defer rig.deinit();
     var a: PopupState = .{};
