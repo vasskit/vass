@@ -80,9 +80,11 @@ pub fn build(b: *std.Build) void {
             _ = stb_dep;
         }
     }
-    addMacosSdkPaths(b, vass, target);
-    vass.linkSystemLibrary("objc", .{});
-    vass.linkFramework("AppKit", .{});
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, vass, target);
+        vass.linkSystemLibrary("objc", .{});
+        vass.linkFramework("AppKit", .{});
+    }
 
     const tests = b.addTest(.{ .root_module = vass });
     const test_step = b.step("test", "Run tests");

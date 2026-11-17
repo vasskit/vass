@@ -34,7 +34,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pcm_mod = @import("audio_pcm.zig");
 const mixer_mod = @import("audio_mixer.zig");
-const macos = @import("../platform/macos.zig");
+const macos = if (builtin.os.tag == .macos) @import("../platform/macos.zig") else struct {};
 
 pub const Pcm = pcm_mod.Pcm;
 pub const DecodeError = pcm_mod.Error;
@@ -914,6 +914,7 @@ test "stopping a paused voice while the idle output is paused leaves nothing bus
 }
 
 test "a file over the size limit is refused before any of it is read" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // builds a sparse file with POSIX calls
     var a = Audio.init(testing.allocator, .{ .driver = "dummy" });
     defer a.deinit();
     var buf: [256]u8 = undefined;

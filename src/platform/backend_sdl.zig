@@ -2835,6 +2835,7 @@ test "an infinite or NaN clip rectangle never widens what is drawn" {
 }
 
 test "loadImageFile refuses a file over the size limit without reading it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // builds a sparse file with POSIX calls
     const win = try dummyWindow(.{ .title = "big file", .width = 80, .height = 60 });
     defer win.destroy();
     var buf: [256]u8 = undefined;
