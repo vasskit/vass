@@ -314,7 +314,9 @@ test "official GraphemeBreakTest.txt" {
     defer marks.deinit(t.allocator);
     var passed: usize = 0;
     var total: usize = 0;
-    while (lines.next()) |line| {
+    while (lines.next()) |raw| {
+        // The file may be checked out with CRLF line endings.
+        const line = std.mem.trimEnd(u8, raw, "\r");
         if (line.len == 0 or line[0] == '#') continue;
         buf.clearRetainingCapacity();
         marks.clearRetainingCapacity();
