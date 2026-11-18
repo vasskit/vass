@@ -1,0 +1,2 @@
+# A test parses this file, so its line endings must not depend on the checkout's settings.
+src/text/testdata/* -text

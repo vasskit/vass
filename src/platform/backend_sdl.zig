@@ -33,7 +33,9 @@ const c = struct {
 
     const INIT_VIDEO: u32 = 0x20;
     const SdlRect = extern struct { x: c_int, y: c_int, w: c_int, h: c_int };
+    const WINDOW_FULLSCREEN: u64 = 0x1;
     const WINDOW_HIDDEN: u64 = 0x8;
+    const WINDOW_MAXIMIZED: u64 = 0x80;
     const WINDOW_RESIZABLE: u64 = 0x20;
     const IOStream = opaque {};
     const WINDOW_BORDERLESS: u64 = 0x10;
@@ -91,6 +93,11 @@ const c = struct {
     extern fn SDL_CreateWindow(title: [*:0]const u8, w: c_int, h: c_int, flags: u64) ?*SdlWindow;
     extern fn SDL_DestroyWindow(w: *SdlWindow) void;
     extern fn SDL_GetWindowPixelDensity(w: *SdlWindow) f32;
+    extern fn SDL_GetWindowDisplayScale(w: *SdlWindow) f32;
+    extern fn SDL_GetDisplayContentScale(display: u32) f32;
+    extern fn SDL_GetDisplayForPoint(p: *const SdlPoint) u32;
+    extern fn SDL_GetWindowFromID(id: u32) ?*SdlWindow;
+    extern fn SDL_GetWindowFlags(w: *SdlWindow) u64;
     extern fn SDL_SetWindowAlwaysOnTop(w: *SdlWindow, on_top: bool) bool;
     extern fn SDL_SetWindowTitle(w: *SdlWindow, title: [*:0]const u8) bool;
     extern fn SDL_GetWindowPosition(w: *SdlWindow, x: *c_int, y: *c_int) bool;
@@ -300,13 +307,14 @@ pub const DropPath = struct {
 /// drops, and for paths longer than `DropPath` holds.
 pub fn decodeDropEvent(ev_type: u32, raw: []const u8) ?Event {
     const window = std.mem.readInt(u32, raw[16..20], .little);
+    const s = windowCoordScaleById(window);
     switch (ev_type) {
         c.EVENT_DROP_BEGIN => return .{ .drop_begin = window },
         c.EVENT_DROP_COMPLETE => return .{ .drop_complete = window },
-        c.EVENT_DROP_POSITION => return .{ .drop_position = .{ .window = window, .x = readF32(raw, 20), .y = readF32(raw, 24) } },
+        c.EVENT_DROP_POSITION => return .{ .drop_position = .{ .window = window, .x = readF32(raw, 20) / s, .y = readF32(raw, 24) / s } },
         c.EVENT_DROP_FILE => {
             const path = DropPath.from(eventString(raw, 40)) orelse return null;
-            return .{ .file_drop = .{ .window = window, .x = readF32(raw, 20), .y = readF32(raw, 24), .path = path } };
+            return .{ .file_drop = .{ .window = window, .x = readF32(raw, 20) / s, .y = readF32(raw, 24) / s, .path = path } };
         },
         else => return null,
     }
@@ -494,12 +502,13 @@ pub const WindowOptions = struct {
     /// one. The slice, and the bytes of any `.bytes` source, must stay valid for the life of the
     /// window.
     fallback_fonts: []const FontSource = &.{},
-    /// Also try the fonts macOS ships for symbols, Chinese, Japanese and Korean after
+    /// Also try the fonts macOS and Windows ship for symbols, Chinese, Japanese and Korean after
     /// `fallback_fonts`. Has no effect on other systems (nothing is known to be installed).
     system_fallback_fonts: bool = true,
     /// Draw emoji in colour. The font is the system's colour emoji font (Apple Color Emoji on
-    /// macOS) unless `emoji_font` names another. Without a usable font, emoji draw as the UI
-    /// font's missing-glyph boxes and nothing fails.
+    /// macOS, Segoe UI Emoji on Windows) unless `emoji_font` names another. Without a usable font,
+    /// emoji draw as the UI font's missing-glyph boxes and nothing fails. Segoe UI Emoji has no
+    /// flags: a flag is drawn as the two letters of its country code.
     colour_emoji: bool = true,
     /// A colour emoji font to use instead of the system's: a bitmap font (PNG strikes: `sbix`,
     /// `CBDT`) or a font with `COLR` colours. Bitmap strikes are scaled so the emoji's ascent
@@ -536,6 +545,73 @@ pub fn cascadePosition(index: u32, width: f32, height: f32) [2]f32 {
     return cascadeIn(usableBounds(), index, width, height);
 }
 
+/// SDL window coordinates per point. macOS windows are sized in points (1.0). On Windows they are
+/// physical pixels, so the OS scaling (`display_scale`, which already includes the pixel density
+/// there) shows up here: 1.25 at 125%. Derived from SDL's two values, except on macOS, where the
+/// callers pin it to 1.0: SDL refreshes the display scale and the pixel density at different
+/// moments, so mid-move between displays they could disagree and read as 2 or 0.5. Anything
+/// unusable gives 1.0, and values within float noise of 1.0 snap to it so points round-trip exactly.
+fn coordScaleOf(display_scale: f32, pixel_density: f32) f32 {
+    if (!(display_scale > 0) or !(pixel_density > 0)) return 1;
+    const s = display_scale / pixel_density;
+    if (!std.math.isFinite(s) or s <= 0) return 1;
+    return if (@abs(s - 1) < 1e-3) 1 else s;
+}
+
+fn windowCoordScale(win: *c.SdlWindow) f32 {
+    if (comptime builtin.os.tag == .macos) return 1;
+    return coordScaleOf(c.SDL_GetWindowDisplayScale(win), c.SDL_GetWindowPixelDensity(win));
+}
+
+/// For events, which carry a window id; an unknown id (or one a test made up) gives 1.0.
+fn windowCoordScaleById(window_id: u32) f32 {
+    const win = c.SDL_GetWindowFromID(window_id) orelse return 1;
+    return windowCoordScale(win);
+}
+
+/// For coordinates that belong to a display, not a window. SDL reports 1.0 on macOS.
+fn displayCoordScale(display: u32) f32 {
+    if (comptime builtin.os.tag == .macos) return 1;
+    return coordScaleOf(c.SDL_GetDisplayContentScale(display), 1);
+}
+
+fn pointsToWindow(points: f32, scale: f32) c_int {
+    return @intFromFloat(@round(points * scale));
+}
+
+/// Moves `win` so its top-left is at `p` (points). Moving to a display with another scale
+/// changes the scale (SDL updates it during the move) and the position is in the new display's
+/// pixels, so it is set again with the scale it ended up with. Returns that scale.
+fn placeWindow(win: *c.SdlWindow, p: [2]f32) f32 {
+    var s = windowCoordScale(win);
+    _ = c.SDL_SetWindowPosition(win, pointsToWindow(p[0], s), pointsToWindow(p[1], s));
+    const moved = windowCoordScale(win);
+    if (moved != s) {
+        s = moved;
+        _ = c.SDL_SetWindowPosition(win, pointsToWindow(p[0], s), pointsToWindow(p[1], s));
+    }
+    return s;
+}
+
+/// Gives `win` its minimum size and size (points) at scale `s`. When a window's scale changes
+/// Windows keeps a fixed-size window's pixel size, and rounds when it scales a resizable one, so
+/// both are set again. A maximised or fullscreen window is the desktop's to size.
+fn fitWindow(win: *c.SdlWindow, size_pt: [2]f32, min_pt: [2]f32, s: f32) void {
+    if (min_pt[0] > 0 and min_pt[1] > 0) _ = c.SDL_SetWindowMinimumSize(win, pointsToWindow(min_pt[0], s), pointsToWindow(min_pt[1], s));
+    if (c.SDL_GetWindowFlags(win) & (c.WINDOW_MAXIMIZED | c.WINDOW_FULLSCREEN) != 0) return;
+    const want_w = pointsToWindow(size_pt[0], s);
+    const want_h = pointsToWindow(size_pt[1], s);
+    var cw: c_int = 0;
+    var ch: c_int = 0;
+    _ = c.SDL_GetWindowSize(win, &cw, &ch);
+    // One pixel of slack: the OS's own scaling of the size rounds.
+    if (@abs(cw - want_w) > 1 or @abs(ch - want_h) > 1) _ = c.SDL_SetWindowSize(win, want_w, want_h);
+}
+
+fn rectToPoints(r: c.SdlRect, s: f32) geom.Rect {
+    return .{ .x = @as(f32, @floatFromInt(r.x)) / s, .y = @as(f32, @floatFromInt(r.y)) / s, .w = @as(f32, @floatFromInt(r.w)) / s, .h = @as(f32, @floatFromInt(r.h)) / s };
+}
+
 var live_windows: usize = 0;
 
 /// The last window is gone: free what is process-wide and shut SDL down.
@@ -549,15 +625,17 @@ fn shutdownVideo() void {
 /// Primary display in points, including the menu bar and Dock areas.
 pub fn displayBounds() geom.Rect {
     var r: c.SdlRect = .{ .x = 0, .y = 0, .w = 1440, .h = 900 };
-    _ = c.SDL_GetDisplayBounds(c.SDL_GetPrimaryDisplay(), &r);
-    return .{ .x = @floatFromInt(r.x), .y = @floatFromInt(r.y), .w = @floatFromInt(r.w), .h = @floatFromInt(r.h) };
+    const display = c.SDL_GetPrimaryDisplay();
+    _ = c.SDL_GetDisplayBounds(display, &r);
+    return rectToPoints(r, displayCoordScale(display));
 }
 
 /// Primary display minus the menu bar and Dock.
 pub fn usableBounds() geom.Rect {
     var r: c.SdlRect = .{ .x = 0, .y = 0, .w = 1440, .h = 900 };
-    _ = c.SDL_GetDisplayUsableBounds(c.SDL_GetPrimaryDisplay(), &r);
-    return .{ .x = @floatFromInt(r.x), .y = @floatFromInt(r.y), .w = @floatFromInt(r.w), .h = @floatFromInt(r.h) };
+    const display = c.SDL_GetPrimaryDisplay();
+    _ = c.SDL_GetDisplayUsableBounds(display, &r);
+    return rectToPoints(r, displayCoordScale(display));
 }
 
 pub const Mouse = struct { x: f32, y: f32, left_down: bool };
@@ -568,7 +646,9 @@ pub fn globalMouse() Mouse {
     var x: f32 = 0;
     var y: f32 = 0;
     const buttons = c.SDL_GetGlobalMouseState(&x, &y);
-    return .{ .x = x, .y = y, .left_down = buttons & 1 != 0 };
+    const at: c.SdlPoint = .{ .x = @intFromFloat(std.math.clamp(@floor(x), -1e9, 1e9)), .y = @intFromFloat(std.math.clamp(@floor(y), -1e9, 1e9)) };
+    const s = displayCoordScale(c.SDL_GetDisplayForPoint(&at));
+    return .{ .x = x / s, .y = y / s, .left_down = buttons & 1 != 0 };
 }
 
 /// Window drag regions (`Window.setDragRegion`), one per window. SDL's hit-test callback gets
@@ -595,7 +675,8 @@ fn dragHit(e: *const DragEntry, x: f32, y: f32) bool {
 
 fn hitTest(win: *c.SdlWindow, area: *const c.SdlPoint, _: ?*anyopaque) callconv(.c) c_int {
     const e = dragEntry(win) orelse return 0;
-    return if (dragHit(e, @floatFromInt(area.x), @floatFromInt(area.y))) 1 else 0; // 1 = SDL_HITTEST_DRAGGABLE
+    const s = windowCoordScale(win);
+    return if (dragHit(e, @as(f32, @floatFromInt(area.x)) / s, @as(f32, @floatFromInt(area.y)) / s)) 1 else 0; // 1 = SDL_HITTEST_DRAGGABLE
 }
 
 /// Sets, replaces (`region` non-null) or removes (null) the drag region of `win`. False if the
@@ -718,9 +799,19 @@ fn decodeRaw(ev_type: u32, raw: []const u8) ?Event {
         // The path lives in SDL's event memory until the next poll; decodeDropEvent copies it.
         c.EVENT_DROP_FILE, c.EVENT_DROP_BEGIN, c.EVENT_DROP_COMPLETE, c.EVENT_DROP_POSITION => return decodeDropEvent(ev_type, raw),
         c.EVENT_MOUSE_WHEEL => return .{ .mouse_wheel = .{ .window = window, .dx = readF32(raw, 24), .dy = readF32(raw, 28) } },
-        c.EVENT_MOUSE_MOTION => return .{ .mouse_move = .{ .window = window, .x = readF32(raw, 28), .y = readF32(raw, 32) } },
-        c.EVENT_MOUSE_BUTTON_UP => return .{ .mouse_up = .{ .window = window, .x = readF32(raw, 28), .y = readF32(raw, 32), .button = raw[24] } },
-        c.EVENT_MOUSE_BUTTON_DOWN => return .{ .mouse_down = .{ .window = window, .x = readF32(raw, 28), .y = readF32(raw, 32), .button = raw[24], .mods = modState(), .clicks = raw[26] } },
+        // Positions arrive in window coordinates; wheel steps above are not positions.
+        c.EVENT_MOUSE_MOTION => {
+            const s = windowCoordScaleById(window);
+            return .{ .mouse_move = .{ .window = window, .x = readF32(raw, 28) / s, .y = readF32(raw, 32) / s } };
+        },
+        c.EVENT_MOUSE_BUTTON_UP => {
+            const s = windowCoordScaleById(window);
+            return .{ .mouse_up = .{ .window = window, .x = readF32(raw, 28) / s, .y = readF32(raw, 32) / s, .button = raw[24] } };
+        },
+        c.EVENT_MOUSE_BUTTON_DOWN => {
+            const s = windowCoordScaleById(window);
+            return .{ .mouse_down = .{ .window = window, .x = readF32(raw, 28) / s, .y = readF32(raw, 32) / s, .button = raw[24], .mods = modState(), .clicks = raw[26] } };
+        },
         else => return null,
     }
 }
@@ -809,14 +900,64 @@ const system_fallback_paths: []const [:0]const u8 = if (builtin.os.tag == .macos
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
 } else &.{};
 
-/// Advance of the system emoji font's glyphs in percent of their bitmap width (see `EmojiState`).
-const system_emoji_advance_pct: u32 = 115;
+/// Advance of the system emoji font's glyphs in percent of the width SDL_ttf reports (see
+/// `EmojiState`). Apple Color Emoji: bitmaps as wide as the em, advancing 1.15 em. Segoe UI Emoji
+/// advances 1.375 em around an ink at most 1 em wide, which is too loose; 90% (1.24 em) is the
+/// most it can be tightened before the letters of a flag, which fill 88% of their advance,
+/// spill out of their slot.
+const system_emoji_advance_pct: u32 = if (builtin.os.tag == .windows) 90 else 115;
 
 /// How far the system emoji font's glyphs sit below the baseline, in percent of the text size.
-const system_emoji_drop_pct: u32 = 15;
+/// Segoe UI Emoji needs none: `emojiBitmap` finds its baseline.
+const system_emoji_drop_pct: u32 = if (builtin.os.tag == .windows) 0 else 15;
 
-/// The system colour emoji font.
+/// The system colour emoji font on macOS (Windows: see `windows_emoji_font`).
 const system_emoji_path: ?[:0]const u8 = if (builtin.os.tag == .macos) "/System/Library/Fonts/Apple Color Emoji.ttc" else null;
+
+// Windows keeps its fonts under the Windows directory, which is not always `C:\Windows`, so
+// these are file names resolved against it each time a font is opened.
+const windows_ui_font = "segoeui.ttf";
+const windows_emoji_font = "seguiemj.ttf";
+const windows_fallback_fonts = [_][]const u8{ "seguisym.ttf", "YuGothR.ttc", "msyh.ttc", "malgun.ttf" };
+const windows_dir_units = 260;
+// Room for a directory of `windows_dir_units` UTF-16 units in UTF-8 (at most 3 bytes a unit), plus
+// `\Fonts\` and the longest file name above.
+const font_path_max = windows_dir_units * 3 + 32;
+
+extern "kernel32" fn GetSystemWindowsDirectoryW(buf: [*]u16, size: u32) callconv(.winapi) u32;
+
+fn fontPathIn(buf: []u8, windows_dir: []const u8, file: []const u8) ?[:0]const u8 {
+    return std.mem.printSentinel(buf, "{s}\\Fonts\\{s}", .{ windows_dir, file }, 0) catch null;
+}
+
+/// Windows only: `file` in the system Fonts directory, written to `buf`. The result is only
+/// good until `buf` is reused, which is long enough to open the font.
+fn windowsFontPath(buf: []u8, file: []const u8) ?[:0]const u8 {
+    var wide: [windows_dir_units]u16 = undefined;
+    var dir: [windows_dir_units * 3]u8 = undefined;
+    const n = GetSystemWindowsDirectoryW(&wide, wide.len);
+    if (n > 0 and n < wide.len) {
+        if (std.unicode.utf16LeToUtf8(&dir, wide[0..n])) |len| return fontPathIn(buf, dir[0..len], file) else |_| {}
+    }
+    return fontPathIn(buf, "C:\\Windows", file);
+}
+
+/// The system colour emoji font, or null where there is none. On Windows the path is written to
+/// `buf` and is only good until `buf` is reused.
+fn systemEmojiSource(buf: []u8) ?FontSource {
+    if (comptime builtin.os.tag == .windows) {
+        const path = windowsFontPath(buf, windows_emoji_font) orelse return null;
+        return .{ .path = path };
+    }
+    return if (system_emoji_path) |p| .{ .path = p } else null;
+}
+
+test "font path in the Windows directory" {
+    var buf: [font_path_max]u8 = undefined;
+    try std.testing.expectEqualStrings("D:\\Win\\Fonts\\a.ttf", fontPathIn(&buf, "D:\\Win", "a.ttf").?);
+    var small: [8]u8 = undefined;
+    try std.testing.expect(fontPathIn(&small, "D:\\Win", "a.ttf") == null);
+}
 
 const CachedFont = struct { px: u32, weight: gfx.Weight, font: *c.Font, fb_attached: bool = false };
 /// A fallback font opened at one pixel size (shared by every weight of the UI font at that size);
@@ -831,12 +972,14 @@ const EmojiState = struct {
     /// 0 not tried yet, 1 usable, 2 no usable font.
     status: enum { untried, ready, unavailable } = .untried,
     scalable: bool = false,
-    /// How wide a glyph's advance is as a percentage of the bitmap's width. Apple Color Emoji's
-    /// bitmaps are as wide as the em but the font advances 1.15 em (CoreText leaves that gap
-    /// between emoji); FreeType reports the bitmap width, so the gap is added here.
+    /// How wide a glyph's advance is as a percentage of the width FreeType reports. Apple Color
+    /// Emoji's bitmaps are as wide as the em but the font advances 1.15 em (CoreText leaves that
+    /// gap between emoji), so the gap is added here. Segoe UI Emoji reports 1.375 em, which is
+    /// trimmed.
     advance_pct: u32 = 100,
     /// How far below the baseline the glyphs are moved, in percent of the text size. CoreText sets
     /// Apple Color Emoji about 0.15 em lower than the origin FreeType reports for its bitmaps.
+    /// Segoe UI Emoji needs none.
     drop_pct: u32 = 0,
     /// Bitmap fonts: the size of each strike in pixels (the font's ascent there), ascending; the
     /// index into this array is what SDL_ttf takes as a "size" for a font that cannot scale.
@@ -1010,10 +1153,16 @@ pub const Window = struct {
     gpa: std.mem.Allocator,
     win: *c.SdlWindow,
     ren: *c.Renderer,
-    /// Physical pixels per logical point (2.0 on Retina displays).
     /// The largest texture the renderer can make, in pixels per side (see `rendererMaxTexture`).
     max_tex: u32,
+    /// Device pixels per point: the pixel density times `coord_scale`.
     density: f32,
+    /// SDL window coordinates per point (see `coordScaleOf`). The conversions read SDL's current
+    /// value; this is the one `syncMetrics` last acted on.
+    coord_scale: f32,
+    /// The window's size and minimum size in points, kept so they survive a scale change.
+    size_pt: [2]f32,
+    min_pt: [2]f32,
     frame: u64 = 0,
     fonts: std.ArrayList(CachedFont) = .empty,
     texts: std.AutoHashMapUnmanaged(u64, CachedText) = .empty,
@@ -1082,11 +1231,14 @@ pub const Window = struct {
         if (opts.borderless) flags |= c.WINDOW_BORDERLESS;
         if (opts.transparent) flags |= c.WINDOW_TRANSPARENT;
         // A window with a position is created hidden, moved, then shown, so it never flashes at the OS's spot.
-        const show_after = opts.position != null and !opts.hidden;
+        // So is one on a scaled display (SDL sizes Windows windows in pixels): the scale it really
+        // gets is known only once it exists, so its size is corrected before it is shown.
+        const guess = displayCoordScale(c.SDL_GetPrimaryDisplay());
+        const show_after = (opts.position != null or guess != 1) and !opts.hidden;
         if (opts.hidden or show_after) flags |= c.WINDOW_HIDDEN;
         if (opts.resizable) flags |= c.WINDOW_RESIZABLE;
         if (!opts.focusable) flags |= c.WINDOW_NOT_FOCUSABLE;
-        const win = c.SDL_CreateWindow(opts.title, @intCast(opts.width), @intCast(opts.height), flags) orelse
+        const win = c.SDL_CreateWindow(opts.title, pointsToWindow(@floatFromInt(opts.width), guess), pointsToWindow(@floatFromInt(opts.height), guess), flags) orelse
             return fail("SDL_CreateWindow");
         errdefer c.SDL_DestroyWindow(win);
         const ren = c.SDL_CreateRenderer(win, null) orelse return fail("SDL_CreateRenderer");
@@ -1094,11 +1246,18 @@ pub const Window = struct {
         // The app paces its own frames.
         _ = c.SDL_SetRenderVSync(ren, 0);
         live_windows += 1;
-        if (opts.min_width > 0 and opts.min_height > 0) _ = c.SDL_SetWindowMinimumSize(win, @intCast(opts.min_width), @intCast(opts.min_height));
         _ = c.SDL_SetRenderDrawBlendMode(ren, c.BLENDMODE_BLEND);
-        const density = @max(1.0, c.SDL_GetWindowPixelDensity(win));
+        const size_pt: [2]f32 = .{ @floatFromInt(opts.width), @floatFromInt(opts.height) };
+        const min_pt: [2]f32 = .{ @floatFromInt(opts.min_width), @floatFromInt(opts.min_height) };
+        const scale = if (opts.position) |p| placeWindow(win, p) else windowCoordScale(win);
+        // With nothing scaled the window is left exactly as SDL made it.
+        if (scale != 1 or guess != 1) {
+            fitWindow(win, size_pt, min_pt, scale);
+        } else if (opts.min_width > 0 and opts.min_height > 0) {
+            _ = c.SDL_SetWindowMinimumSize(win, @intCast(opts.min_width), @intCast(opts.min_height));
+        }
+        const density = @max(1.0, c.SDL_GetWindowPixelDensity(win)) * scale;
         _ = c.SDL_SetRenderScale(ren, density, density);
-        if (opts.position) |p| _ = c.SDL_SetWindowPosition(win, @intFromFloat(@round(p[0])), @intFromFloat(@round(p[1])));
         if (show_after) _ = c.SDL_ShowWindow(win);
         return .{
             .gpa = gpa,
@@ -1106,6 +1265,9 @@ pub const Window = struct {
             .ren = ren,
             .max_tex = rendererMaxTexture(ren),
             .density = density,
+            .coord_scale = scale,
+            .size_pt = size_pt,
+            .min_pt = min_pt,
             .font_set = opts.fonts,
             .fallback_sources = opts.fallback_fonts,
             .system_fallback = opts.system_fallback_fonts,
@@ -1178,7 +1340,8 @@ pub const Window = struct {
         var iw: c_int = 0;
         var ih: c_int = 0;
         _ = c.SDL_GetWindowSize(w.win, &iw, &ih);
-        return .{ .w = @floatFromInt(iw), .h = @floatFromInt(ih) };
+        const s = windowCoordScale(w.win);
+        return .{ .w = @as(f32, @floatFromInt(iw)) / s, .h = @as(f32, @floatFromInt(ih)) / s };
     }
 
     /// Registers `func` to draw one frame while the OS is live-resizing the
@@ -1244,10 +1407,18 @@ pub const Window = struct {
         return k;
     }
 
-    /// Re-reads the pixel density (it changes when the window moves between
-    /// a Retina and a normal display) and updates the render scale.
+    /// Re-reads the pixel density and the window coordinate scale (they change when the window
+    /// moves between displays or the OS scaling is changed) and updates the render scale. A new
+    /// coordinate scale also brings the window back to its size in points.
     fn syncMetrics(w: *Window) void {
-        const d = @max(1.0, c.SDL_GetWindowPixelDensity(w.win));
+        const s = windowCoordScale(w.win);
+        if (s != w.coord_scale) {
+            w.coord_scale = s;
+            fitWindow(w.win, w.size_pt, w.min_pt, s);
+        }
+        const sz = w.logicalSize();
+        w.size_pt = .{ sz.w, sz.h };
+        const d = @max(1.0, c.SDL_GetWindowPixelDensity(w.win)) * s;
         if (d == w.density) return;
         w.density = d;
         _ = c.SDL_SetRenderScale(w.ren, d, d);
@@ -1305,12 +1476,13 @@ pub const Window = struct {
         var x: c_int = 0;
         var y: c_int = 0;
         _ = c.SDL_GetWindowPosition(w.win, &x, &y);
-        return .{ @floatFromInt(x), @floatFromInt(y) };
+        const s = windowCoordScale(w.win);
+        return .{ @as(f32, @floatFromInt(x)) / s, @as(f32, @floatFromInt(y)) / s };
     }
 
     /// Top-left corner in screen points.
     pub fn setPosition(w: *Window, x: f32, y: f32) void {
-        _ = c.SDL_SetWindowPosition(w.win, @intFromFloat(@round(x)), @intFromFloat(@round(y)));
+        _ = placeWindow(w.win, .{ x, y });
     }
 
     /// The OS window object (an NSWindow on macOS), for platform extras.
@@ -1345,8 +1517,9 @@ pub const Window = struct {
     /// so its candidate popup can sit next to it. `cursor_x` is the caret's
     /// x offset inside `r`.
     pub fn setTextInputArea(w: *Window, r: geom.Rect, cursor_x: f32) void {
-        const ir: c.SdlRect = .{ .x = clampInt(r.x), .y = clampInt(r.y), .w = clampInt(r.w), .h = clampInt(r.h) };
-        _ = c.SDL_SetTextInputArea(w.win, &ir, clampInt(cursor_x));
+        const s = windowCoordScale(w.win);
+        const ir: c.SdlRect = .{ .x = clampInt(r.x * s), .y = clampInt(r.y * s), .w = clampInt(r.w * s), .h = clampInt(r.h * s) };
+        _ = c.SDL_SetTextInputArea(w.win, &ir, clampInt(cursor_x * s));
     }
 
     // ---- images -------------------------------------------------------
@@ -1945,6 +2118,11 @@ pub const Window = struct {
             const bytes = set.forWeight(weight);
             return openSource(.{ .bytes = bytes }, @floatFromInt(px));
         }
+        if (comptime builtin.os.tag == .windows) {
+            var buf: [font_path_max]u8 = undefined;
+            const path = windowsFontPath(&buf, windows_ui_font) orelse return null;
+            return c.TTF_OpenFont(path.ptr, @floatFromInt(px));
+        }
         for (font_paths) |path| {
             if (c.TTF_OpenFont(path, @floatFromInt(px))) |font| return font;
         }
@@ -1960,7 +2138,8 @@ pub const Window = struct {
     }
 
     fn fallbackCount(w: *const Window) usize {
-        return w.fallback_sources.len + (if (w.system_fallback) system_fallback_paths.len else 0);
+        const system = if (builtin.os.tag == .windows) windows_fallback_fonts.len else system_fallback_paths.len;
+        return w.fallback_sources.len + (if (w.system_fallback) system else 0);
     }
 
     fn fallbackSource(w: *const Window, index: usize) FontSource {
@@ -1969,10 +2148,20 @@ pub const Window = struct {
         return .{ .path = system_fallback_paths[index - w.fallback_sources.len] };
     }
 
+    fn openWindowsFallback(w: *const Window, index: usize, px: u32) ?*c.Font {
+        if (index < w.fallback_sources.len) return openSource(w.fallback_sources[index], @floatFromInt(px));
+        var buf: [font_path_max]u8 = undefined;
+        const path = windowsFontPath(&buf, windows_fallback_fonts[index - w.fallback_sources.len]) orelse return null;
+        return openSource(.{ .path = path }, @floatFromInt(px));
+    }
+
     /// The fallback font number `index` at `px`, opened the first time; null if it cannot be opened.
     fn fallbackFont(w: *Window, index: u16, px: u32) ?*c.Font {
         for (w.fb_fonts.items) |f| if (f.index == index and f.px == px) return f.font;
-        const font = openSource(w.fallbackSource(index), @floatFromInt(px));
+        const font = if (comptime builtin.os.tag == .windows)
+            w.openWindowsFallback(index, px)
+        else
+            openSource(w.fallbackSource(index), @floatFromInt(px));
         w.fb_fonts.append(w.gpa, .{ .index = index, .px = px, .font = font }) catch @panic("out of memory");
         return font;
     }
@@ -2002,7 +2191,8 @@ pub const Window = struct {
         w.emoji.status = .unavailable;
         w.emoji.advance_pct = if (w.emoji_source == null) system_emoji_advance_pct else 100;
         w.emoji.drop_pct = if (w.emoji_source == null) system_emoji_drop_pct else 0;
-        const src: FontSource = w.emoji_source orelse if (system_emoji_path) |p| .{ .path = p } else return false;
+        var path_buf: [font_path_max]u8 = undefined;
+        const src: FontSource = w.emoji_source orelse systemEmojiSource(&path_buf) orelse return false;
         // Size 0.5 is strike 0 for a bitmap font, which takes an index, not a size.
         const font = openSource(src, 0.5) orelse return false;
         const st = &w.emoji;
@@ -2041,7 +2231,6 @@ pub const Window = struct {
     fn emojiFontFor(w: *Window, px: u32) ?EmojiSize {
         if (!w.emojiReady()) return null;
         const st = &w.emoji;
-        const src: FontSource = w.emoji_source orelse if (system_emoji_path) |p| .{ .path = p } else return null;
         var key: u32 = px;
         var ptsize: f32 = @floatFromInt(px);
         var num: u32 = 1;
@@ -2060,6 +2249,8 @@ pub const Window = struct {
             den = st.strikes[k];
         }
         for (st.fonts.items) |f| if (f.key == key) return .{ .font = f.font, .num = num, .den = den };
+        var path_buf: [font_path_max]u8 = undefined;
+        const src: FontSource = w.emoji_source orelse systemEmojiSource(&path_buf) orelse return null;
         const font = openSource(src, ptsize) orelse return null;
         st.fonts.append(w.gpa, .{ .key = key, .font = font }) catch @panic("out of memory");
         return .{ .font = font, .num = num, .den = den };
@@ -2106,7 +2297,11 @@ pub const Window = struct {
         const sh: u32 = @intCast(hdr.h);
         const dw = compose.scaled(sw, ef.num, ef.den);
         const dh = compose.scaled(sh, ef.num, ef.den);
-        const asc: u32 = @intCast(@max(0, c.TTF_GetFontAscent(ef.font)));
+        var asc: u32 = @intCast(@max(0, c.TTF_GetFontAscent(ef.font)));
+        // SDL_ttf grows the line upwards for a glyph taller than the font's ascent (Segoe UI
+        // Emoji's are), which moves the baseline down by as much. Bitmap strikes never do.
+        const line_h: u32 = @intCast(@max(0, c.TTF_GetFontHeight(ef.font)));
+        if (w.emoji.scalable and sh > line_h) asc += sh - line_h;
         const rgba = compose.scaleBgraPremulToRgba(w.gpa, pixels[0 .. @as(usize, @intCast(hdr.pitch)) * sh], sw, sh, @intCast(hdr.pitch), dw, dh) catch return null;
         return .{ .w = dw, .h = dh, .base = compose.scaled(asc, ef.num, ef.den), .rgba = rgba };
     }
@@ -3364,9 +3559,20 @@ fn expectNear(want: f32, got: f32, tol: f32) !void {
     try std.testing.expect(@abs(want - got) <= tol);
 }
 
+/// Segoe UI Emoji has no flag glyphs: a flag is drawn as two grey regional-indicator letters.
+const flags_in_colour = builtin.os.tag != .windows;
+
+const InkBox = struct { x0: usize, x1: usize, n: usize };
+
 /// Bounding box of the pixels of `line` that are coloured (not grey, as the UI text is white or
 /// red here: a pixel with red, green and blue far apart).
-fn colourBox(line: Window.Composed) ?struct { x0: usize, x1: usize, n: usize } {
+fn colourBox(line: Window.Composed) ?InkBox {
+    return spreadBox(line, 40);
+}
+
+/// Like `colourBox`, but counts a pixel when its channels are at least `spread` apart (0: any
+/// visible pixel).
+fn spreadBox(line: Window.Composed, spread: u8) ?InkBox {
     var x0: usize = line.w;
     var x1: usize = 0;
     var n: usize = 0;
@@ -3375,7 +3581,7 @@ fn colourBox(line: Window.Composed) ?struct { x0: usize, x1: usize, n: usize } {
         if (p[3] < 128) continue;
         const hi = @max(p[0], @max(p[1], p[2]));
         const lo = @min(p[0], @min(p[1], p[2]));
-        if (hi - lo < 40) continue;
+        if (hi - lo < spread) continue;
         n += 1;
         x0 = @min(x0, x);
         x1 = @max(x1, x);
@@ -3434,8 +3640,8 @@ test "emoji: the glyph keeps its own colours whatever the text colour is, only o
         const h = win.composeBuffer(i, str, half, px) orelse return error.TestUnexpectedResult;
         defer win.gpa.free(h.rgba);
         // Coloured (not grey) pixels exist, and the text colour changes nothing.
-        const box = colourBox(a) orelse return error.TestUnexpectedResult;
-        try std.testing.expect(box.n > 50);
+        const box = colourBox(a);
+        if (flags_in_colour or !std.mem.eql(u8, str, flag_ng)) try std.testing.expect(box != null and box.?.n > 50);
         try std.testing.expectEqualSlices(u8, a.rgba, b.rgba);
         // Half opacity: same colours, about half the alpha.
         try std.testing.expectEqual(a.rgba.len, h.rgba.len);
@@ -3468,15 +3674,18 @@ test "emoji: the caret positions around a cluster match where it is drawn" {
     const i = win.fontIndex(px, .regular).?;
     const size: f32 = 26;
     inline for ([_][]const u8{ family_emoji, flag_ng, "\u{1F44D}\u{1F3FD}", "\u{1F600}" }) |cluster| {
-        const str = "ab" ++ cluster;
+        // Where flags are not coloured the box is of any visible pixel, so no text may precede them.
+        const coloured = comptime flags_in_colour or !std.mem.eql(u8, cluster, flag_ng);
+        const prefix = if (coloured) "ab" else "";
+        const str = prefix ++ cluster;
         // Prefix before the cluster and through it, as a text field measures them for the caret.
-        const x0 = win.measureText("ab", size);
+        const x0 = win.measureText(prefix, size);
         const x1 = win.measureText(str, size);
         try std.testing.expect(x1 > x0);
         const line = win.composeBuffer(i, str, white, px) orelse return error.TestUnexpectedResult;
         defer win.gpa.free(line.rgba);
         try std.testing.expectEqual(@as(usize, @intFromFloat(x1)), line.w);
-        const box = colourBox(line) orelse return error.TestUnexpectedResult;
+        const box = spreadBox(line, if (coloured) 40 else 0) orelse return error.TestUnexpectedResult;
         // The coloured pixels lie between the two caret positions and fill most of the gap.
         try std.testing.expect(@as(f32, @floatFromInt(box.x0)) >= x0 - 1);
         try std.testing.expect(@as(f32, @floatFromInt(box.x1)) <= x1);
@@ -3575,4 +3784,55 @@ test "fallback fonts: CJK has glyphs through the system fallbacks, and only when
     const own = try dummyWindow(.{ .title = "own", .width = 80, .height = 60, .system_fallback_fonts = false, .fallback_fonts = &.{.{ .path = "/System/Library/Fonts/Hiragino Sans GB.ttc" }} });
     defer own.destroy();
     try std.testing.expectEqual(with, own.measureText(cjk, 20));
+}
+
+test "coord scale: display scale over pixel density, 1.0 when unusable or within float noise" {
+    const eq = std.testing.expectEqual;
+    try eq(@as(f32, 1.25), coordScaleOf(1.25, 1));
+    try eq(@as(f32, 1.5), coordScaleOf(3, 2));
+    // macOS: the display scale is the pixel density.
+    try eq(@as(f32, 1), coordScaleOf(2, 2));
+    try eq(@as(f32, 1), coordScaleOf(1, 1));
+    try eq(@as(f32, 1), coordScaleOf(2.0004, 2));
+    try eq(@as(f32, 1), coordScaleOf(0, 1));
+    try eq(@as(f32, 1), coordScaleOf(1.25, 0));
+    try eq(@as(f32, 1), coordScaleOf(-1, 1));
+    try eq(@as(f32, 1), coordScaleOf(std.math.nan(f32), 1));
+    try eq(@as(f32, 1), coordScaleOf(1.25, std.math.inf(f32)));
+    try eq(@as(f32, 1), coordScaleOf(std.math.inf(f32), 1));
+}
+
+test "points and window coordinates convert by the scale, unchanged at 1.0" {
+    const eq = std.testing.expectEqual;
+    try eq(@as(c_int, 400), pointsToWindow(320, 1.25));
+    try eq(@as(c_int, 200), pointsToWindow(160, 1.25));
+    try eq(@as(c_int, 320), pointsToWindow(320, 1));
+    try eq(@as(c_int, 13), pointsToWindow(12.6, 1));
+    const r = rectToPoints(.{ .x = 0, .y = 40, .w = 2560, .h = 1440 }, 1.25);
+    try eq(@as(f32, 40.0 / 1.25), r.y);
+    try eq(@as(f32, 2048), r.w);
+    const r1 = rectToPoints(.{ .x = -5, .y = 7, .w = 1440, .h = 900 }, 1);
+    try eq(@as(f32, -5), r1.x);
+    try eq(@as(f32, 900), r1.h);
+}
+
+test "fitWindow sets the size in window coordinates and leaves a close one alone" {
+    _ = c.SDL_SetHint("SDL_VIDEO_DRIVER", "dummy");
+    var win = Window.init(std.testing.allocator, .{ .title = "t", .width = 320, .height = 160, .hidden = true }) catch return error.SkipZigTest;
+    defer win.deinit();
+    try std.testing.expectEqual(@as(f32, 1), win.coord_scale);
+    try std.testing.expectEqual(@as(f32, 320), win.logicalSize().w);
+    var w: c_int = 0;
+    var h: c_int = 0;
+    fitWindow(win.win, .{ 320, 160 }, .{ 0, 0 }, 1.25);
+    _ = c.SDL_GetWindowSize(win.win, &w, &h);
+    try std.testing.expectEqual(@as(c_int, 400), w);
+    try std.testing.expectEqual(@as(c_int, 200), h);
+    // Within one pixel: not touched.
+    fitWindow(win.win, .{ 320.4, 160 }, .{ 0, 0 }, 1.25);
+    _ = c.SDL_GetWindowSize(win.win, &w, &h);
+    try std.testing.expectEqual(@as(c_int, 400), w);
+    fitWindow(win.win, .{ 320, 160 }, .{ 0, 0 }, 1);
+    _ = c.SDL_GetWindowSize(win.win, &w, &h);
+    try std.testing.expectEqual(@as(c_int, 320), w);
 }
