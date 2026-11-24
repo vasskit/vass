@@ -65,7 +65,7 @@ pub const Config = struct {
     /// Start the input method (text fields and areas need it).
     text_input: bool = false,
     redraw: RedrawPolicy = .always,
-    /// Sleep after every frame, in milliseconds.
+    /// The frame period in milliseconds (see `Options.frame_ms`).
     frame_ms: u32 = 16,
     redraw_every_ms: ?u32 = null,
     /// A scripted run instead of a live one.

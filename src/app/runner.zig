@@ -37,8 +37,8 @@ pub const Step = script_mod.Step;
 
 /// When the loop draws.
 pub const RedrawPolicy = enum {
-    /// Every loop turn, then sleep `Options.frame_ms`: a steady frame rate whether or not anything
-    /// changed. What hand-written loops do.
+    /// Every loop turn, paced to one frame per `Options.frame_ms`: a steady frame rate whether or not
+    /// anything changed. What hand-written loops do.
     always,
     /// Only when something asks for it, blocking in the OS's event wait (no CPU) in between.
     /// What asks: any input event (two frames, because an immediate-mode UI needs a second one
@@ -69,10 +69,24 @@ pub const Clock = union(enum) {
     fake: f64,
 };
 
+pub const Pace = struct { sleep_ns: u64, deadline: ?u64 };
+
+/// How long to sleep after a frame that began at `start` and finished at `now`, and the deadline
+/// for the next one. The deadline moves by whole periods so small errors do not add up; a late
+/// frame restarts from `now` rather than catching up with a burst. Zero `period` never sleeps.
+pub fn pace(deadline: ?u64, start: u64, now: u64, period: u64) Pace {
+    if (period == 0) return .{ .sleep_ns = 0, .deadline = null };
+    const due = (deadline orelse start) + period;
+    if (due <= now) return .{ .sleep_ns = 0, .deadline = now };
+    return .{ .sleep_ns = due - now, .deadline = due };
+}
+
 pub const Options = struct {
     redraw: RedrawPolicy = .always,
-    /// Milliseconds to sleep after every drawn frame: the pace of `.always`, and the longest
-    /// rate a stream of events or an animation can reach in `.on_demand`. 0: no sleep.
+    /// The frame period in milliseconds: the pace of `.always`, and the fastest rate a stream of
+    /// events or an animation can reach in `.on_demand`. After a drawn frame the loop sleeps only
+    /// the rest of the period (a frame that took longer is not followed by a sleep). With the fake
+    /// clock and in scripted runs it is a plain sleep after every frame. 0: no sleep.
     frame_ms: u32 = 16,
     /// `.on_demand`: also draw at least this often (an audio meter, a polled source). Can be
     /// changed at run time with `Context.redrawEvery`.
@@ -458,6 +472,8 @@ pub const Runner = struct {
     last_draw: f64 = -std.math.inf(f64),
     /// Turns that drew, and windows drawn (for tests and idle measurements).
     turns_drawn: u64 = 0,
+    /// When the next drawn frame is due (`platform.ticksNs` time); null until the first one.
+    frame_deadline_ns: ?u64 = null,
     script: ?script_mod.Run = null,
 
     pub fn init(gpa: std.mem.Allocator, opts: Options) Runner {
@@ -766,6 +782,7 @@ pub const Runner = struct {
         if (r.opts.redraw == .on_demand and real and r.script == null and !r.due(r.now())) {
             woke = platform.waitEvent(r.waitMs(r.now()));
         }
+        const frame_start_ns = if (real) platform.ticksNs() else 0;
         _ = r.frame_arena.reset(.retain_capacity);
         const t = r.now();
         r.pump();
@@ -804,7 +821,16 @@ pub const Runner = struct {
             };
             r.reap();
             if (!r.running) return .ended;
-            if (r.opts.frame_ms > 0) platform.sleepMs(r.opts.frame_ms);
+            if (r.opts.frame_ms > 0) {
+                if (real and r.script == null) {
+                    // Vsync is off (windows would block in present one after another), so pace here.
+                    const p = pace(r.frame_deadline_ns, frame_start_ns, platform.ticksNs(), @as(u64, r.opts.frame_ms) * std.time.ns_per_ms);
+                    r.frame_deadline_ns = p.deadline;
+                    if (p.sleep_ns > 0) platform.sleepNs(p.sleep_ns);
+                } else {
+                    platform.sleepMs(r.opts.frame_ms);
+                }
+            }
         }
         return if (drew) .drew else .idle;
     }

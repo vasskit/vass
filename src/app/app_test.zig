@@ -1178,3 +1178,47 @@ test "an explicit loop with every window closed: hooks and scripts get null, not
     try r.run();
     try testing.expect(e.saw_none);
 }
+
+test "pace: sleeps the rest of the period" {
+    const p = @import("runner.zig").pace(null, 1000, 1006, 16);
+    try testing.expectEqual(@as(u64, 10), p.sleep_ns);
+    try testing.expectEqual(@as(?u64, 1016), p.deadline);
+    const q = @import("runner.zig").pace(p.deadline, 1016, 1020, 16);
+    try testing.expectEqual(@as(u64, 12), q.sleep_ns);
+    try testing.expectEqual(@as(?u64, 1032), q.deadline);
+}
+
+test "pace: a slow frame does not sleep and restarts from now" {
+    const p = @import("runner.zig").pace(1016, 1016, 1100, 16);
+    try testing.expectEqual(@as(u64, 0), p.sleep_ns);
+    try testing.expectEqual(@as(?u64, 1100), p.deadline);
+}
+
+test "pace: the first frame counts from its start" {
+    const p = @import("runner.zig").pace(null, 500, 504, 16);
+    try testing.expectEqual(@as(u64, 12), p.sleep_ns);
+    try testing.expectEqual(@as(?u64, 516), p.deadline);
+}
+
+test "pace: a zero period never sleeps" {
+    const p = @import("runner.zig").pace(100, 100, 150, 0);
+    try testing.expectEqual(@as(u64, 0), p.sleep_ns);
+    try testing.expectEqual(@as(?u64, null), p.deadline);
+}
+
+test "pace: wake-up jitter does not accumulate" {
+    const pace = @import("runner.zig").pace;
+    const period: u64 = 16_000_000;
+    var deadline: ?u64 = null;
+    var start: u64 = 1_000_000;
+    const origin = start;
+    for (0..1000) |i| {
+        const work: u64 = 2_000_000 + (i % 5) * 300_000;
+        const p = pace(deadline, start, start + work, period);
+        deadline = p.deadline;
+        // Each sleep overshoots by up to 0.9 ms.
+        start = start + work + p.sleep_ns + (i % 4) * 300_000;
+    }
+    // Late wake-ups are absorbed by shorter sleeps: the deadline is exactly 1000 periods on.
+    try testing.expectEqual(origin + 1000 * period, deadline.?);
+}

@@ -83,6 +83,8 @@ const c = struct {
     extern fn SDL_GetError() [*:0]const u8;
     extern fn SDL_Delay(ms: u32) void;
     extern fn SDL_GetTicks() u64;
+    extern fn SDL_GetTicksNS() u64;
+    extern fn SDL_DelayNS(ns: u64) void;
     // SDL_mouse.h (SDL 3.4): SDL_SystemCursor ids are DEFAULT 0, TEXT 1, WAIT 2, CROSSHAIR 3, PROGRESS 4,
     // NWSE_RESIZE 5, NESW_RESIZE 6, EW_RESIZE 7, NS_RESIZE 8, MOVE 9, NOT_ALLOWED 10, POINTER 11.
     extern fn SDL_CreateSystemCursor(id: c_int) ?*SdlCursor;
@@ -1052,6 +1054,12 @@ pub fn sleepMs(ms: u32) void {
     c.SDL_Delay(ms);
 }
 
+/// Sleeps at least `ns` nanoseconds. It does not spin to wake exactly on time: that would
+/// burn CPU every frame, and a caller pacing to a deadline absorbs a late wake-up anyway.
+pub fn sleepNs(ns: u64) void {
+    c.SDL_DelayNS(ns);
+}
+
 /// A mouse cursor shape. Apps ask for one with `Ui.setCursor` (or `Window.setCursor`); the
 /// backend creates the system cursor lazily, caches it and frees it with the last window.
 /// SDL has no open-hand cursor, so `grab` and `grabbing` are both SDL's "move" cursor (on
@@ -1120,6 +1128,11 @@ fn freeCursors() void {
 /// Milliseconds since the platform was initialised.
 pub fn ticks() u64 {
     return c.SDL_GetTicks();
+}
+
+/// Nanoseconds since the platform was initialised.
+pub fn ticksNs() u64 {
+    return c.SDL_GetTicksNS();
 }
 
 const LiveFrame = struct { ctx: ?*anyopaque, func: *const fn (ctx: ?*anyopaque) void, window_id: u32, thread: u64 };
@@ -1191,6 +1204,8 @@ pub const Window = struct {
         if (first) {
             // Let the first click on an unfocused window count as a click.
             _ = c.SDL_SetHint("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
+            // Without this a trackpad scroll stops dead when the fingers lift. Must precede SDL_Init.
+            _ = c.SDL_SetHint("SDL_MAC_SCROLL_MOMENTUM", "1");
             if (!c.SDL_Init(c.INIT_VIDEO)) return fail("SDL_Init");
             if (!c.TTF_Init()) {
                 const err = fail("TTF_Init");
