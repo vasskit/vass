@@ -6,7 +6,7 @@
 //!
 //! The source tree is grouped by the package each folder would become: `core/` (geometry, display
 //! list, keys, image handles, PNG writer), `platform/` (SDL3 backend, macOS extras), `text/`
-//! (grapheme/emoji tables, editing core, undo, emoji compositing), `layout/`, `image/` (decoders,
+//! (grapheme/emoji tables, editing core, undo, emoji compositing, paragraph layout), `layout/`, `image/` (decoders,
 //! SVG, rasteriser, texture cache policy), `audio/`, `ui/` (the immediate-mode widgets) and `app/`
 //! (the application loop over `platform` and `ui`).
 //! The tests of every file are pulled in by the `test` block at the end of this file.
@@ -20,6 +20,8 @@ pub const split = @import("ui/split.zig");
 pub const keys = @import("core/keys.zig");
 pub const text_edit = @import("text/text_edit.zig");
 pub const grapheme = @import("text/grapheme.zig");
+/// Retained layout of styled text wrapped to a width: wrap once, query and draw many times.
+pub const Paragraph = @import("text/paragraph.zig");
 pub const emoji = @import("text/emoji.zig");
 pub const png = @import("core/png.zig");
 pub const image = @import("core/image.zig");
@@ -70,6 +72,7 @@ pub const AppConfig = app.Config;
 test {
     _ = text_edit;
     _ = grapheme;
+    _ = Paragraph;
     _ = emoji;
     _ = @import("text/text_compose.zig");
     _ = ui;

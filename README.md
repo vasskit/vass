@@ -77,6 +77,9 @@ Run it from a clone: `zig build hello`.
   fallback fonts for CJK and symbols on macOS, your own TTFs and weights (`WindowOptions.fonts`),
   bold, italic, monospace, underline and strikethrough (`gfx.TextStyle`), and font metrics
   (`Ui.fontMetrics`) to put runs of different styles on one baseline.
+- **Styled paragraphs.** `vass.Paragraph`: lay out runs of styled text once at a width, then draw
+  it as often as you like; caret, hit-test and selection queries. Left to right, with simple
+  line-breaking rules.
 - **Rect cutting.** `cutTop`, `cutLeft`, `inset` for a strip or two.
 - **Flex layout.** `vass.Layout`: `.fixed`, `.grow`, `.hug`, `.percent`, wrapping, scrolling,
   absolute positioning. Solved in the frame it is declared.
@@ -103,6 +106,8 @@ No reference docs yet. Each example in `examples/` covers one area.
 - Input methods are untested with real Japanese, Chinese or Korean input.
 - No submenus, scrollbar dragging or horizontal scrolling.
 - Emoji newer than the system emoji font draw as boxes.
+- No right-to-left or bidirectional text, and line breaking follows simple rules, not the full
+  Unicode algorithm.
 
 ## Using it in your project
 
@@ -152,7 +157,7 @@ zig build test                      # unit tests; also compiles every example
 ```
 
 There are examples for `hello`, `controls`, `layout`, `split`, `popups`, `windows` (several windows),
-`notes`, `images`, `icons`, `audio`, `vibrancy` and `text_styles`.
+`notes`, `images`, `icons`, `audio`, `vibrancy`, `text_styles` and `paragraphs`.
 
 ## Repository layout
 
@@ -160,7 +165,7 @@ There are examples for `hello`, `controls`, `layout`, `split`, `popups`, `window
 
 - `src/core/`: geometry and colours, the display list, key codes, image handles, a PNG writer.
 - `src/platform/`: the SDL3 backend (windows, input, text, rendering) and the macOS extras.
-- `src/text/`: the editing core, undo history, grapheme and emoji segmentation.
+- `src/text/`: the editing core, undo history, grapheme and emoji segmentation, paragraph layout.
 - `src/layout/`: the flex-style layout solver.
 - `src/image/`: image decoding, the SVG parser and rasteriser.
 - `src/audio/`: sound decoding, the mixer, playback and recording.

@@ -31,6 +31,7 @@ const layout = @import("../layout/layout.zig");
 const focus = @import("focus.zig");
 const split = @import("split.zig");
 const grapheme = @import("../text/grapheme.zig");
+const Paragraph = @import("../text/paragraph.zig");
 const text_input = @import("text_input.zig");
 pub const Cursor = backend.Cursor;
 pub const FocusId = focus.FocusId;
@@ -731,6 +732,22 @@ pub const Ui = struct {
     pub fn fontMetrics(ui: *const Ui, size: f32, style: gfx.TextStyle) gfx.FontMetrics {
         const f = ui.metrics_fn orelse return .{ .ascent = 0.8 * size, .descent = 0.2 * size, .line_height = ui.lineHeight(size) };
         return f(ui.measure_ctx, size, style);
+    }
+
+    /// A measurer for `Paragraph.init` and its queries that measures and reports metrics the way
+    /// this Ui does. It points at `ui`, so use it only while `ui` is alive (the frame).
+    pub fn paragraphMeasurer(ui: *const Ui) Paragraph.Measurer {
+        return .{ .ctx = @constCast(ui), .measureFn = paragraphMeasure, .metricsFn = paragraphMetrics };
+    }
+
+    fn paragraphMeasure(ctx: ?*anyopaque, str: []const u8, size: f32, style: gfx.TextStyle) f32 {
+        const ui: *const Ui = @ptrCast(@alignCast(ctx.?));
+        return ui.measureStyled(str, size, style);
+    }
+
+    fn paragraphMetrics(ctx: ?*anyopaque, size: f32, style: gfx.TextStyle) gfx.FontMetrics {
+        const ui: *const Ui = @ptrCast(@alignCast(ctx.?));
+        return ui.fontMetrics(size, style);
     }
 
     /// Hover and click state of `r` for this frame. Draws nothing. A pointer
@@ -4114,4 +4131,34 @@ test "setting a styled measurer does not change how plain text wraps or hit-test
     try std.testing.expectEqual(m0, ui.measureStyled("abc", 10, .{ .underline = true }));
     // A face that differs does use the styled measurer.
     try std.testing.expectEqual(@as(f32, 90), ui.measureStyled("abc", 10, .{ .italic = true }));
+}
+
+test "a paragraph laid out with a window's measurer fits its width" {
+    backend.useDummyVideo();
+    const win = backend.Window.create(std.testing.allocator, .{ .title = "paragraph", .width = 200, .height = 100, .hidden = true }) catch return error.SkipZigTest;
+    defer win.destroy();
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    const ui = Ui.init(&list, win, .{}, .{});
+    if (ui.measureStyled("abc", 14, .{}) <= 0) return error.SkipZigTest; // no fonts here
+    const text = "Some body text with bold words and a long-winded conclusion that has to wrap.";
+    const runs = [_]Paragraph.Run{
+        .{ .len = 10, .color = .{ .r = 255, .g = 255, .b = 255 } },
+        .{ .len = 17, .style = .{ .weight = .bold }, .color = .{ .r = 255, .g = 255, .b = 255 } },
+        .{ .len = text.len - 27, .style = .{ .italic = true }, .color = .{ .r = 255, .g = 255, .b = 255 } },
+    };
+    const width: f32 = 160;
+    var p = try Paragraph.init(std.testing.allocator, ui.paragraphMeasurer(), text, &runs, .{ .size = 14, .width = width });
+    defer p.deinit(std.testing.allocator);
+    try std.testing.expect(p.lines.len >= 2);
+    try std.testing.expect(p.height > 0);
+    for (p.lines) |l| {
+        try std.testing.expect(l.width > 0 and l.width <= width + 0.5);
+        try std.testing.expect(l.height >= 14);
+    }
+    for (p.segments) |s| try std.testing.expect(s.width > 0);
+    const c = p.caretRect(ui.paragraphMeasurer(), 12, .downstream);
+    try std.testing.expect(c.x > 0 and c.h > 0);
+    p.draw(&list, 0, 0);
+    try std.testing.expectEqual(p.segments.len, list.cmds.items.len);
 }
