@@ -74,7 +74,9 @@ Run it from a clone: `zig build hello`.
   composition inline. Undo, redo, clipboard, selection by word and line, a right-click menu, a
   password mode. The editor behind them, `vass.TextEdit`, works without the widgets.
 - **Text rendering.** SDL_ttf with HarfBuzz shaping, colour emoji through Apple Color Emoji,
-  fallback fonts for CJK and symbols on macOS, your own TTFs and weights (`WindowOptions.fonts`).
+  fallback fonts for CJK and symbols on macOS, your own TTFs and weights (`WindowOptions.fonts`),
+  bold, italic, monospace, underline and strikethrough (`gfx.TextStyle`), and font metrics
+  (`Ui.fontMetrics`) to put runs of different styles on one baseline.
 - **Rect cutting.** `cutTop`, `cutLeft`, `inset` for a strip or two.
 - **Flex layout.** `vass.Layout`: `.fixed`, `.grow`, `.hug`, `.percent`, wrapping, scrolling,
   absolute positioning. Solved in the frame it is declared.
@@ -150,7 +152,7 @@ zig build test                      # unit tests; also compiles every example
 ```
 
 There are examples for `hello`, `controls`, `layout`, `split`, `popups`, `windows` (several windows),
-`notes`, `images`, `icons`, `audio` and `vibrancy`.
+`notes`, `images`, `icons`, `audio`, `vibrancy` and `text_styles`.
 
 ## Repository layout
 

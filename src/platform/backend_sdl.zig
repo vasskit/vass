@@ -103,6 +103,7 @@ const c = struct {
     extern fn SDL_SetRenderScale(r: *Renderer, sx: f32, sy: f32) bool;
     extern fn SDL_SetRenderDrawBlendMode(r: *Renderer, mode: u32) bool;
     extern fn SDL_SetRenderDrawColor(r: *Renderer, red: u8, g: u8, b: u8, a: u8) bool;
+    extern fn SDL_RenderFillRect(r: *Renderer, rect: *const FRect) bool;
     extern fn SDL_RenderClear(r: *Renderer) bool;
     extern fn SDL_RenderPresent(r: *Renderer) bool;
     extern fn SDL_RenderGeometry(r: *Renderer, tex: ?*Texture, verts: [*]const Vertex, n: c_int, idx: ?[*]const c_int, n_idx: c_int) bool;
@@ -173,6 +174,22 @@ const c = struct {
     extern fn TTF_FontIsScalable(f: *Font) bool;
     extern fn TTF_SetFontSize(f: *Font, ptsize: f32) bool;
     extern fn TTF_AddFallbackFont(f: *Font, fallback: *Font) bool;
+    extern fn SDL_CreateProperties() u32;
+    extern fn SDL_DestroyProperties(props: u32) void;
+    extern fn SDL_SetStringProperty(props: u32, name: [*:0]const u8, value: [*:0]const u8) bool;
+    extern fn SDL_SetNumberProperty(props: u32, name: [*:0]const u8, value: i64) bool;
+    extern fn SDL_SetFloatProperty(props: u32, name: [*:0]const u8, value: f32) bool;
+    extern fn TTF_OpenFontWithProperties(props: u32) ?*Font;
+    extern fn TTF_SetFontStyle(f: *Font, style: c_int) void;
+    extern fn TTF_GetFontDescent(f: *Font) c_int;
+    extern fn TTF_GetFontLineSkip(f: *Font) c_int;
+    extern fn TTF_GetFontStyleName(f: *Font) ?[*:0]const u8;
+    const STYLE_BOLD: c_int = 1;
+    const STYLE_ITALIC: c_int = 2;
+    /// `TTF_PROP_FONT_CREATE_*` property names.
+    const PROP_FILENAME = "SDL_ttf.font.create.filename";
+    const PROP_SIZE = "SDL_ttf.font.create.size";
+    const PROP_FACE = "SDL_ttf.font.create.face";
     /// The start of `SDL_Surface` (SDL 3.4), enough to read the pixels SDL_ttf drew.
     const SurfaceHeader = extern struct { flags: u32, format: u32, w: c_int, h: c_int, pitch: c_int, pixels: ?[*]u8 };
     const PIXELFORMAT_ARGB8888: u32 = 0x16362004;
@@ -448,20 +465,95 @@ fn deliverDialogForTest(list: ?[*:null]const ?[*:0]const u8) void {
     dialogCallback(null, list, 0);
 }
 
-/// TrueType font data to draw text with instead of the system fonts. The
-/// bytes must stay valid for the life of the window (embed them with
-/// `@embedFile`). A weight left null is drawn with `regular`.
+/// What a text command asks of a font: the fields of `gfx.TextStyle` that choose a face.
+const Face = struct {
+    weight: gfx.Weight = .regular,
+    italic: bool = false,
+    mono: bool = false,
+
+    fn of(style: gfx.TextStyle) Face {
+        return .{ .weight = style.weight, .italic = style.italic, .mono = style.mono };
+    }
+
+    fn code(f: Face) u8 {
+        return @as(u8, @intFromEnum(f.weight)) | @as(u8, @intFromBool(f.italic)) << 2 | @as(u8, @intFromBool(f.mono)) << 3;
+    }
+
+    fn eql(a: Face, b: Face) bool {
+        return a.code() == b.code();
+    }
+};
+
+/// SDL_ttf's style flags to add to a font file that lacks the weight or slant asked for.
+const Synth = struct {
+    bold: bool = false,
+    italic: bool = false,
+
+    fn flags(s: Synth) c_int {
+        return (if (s.bold) c.STYLE_BOLD else 0) | (if (s.italic) c.STYLE_ITALIC else 0);
+    }
+};
+
+/// TrueType font data to draw text with instead of the system fonts. The bytes must stay valid
+/// for the life of the window (embed them with `@embedFile`). A weight left null is drawn with
+/// `regular` (`bold`: with `semibold`, else `medium`, else `regular`). Faces that are missing
+/// are made from the nearest one with SDL_ttf's synthetic bold and slant: an upright face
+/// slanted for `italic`, a lighter one emboldened for `bold`. Without `mono`, monospaced text
+/// uses the proportional faces.
 pub const FontSet = struct {
     regular: []const u8,
     medium: ?[]const u8 = null,
     semibold: ?[]const u8 = null,
+    bold: ?[]const u8 = null,
+    /// Regular weight, slanted.
+    italic: ?[]const u8 = null,
+    bold_italic: ?[]const u8 = null,
+    /// The monospace family; `mono_bold` is its bold weight (other weights use `mono`).
+    mono: ?[]const u8 = null,
+    mono_bold: ?[]const u8 = null,
 
     pub fn forWeight(f: FontSet, weight: gfx.Weight) []const u8 {
         return switch (weight) {
             .regular => f.regular,
             .medium => f.medium orelse f.regular,
             .semibold => f.semibold orelse f.medium orelse f.regular,
+            .bold => f.bold orelse f.semibold orelse f.medium orelse f.regular,
         };
+    }
+
+    const Pick = struct { bytes: []const u8, synth: Synth };
+
+    /// The font data for `face` and what is still missing from it. A real face for everything
+    /// asked is preferred; otherwise the nearest face gets the slant, and the bold weight only,
+    /// synthesised. Medium and semibold are never made: they use their own face or the nearest
+    /// lighter one, as they always did.
+    fn pick(f: FontSet, face: Face) Pick {
+        const want_bold = face.weight == .bold;
+        if (face.mono) if (f.mono) |m| {
+            if (want_bold) {
+                if (f.mono_bold) |mb| return .{ .bytes = mb, .synth = .{ .italic = face.italic } };
+                return .{ .bytes = m, .synth = .{ .bold = true, .italic = face.italic } };
+            }
+            return .{ .bytes = m, .synth = .{ .italic = face.italic } };
+        };
+        const upright = f.forWeight(face.weight);
+        const heavy = f.bold != null or f.semibold != null; // `upright` is a real bold-ish face
+        if (!face.italic) return .{ .bytes = upright, .synth = .{ .bold = want_bold and !heavy } };
+        if (want_bold) if (f.bold_italic) |bi| return .{ .bytes = bi, .synth = .{} };
+        if (face.weight == .regular) {
+            if (f.italic) |it| return .{ .bytes = it, .synth = .{} };
+            return .{ .bytes = f.regular, .synth = .{ .italic = true } };
+        }
+        // A face of this weight, slanted; else the italic face, emboldened for bold only.
+        const weighted: ?[]const u8 = switch (face.weight) {
+            .regular => f.regular,
+            .medium => f.medium,
+            .semibold => f.semibold orelse f.medium,
+            .bold => f.bold orelse f.semibold,
+        };
+        if (weighted) |wb| return .{ .bytes = wb, .synth = .{ .italic = true } };
+        if (f.italic) |it| return .{ .bytes = it, .synth = .{ .bold = want_bold } };
+        return .{ .bytes = upright, .synth = .{ .italic = true, .bold = want_bold } };
     }
 };
 
@@ -792,11 +884,32 @@ pub fn setClipboardText(gpa: std.mem.Allocator, str: []const u8) !void {
     _ = c.SDL_SetClipboardText(z.ptr);
 }
 
-const font_paths = [_][*:0]const u8{
-    "/System/Library/Fonts/SFNSRounded.ttf",
-    "/System/Library/Fonts/SFNS.ttf",
-    "/System/Library/Fonts/Helvetica.ttc",
+/// A system font file. A variable one has named instances (Medium, Semibold, Bold, ...) that
+/// give real weights; for the others `.bold` is synthesised (medium and semibold draw regular). `default_regular` is false for a file
+/// whose default instance is not its Regular one (the mono files default to Light).
+const SysFont = struct { path: [*:0]const u8, variable: bool, default_regular: bool = true };
+
+const font_paths = [_]SysFont{
+    .{ .path = "/System/Library/Fonts/SFNSRounded.ttf", .variable = true },
+    .{ .path = "/System/Library/Fonts/SFNS.ttf", .variable = true },
+    .{ .path = "/System/Library/Fonts/Helvetica.ttc", .variable = false },
 };
+const italic_font_paths = [_]SysFont{.{ .path = "/System/Library/Fonts/SFNSItalic.ttf", .variable = true }};
+const mono_font_paths = [_]SysFont{
+    .{ .path = "/System/Library/Fonts/SFNSMono.ttf", .variable = true, .default_regular = false },
+    .{ .path = "/System/Library/Fonts/Menlo.ttc", .variable = false },
+};
+const mono_italic_font_paths = [_]SysFont{.{ .path = "/System/Library/Fonts/SFNSMonoItalic.ttf", .variable = true, .default_regular = false }};
+
+/// The style name of the named instance that has `weight` (`italic`: in an italic file).
+fn instanceName(weight: gfx.Weight, italic: bool) []const u8 {
+    return switch (weight) {
+        .regular => if (italic) "Regular Italic" else "Regular",
+        .medium => if (italic) "Medium Italic" else "Medium",
+        .semibold => if (italic) "Semibold Italic" else "Semibold",
+        .bold => if (italic) "Bold Italic" else "Bold",
+    };
+}
 
 /// Fonts tried after the UI font, and after `WindowOptions.fallback_fonts`, for characters the UI
 /// font lacks (symbols, then Han in Simplified Chinese and Japanese forms, kana, Hangul, then
@@ -818,13 +931,15 @@ const system_emoji_drop_pct: u32 = 15;
 /// The system colour emoji font.
 const system_emoji_path: ?[:0]const u8 = if (builtin.os.tag == .macos) "/System/Library/Fonts/Apple Color Emoji.ttc" else null;
 
-const CachedFont = struct { px: u32, weight: gfx.Weight, font: *c.Font, fb_attached: bool = false };
-/// A fallback font opened at one pixel size (shared by every weight of the UI font at that size);
-/// null when the file could not be opened.
-const FallbackFont = struct { index: u16, px: u32, font: ?*c.Font };
+const CachedFont = struct { px: u32, face: Face, font: *c.Font, fb_attached: bool = false };
+/// A fallback font opened at one pixel size and style (shared by every UI font that asks for
+/// them); null when the file could not be opened.
+const FallbackFont = struct { index: u16, px: u32, style: c_int, font: ?*c.Font };
 /// A colour emoji font opened for one strike (a bitmap font) or one pixel size (a scalable one).
 const EmojiFont = struct { key: u32, font: *c.Font };
 const max_strikes = 24;
+/// How many named instances of a variable font are looked through for a weight.
+const max_instances = 32;
 
 /// The colour emoji font of a window, found on first use.
 const EmojiState = struct {
@@ -906,6 +1021,9 @@ fn textSurfaceOk(width: u64, height: u64) bool {
 }
 
 /// A string that was not drawn, remembered so it is not rasterised every frame.
+/// A UI font size and face that could not be opened, and when it may be tried again.
+const FontMiss = struct { px: u32, face: Face, miss: TextMiss };
+
 const TextMiss = struct {
     /// The last frame it was asked for (it is dropped when nobody asks for a while).
     seen: u64,
@@ -1043,6 +1161,10 @@ pub const Window = struct {
     emoji_source: ?FontSource = null,
     /// Fallback fonts opened so far, per source and pixel size.
     fb_fonts: std.ArrayList(FallbackFont) = .empty,
+    /// Sizes and faces that could not be opened, so they are not tried again on every call.
+    font_misses: std.ArrayList(FontMiss) = .empty,
+    /// Face number of each system font's named weight instance (`instanceKey`); 0: it has none.
+    instances: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     emoji: EmojiState = .{},
     /// Advance (pixels) of each emoji cluster per pixel size, as `emojiAdvance` worked it out.
     emoji_adv: std.AutoHashMapUnmanaged(u64, u32) = .empty,
@@ -1140,6 +1262,8 @@ pub const Window = struct {
         w.fonts.deinit(w.gpa);
         for (w.fb_fonts.items) |f| if (f.font) |font| c.TTF_CloseFont(font);
         w.fb_fonts.deinit(w.gpa);
+        w.instances.deinit(w.gpa);
+        w.font_misses.deinit(w.gpa);
         for (w.emoji.fonts.items) |f| c.TTF_CloseFont(f.font);
         w.emoji.fonts.deinit(w.gpa);
         w.emoji_adv.deinit(w.gpa);
@@ -1722,7 +1846,7 @@ pub const Window = struct {
             },
             .text => |t| {
                 w.flush();
-                w.drawText(t.x, t.y, t.str, t.size, t.color, t.alignment, t.weight);
+                w.drawText(t.x, t.y, t.str, t.size, t.color, t.alignment, t.style);
             },
             .push_clip => |r| w.pushClip(r),
             .pop_clip => w.popClip(),
@@ -1940,23 +2064,119 @@ pub const Window = struct {
         }
     }
 
-    fn openUiFont(w: *Window, px: u32, weight: gfx.Weight) ?*c.Font {
-        if (w.font_set) |set| {
-            const bytes = set.forWeight(weight);
-            return openSource(.{ .bytes = bytes }, @floatFromInt(px));
+    /// Opens the system font file `path`; `face_number` 0 is the file's default face, `n << 16`
+    /// its n-th named instance (FreeType's convention, passed through by SDL_ttf).
+    fn openSysFile(path: [*:0]const u8, px: u32, face_number: u32) ?*c.Font {
+        if (face_number == 0) return c.TTF_OpenFont(path, @floatFromInt(px));
+        const props = c.SDL_CreateProperties();
+        defer c.SDL_DestroyProperties(props);
+        _ = c.SDL_SetStringProperty(props, c.PROP_FILENAME, path);
+        _ = c.SDL_SetFloatProperty(props, c.PROP_SIZE, @floatFromInt(px));
+        _ = c.SDL_SetNumberProperty(props, c.PROP_FACE, face_number);
+        return c.TTF_OpenFontWithProperties(props);
+    }
+
+    /// The variable font `sf` at the weight of its named instance `name`, or null if it has no
+    /// such instance. The instance's number is looked for once per file and weight.
+    fn openInstance(w: *Window, sf: SysFont, px: u32, weight: gfx.Weight, name: []const u8) ?*c.Font {
+        const key = std.hash.Wyhash.hash(@intFromEnum(weight), std.mem.span(sf.path)) ^ std.hash.Wyhash.hash(0, name);
+        if (w.instances.get(key)) |n| return if (n == 0) null else openSysFile(sf.path, px, n);
+        var n: u32 = 1;
+        var settled = true; // the probe ended because the instances ran out, not because an open failed
+        while (n <= max_instances) : (n += 1) {
+            const font = openSysFile(sf.path, px, n << 16) orelse {
+                if (openSysFile(sf.path, px, 0)) |f0| c.TTF_CloseFont(f0) else settled = false;
+                break;
+            };
+            if (c.TTF_GetFontStyleName(font)) |got| {
+                if (std.mem.eql(u8, std.mem.span(got), name)) {
+                    w.instances.put(w.gpa, key, n << 16) catch {};
+                    return font;
+                }
+            }
+            c.TTF_CloseFont(font);
         }
-        for (font_paths) |path| {
-            if (c.TTF_OpenFont(path, @floatFromInt(px))) |font| return font;
+        if (settled) w.instances.put(w.gpa, key, 0) catch {};
+        return null;
+    }
+
+    /// The first font of `list` that opens, at `weight`: its real weight if it has a named
+    /// instance for it (always looked up where the default instance is not Regular), else the
+    /// default face, emboldened synthetically for `.bold` only.
+    fn openFirst(w: *Window, list: []const SysFont, px: u32, weight: gfx.Weight, italic_file: bool, synth: *Synth) ?*c.Font {
+        for (list) |sf| {
+            if (sf.variable and (weight != .regular or !sf.default_regular)) {
+                if (w.openInstance(sf, px, weight, instanceName(weight, italic_file))) |font| return font;
+            }
+            if (openSysFile(sf.path, px, 0)) |font| {
+                if (weight == .bold) synth.bold = true;
+                return font;
+            }
         }
         return null;
     }
 
+    /// A system font for `face`; the face's missing slant is added to `synth`.
+    fn openSystemFont(w: *Window, px: u32, face: Face, synth: *Synth) ?*c.Font {
+        if (face.mono) {
+            if (face.italic) {
+                if (w.openFirst(&mono_italic_font_paths, px, face.weight, true, synth)) |f| return f;
+            }
+            var s: Synth = .{ .italic = face.italic };
+            if (w.openFirst(&mono_font_paths, px, face.weight, false, &s)) |f| {
+                synth.* = s;
+                return f;
+            }
+        }
+        if (face.italic) {
+            if (w.openFirst(&italic_font_paths, px, face.weight, true, synth)) |f| return f;
+        }
+        synth.italic = face.italic;
+        return w.openFirst(&font_paths, px, face.weight, false, synth);
+    }
+
+    fn openUiFont(w: *Window, px: u32, face: Face) ?*c.Font {
+        var synth: Synth = .{};
+        const font = if (w.font_set) |set| blk: {
+            const pk = set.pick(face);
+            synth = pk.synth;
+            break :blk openSource(.{ .bytes = pk.bytes }, @floatFromInt(px));
+        } else w.openSystemFont(px, face, &synth);
+        if (font) |f| if (synth.flags() != 0) c.TTF_SetFontStyle(f, synth.flags());
+        return font;
+    }
+
     /// Index in `fonts` of the UI font for this size and weight, opening it the first time.
     fn fontIndex(w: *Window, px: u32, weight: gfx.Weight) ?usize {
-        for (w.fonts.items, 0..) |f, i| if (f.px == px and f.weight == weight) return i;
-        const font = w.openUiFont(px, weight) orelse return null;
-        w.fonts.append(w.gpa, .{ .px = px, .weight = weight, .font = font }) catch @panic("out of memory");
+        return w.faceIndex(px, .{ .weight = weight });
+    }
+
+    /// Index in `fonts` of the UI font for this size and face, opening it the first time.
+    fn faceIndex(w: *Window, px: u32, face: Face) ?usize {
+        for (w.fonts.items, 0..) |f, i| if (f.px == px and f.face.eql(face)) return i;
+        var miss: ?usize = null;
+        for (w.font_misses.items, 0..) |m, k| if (m.px == px and m.face.eql(face)) {
+            if (w.frame < m.miss.retry_at) return null;
+            miss = k; // a failure that may have passed: try again, not on every call
+        };
+        const font = w.openUiFont(px, face) orelse {
+            if (miss) |k| {
+                w.font_misses.items[k].miss = TextMiss.failed(w.font_misses.items[k].miss, w.frame, false);
+            } else {
+                w.font_misses.append(w.gpa, .{ .px = px, .face = face, .miss = TextMiss.failed(null, w.frame, false) }) catch {};
+            }
+            return null;
+        };
+        if (miss) |k| _ = w.font_misses.swapRemove(k);
+        w.fonts.append(w.gpa, .{ .px = px, .face = face, .font = font }) catch @panic("out of memory");
         return w.fonts.items.len - 1;
+    }
+
+    /// SDL_ttf's style flags for the fallback fonts of a UI font: they are separate files, so
+    /// they get bold (only for `.bold`) and slant synthetically.
+    fn fallbackStyle(face: Face) c_int {
+        const s: Synth = .{ .bold = face.weight == .bold, .italic = face.italic };
+        return s.flags();
     }
 
     fn fallbackCount(w: *const Window) usize {
@@ -1969,11 +2189,12 @@ pub const Window = struct {
         return .{ .path = system_fallback_paths[index - w.fallback_sources.len] };
     }
 
-    /// The fallback font number `index` at `px`, opened the first time; null if it cannot be opened.
-    fn fallbackFont(w: *Window, index: u16, px: u32) ?*c.Font {
-        for (w.fb_fonts.items) |f| if (f.index == index and f.px == px) return f.font;
+    /// The fallback font number `index` at `px` with SDL_ttf style flags `style`, opened the first time; null if it cannot be opened.
+    fn fallbackFont(w: *Window, index: u16, px: u32, style: c_int) ?*c.Font {
+        for (w.fb_fonts.items) |f| if (f.index == index and f.px == px and f.style == style) return f.font;
         const font = openSource(w.fallbackSource(index), @floatFromInt(px));
-        w.fb_fonts.append(w.gpa, .{ .index = index, .px = px, .font = font }) catch @panic("out of memory");
+        if (font) |f| if (style != 0) c.TTF_SetFontStyle(f, style);
+        w.fb_fonts.append(w.gpa, .{ .index = index, .px = px, .style = style, .font = font }) catch @panic("out of memory");
         return font;
     }
 
@@ -1984,7 +2205,7 @@ pub const Window = struct {
         if (f.fb_attached or !needsFallback(f.font, text)) return f.font;
         f.fb_attached = true;
         for (0..w.fallbackCount()) |k| {
-            if (w.fallbackFont(@intCast(k), f.px)) |fb| _ = c.TTF_AddFallbackFont(f.font, fb);
+            if (w.fallbackFont(@intCast(k), f.px, fallbackStyle(f.face))) |fb| _ = c.TTF_AddFallbackFont(f.font, fb);
         }
         return f.font;
     }
@@ -2302,9 +2523,15 @@ pub const Window = struct {
     /// Width in points that `str` takes when drawn at `size` in `weight`: the width of the texture
     /// `drawText` makes for it, emoji and fallback fonts included.
     pub fn measureTextWeighted(w: *Window, str: []const u8, size: f32, weight: gfx.Weight) f32 {
+        return w.measureTextStyled(str, size, .{ .weight = weight });
+    }
+
+    /// Width in points that `str` takes when drawn at `size` in `style` (underline and
+    /// strikethrough do not change it).
+    pub fn measureTextStyled(w: *Window, str: []const u8, size: f32, style: gfx.TextStyle) f32 {
         if (str.len == 0) return 0;
         const px = w.textPx(size) orelse return 0;
-        const i = w.fontIndex(px, weight) orelse return 0;
+        const i = w.faceIndex(px, Face.of(style)) orelse return 0;
         var total: u32 = 0;
         if (w.hasEmojiRuns(str, px)) {
             var it = emoji_mod.runs(str);
@@ -2315,13 +2542,35 @@ pub const Window = struct {
         return @as(f32, @floatFromInt(total)) / w.density;
     }
 
-    fn drawText(w: *Window, x: f32, y: f32, str: []const u8, size: f32, col: Color, alignment: gfx.Align, weight: gfx.Weight) void {
-        if (str.len == 0) return;
-        const px = w.textPx(size) orelse return;
-        var h = std.hash.Wyhash.init(@as(u64, px) << 8 | @intFromEnum(weight));
+    /// Vertical metrics of the face `style` picks at `size`, as `drawText` lays it out: a text
+    /// command at `y` has its baseline at `y + ascent`, for text within the face's ascent: SDL_ttf
+    /// moves a line down when a glyph rises above it, and fallback-font glyphs sit on their own
+    /// font's ascent, so such text can be a few pixels off. Without a usable font, an estimate.
+    pub fn fontMetrics(w: *Window, size: f32, style: gfx.TextStyle) gfx.FontMetrics {
+        const est: gfx.FontMetrics = .{ .ascent = 0.8 * size, .descent = 0.2 * size, .line_height = 1.2 * size };
+        const px = w.textPx(size) orelse return est;
+        const i = w.faceIndex(px, Face.of(style)) orelse return est;
+        const font = w.fonts.items[i].font;
+        const asc: f32 = @floatFromInt(@max(0, c.TTF_GetFontAscent(font)));
+        const desc: f32 = @floatFromInt(@max(0, -c.TTF_GetFontDescent(font)));
+        const skip: f32 = @floatFromInt(@max(0, c.TTF_GetFontLineSkip(font)));
+        return .{ .ascent = asc / w.density, .descent = desc / w.density, .line_height = @max(skip, asc + desc) / w.density };
+    }
+
+    /// The cache key of a text texture: everything that changes its pixels. Underline and
+    /// strikethrough are drawn apart from the texture, so they are not part of it.
+    fn textKey(px: u32, face: Face, str: []const u8, col: Color) u64 {
+        var h = std.hash.Wyhash.init(@as(u64, px) << 8 | face.code());
         h.update(str);
         h.update(std.mem.asBytes(&col));
-        const key = h.final();
+        return h.final();
+    }
+
+    fn drawText(w: *Window, x: f32, y: f32, str: []const u8, size: f32, col: Color, alignment: gfx.Align, style: gfx.TextStyle) void {
+        if (str.len == 0) return;
+        const px = w.textPx(size) orelse return;
+        const face = Face.of(style);
+        const key = textKey(px, face, str, col);
 
         const entry = w.texts.getPtr(key) orelse blk: {
             var prior: ?TextMiss = null;
@@ -2330,7 +2579,7 @@ pub const Window = struct {
                 if (w.frame < m.retry_at) return;
                 prior = m.*; // a failure that may have passed: try again, not every frame
             }
-            const i = w.fontIndex(px, weight) orelse return;
+            const i = w.faceIndex(px, face) orelse return;
             const t = w.textTexture(i, str, col, px) orelse {
                 w.text_misses.put(w.gpa, key, TextMiss.failed(prior, w.frame, w.text_never)) catch @panic("out of memory");
                 return;
@@ -2360,6 +2609,22 @@ pub const Window = struct {
             _ = c.SDL_RenderTexture(w.ren, m, null, &part);
             sx += tw;
         }
+        if (style.underline or style.strikethrough) {
+            const i = w.faceIndex(px, face) orelse return;
+            const asc = c.TTF_GetFontAscent(w.fonts.items[i].font);
+            if (style.underline) w.fillDecoration(o.x, o.y, entry.pw, underlineBar(px, asc), col);
+            if (style.strikethrough) w.fillDecoration(o.x, o.y, entry.pw, strikethroughBar(px, asc), col);
+        }
+    }
+
+    /// A line `bar` under or through the text whose texture has its top-left at (`x`, `y`)
+    /// device pixels and is `pw` wide. A plain filled rectangle: the shape renderer's soft edge
+    /// would smear a one pixel line over two rows.
+    fn fillDecoration(w: *Window, x: f32, y: f32, pw: f32, bar: Bar, col: Color) void {
+        const d = w.density;
+        const rect: c.FRect = .{ .x = x / d, .y = (y + @as(f32, @floatFromInt(bar.top))) / d, .w = pw / d, .h = @as(f32, @floatFromInt(bar.thickness)) / d };
+        _ = c.SDL_SetRenderDrawColor(w.ren, col.r, col.g, col.b, col.a);
+        _ = c.SDL_RenderFillRect(w.ren, &rect);
     }
 
     /// Where the top-left of a text texture `pw` pixels wide goes, in device pixels, whole numbers.
@@ -2405,6 +2670,28 @@ pub const Window = struct {
         }
     }
 };
+
+/// A horizontal line over a text texture, in whole device pixels: `top` rows below the top of
+/// the texture.
+const Bar = struct { top: i32, thickness: i32 };
+
+fn barThickness(px: u32) i32 {
+    return @max(1, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(px)) / 14))));
+}
+
+/// The underline for text `px` tall whose baseline is `ascent` rows below the texture's top. SDL_ttf
+/// does not expose the font's own underline position, so it is a fixed share of the size.
+fn underlineBar(px: u32, ascent: i32) Bar {
+    const gap: i32 = @max(1, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(px)) / 9))));
+    return .{ .top = ascent + gap, .thickness = barThickness(px) };
+}
+
+/// The strikethrough, centred a bit under a third of the ascent above the baseline.
+fn strikethroughBar(px: u32, ascent: i32) Bar {
+    const t = barThickness(px);
+    const centre = @as(f32, @floatFromInt(ascent)) * 0.70;
+    return .{ .top = @intFromFloat(@round(centre - @as(f32, @floatFromInt(t)) / 2)), .thickness = t };
+}
 
 /// Characters that draw nothing (joiners, variation selectors, ...): a UI font need not have a
 /// glyph for them, so they do not by themselves call for the fallback fonts.
@@ -2541,12 +2828,12 @@ test "text sizes that are not a positive finite number draw nothing and measure 
         } else {
             try std.testing.expectEqual(@as(f32, 0), m);
         }
-        win.drawText(0, 0, "hello", size, white, .left, .regular);
+        win.drawText(0, 0, "hello", size, white, .left, .{});
     }
     // A huge size is clamped to the text size cap: a finite, bounded width.
     const huge_w = win.measureText("hello", 1e30);
     try std.testing.expect(std.math.isFinite(huge_w) and huge_w > win.measureText("hello", 14) and huge_w < 1e6);
-    win.drawText(0, 0, "hello", 1e30, white, .left, .regular);
+    win.drawText(0, 0, "hello", 1e30, white, .left, .{});
     // A size under half a pixel opens no font, however often it is asked for.
     const fonts = win.fonts.items.len;
     for (0..5) |_| _ = win.measureText("hello", 0.1);
@@ -2585,8 +2872,8 @@ test "text wider than the largest texture is drawn in strips, measured as one li
         try std.testing.expectEqual(want * win.density, sum);
     } else return error.TestUnexpectedResult;
     // Drawn through the cache it is not retried: one texture set, no miss entry.
-    win.drawText(0, 0, long, size, white, .left, .regular);
-    win.drawText(0, 0, long, size, white, .left, .regular);
+    win.drawText(0, 0, long, size, white, .left, .{});
+    win.drawText(0, 0, long, size, white, .left, .{});
     try std.testing.expectEqual(@as(u32, 1), win.texts.count());
     try std.testing.expectEqual(@as(u32, 0), win.text_misses.count());
     // A string under the limit is one texture, as before.
@@ -2597,8 +2884,8 @@ test "text wider than the largest texture is drawn in strips, measured as one li
     const huge = try std.testing.allocator.alloc(u8, max_line_px / 2);
     defer std.testing.allocator.free(huge);
     @memset(huge, 'm');
-    win.drawText(0, 0, huge, size, white, .left, .regular);
-    win.drawText(0, 0, huge, size, white, .left, .regular);
+    win.drawText(0, 0, huge, size, white, .left, .{});
+    win.drawText(0, 0, huge, size, white, .left, .{});
     try std.testing.expectEqual(@as(u32, 1), win.text_misses.count());
     try std.testing.expectEqual(@as(u32, 1), win.texts.count());
 }
@@ -2650,7 +2937,7 @@ test "text drawn at a fractional position is pixel-identical to the same text on
                 const x = 60 + fr;
                 const y = 10 + fr;
                 clearTo(win, 40);
-                win.drawText(x, y, "Hello", 13, white, al, .regular);
+                win.drawText(x, y, "Hello", 13, white, al, .{});
                 const got = try readBack(win);
                 defer std.testing.allocator.free(got);
                 // Reference: left aligned at the pixel the origin should round to.
@@ -2661,7 +2948,7 @@ test "text drawn at a fractional position is pixel-identical to the same text on
                     .right => x * d - pw,
                 };
                 clearTo(win, 40);
-                win.drawText(@round(left) / d, @round(y * d) / d, "Hello", 13, white, .left, .regular);
+                win.drawText(@round(left) / d, @round(y * d) / d, "Hello", 13, white, .left, .{});
                 const want = try readBack(win);
                 defer std.testing.allocator.free(want);
                 try std.testing.expectEqualSlices(u8, want, got);
@@ -2688,7 +2975,7 @@ test "a line drawn in strips is as wide as the measure and contiguous at a fract
         while (it.next()) |e| win.destroyText(e.value_ptr.*);
         win.texts.clearRetainingCapacity();
         clearTo(win, 40);
-        win.drawText(x, 10.5, long, size, white, .left, .regular);
+        win.drawText(x, 10.5, long, size, white, .left, .{});
         shot.* = try readBack(win);
     }
     defer for (shots) |s| std.testing.allocator.free(s);
@@ -2771,7 +3058,7 @@ test "a string that is too big is a permanent miss, one that merely failed is re
     const huge = try std.testing.allocator.alloc(u8, max_line_px / 2);
     defer std.testing.allocator.free(huge);
     @memset(huge, 'm');
-    win.drawText(0, 0, huge, size, white, .left, .regular);
+    win.drawText(0, 0, huge, size, white, .left, .{});
     try std.testing.expectEqual(@as(u32, 1), win.text_misses.count());
     var it = win.text_misses.valueIterator();
     try std.testing.expectEqual(TextMiss.never, it.next().?.retry_at);
@@ -2780,7 +3067,7 @@ test "a string that is too big is a permanent miss, one that merely failed is re
     const key = key_it.next().?.*;
     win.text_misses.getPtr(key).?.retry_at = win.frame + 1;
     win.frame += 1;
-    win.drawText(0, 0, huge, size, white, .left, .regular);
+    win.drawText(0, 0, huge, size, white, .left, .{});
     try std.testing.expectEqual(TextMiss.never, win.text_misses.get(key).?.retry_at); // tried, and now permanent
     try std.testing.expectEqual(@as(u8, 1), win.text_misses.get(key).?.tries);
 }
@@ -3556,7 +3843,7 @@ test "fallback fonts: CJK has glyphs through the system fallbacks, and only when
     const on = try dummyWindow(.{ .title = "fb on", .width = 80, .height = 60 });
     defer on.destroy();
     // Hiragino Sans GB is the second system fallback; no font, no test.
-    if (builtin.os.tag != .macos or on.fallbackFont(1, 20) == null) return error.SkipZigTest;
+    if (builtin.os.tag != .macos or on.fallbackFont(1, 20, 0) == null) return error.SkipZigTest;
     const off = try dummyWindow(.{ .title = "fb off", .width = 80, .height = 60, .system_fallback_fonts = false });
     defer off.destroy();
     const cjk = "\u{4F60}\u{597D}";
@@ -3575,4 +3862,170 @@ test "fallback fonts: CJK has glyphs through the system fallbacks, and only when
     const own = try dummyWindow(.{ .title = "own", .width = 80, .height = 60, .system_fallback_fonts = false, .fallback_fonts = &.{.{ .path = "/System/Library/Fonts/Hiragino Sans GB.ttc" }} });
     defer own.destroy();
     try std.testing.expectEqual(with, own.measureText(cjk, 20));
+}
+
+test "font set: weight and slant are both kept when the set cannot give the real face" {
+    const e = std.testing.expectEqualStrings;
+    const ex = std.testing.expectEqual;
+    const sb_it: FontSet = .{ .regular = "r", .semibold = "s", .italic = "i" };
+    const a = sb_it.pick(.{ .weight = .semibold, .italic = true });
+    try e("s", a.bytes);
+    try ex(Synth{ .italic = true }, a.synth);
+    // Bold falls to the semibold face, slanted.
+    const b = sb_it.pick(.{ .weight = .bold, .italic = true });
+    try e("s", b.bytes);
+    try ex(Synth{ .italic = true }, b.synth);
+    // Without a semibold or bold face, the italic one is used: semibold is never made, bold is.
+    const r_it: FontSet = .{ .regular = "r", .italic = "i" };
+    const c1 = r_it.pick(.{ .weight = .semibold, .italic = true });
+    try e("i", c1.bytes);
+    try ex(@as(c_int, 0), c1.synth.flags());
+    const c2 = r_it.pick(.{ .weight = .bold, .italic = true });
+    try e("i", c2.bytes);
+    try ex(Synth{ .bold = true }, c2.synth);
+    // Medium cannot be made: a medium face is slanted, else the plain italic face is used.
+    const m_it: FontSet = .{ .regular = "r", .medium = "m", .italic = "i" };
+    const d = m_it.pick(.{ .weight = .medium, .italic = true });
+    try e("m", d.bytes);
+    try ex(Synth{ .italic = true }, d.synth);
+    const e2 = r_it.pick(.{ .weight = .medium, .italic = true });
+    try e("i", e2.bytes);
+    try ex(@as(c_int, 0), e2.synth.flags());
+    // Regular italic uses the italic face as is; a real bold italic beats everything.
+    try e("i", sb_it.pick(.{ .italic = true }).bytes);
+    const all: FontSet = .{ .regular = "r", .semibold = "s", .italic = "i", .bold_italic = "bi" };
+    try e("bi", all.pick(.{ .weight = .bold, .italic = true }).bytes);
+    // Only the regular face: semibold is regular, slanted when asked; only bold is emboldened.
+    const only_r: FontSet = .{ .regular = "r" };
+    try e("r", only_r.pick(.{ .weight = .semibold }).bytes);
+    try ex(@as(c_int, 0), only_r.pick(.{ .weight = .semibold }).synth.flags());
+    try ex(Synth{ .italic = true }, only_r.pick(.{ .weight = .semibold, .italic = true }).synth);
+    try ex(Synth{ .bold = true, .italic = true }, only_r.pick(.{ .weight = .bold, .italic = true }).synth);
+    // Semibold italic with only a medium face slants the medium one (the lighter real face).
+    const med_only: FontSet = .{ .regular = "r", .medium = "m" };
+    try e("m", med_only.pick(.{ .weight = .semibold, .italic = true }).bytes);
+    // Removing the italic face never changes the weight picked.
+    const no_it: FontSet = .{ .regular = "r", .semibold = "s" };
+    try e("s", no_it.pick(.{ .weight = .semibold, .italic = true }).bytes);
+}
+
+/// Whether the system font at `path` exists.
+fn fontFileExists(path: [*:0]const u8) bool {
+    var info: c.PathInfo = undefined;
+    return c.SDL_GetPathInfo(path, &info);
+}
+
+test "system fonts: mono regular is the Regular instance, not the file's Light default" {
+    if (builtin.os.tag != .macos or !fontFileExists("/System/Library/Fonts/SFNSMono.ttf")) return error.SkipZigTest;
+    const win = try dummyWindow(.{ .title = "mono", .width = 80, .height = 60 });
+    defer win.destroy();
+    const styleName = struct {
+        fn of(w: *Window, face: Face) []const u8 {
+            const i = w.faceIndex(28, face).?;
+            return std.mem.span(c.TTF_GetFontStyleName(w.fonts.items[i].font).?);
+        }
+    }.of;
+    try std.testing.expectEqualStrings("Regular", styleName(win, .{ .mono = true }));
+    try std.testing.expectEqualStrings("Bold", styleName(win, .{ .mono = true, .weight = .bold }));
+    if (fontFileExists("/System/Library/Fonts/SFNSMonoItalic.ttf")) {
+        try std.testing.expectEqualStrings("Regular Italic", styleName(win, .{ .mono = true, .italic = true }));
+    }
+    // The proportional regular face is the file's default one.
+    const reg = styleName(win, .{});
+    try std.testing.expect(std.mem.eql(u8, reg, "Regular"));
+}
+
+test "a face that cannot be opened is remembered, not retried" {
+    const win = try dummyWindow(.{ .title = "miss", .width = 80, .height = 60, .fonts = .{ .regular = "not a font" } });
+    defer win.destroy();
+    try std.testing.expectEqual(@as(f32, 0), win.measureTextStyled("abc", 20, .{}));
+    try std.testing.expectEqual(@as(usize, 1), win.font_misses.items.len);
+    _ = win.measureTextStyled("abc", 20, .{});
+    _ = win.fontMetrics(20, .{});
+    win.drawText(0, 0, "abc", 20, white, .left, .{});
+    try std.testing.expectEqual(@as(usize, 1), win.font_misses.items.len);
+    _ = win.measureTextStyled("abc", 20, .{ .italic = true });
+    try std.testing.expectEqual(@as(usize, 2), win.font_misses.items.len);
+    try std.testing.expectEqual(@as(usize, 0), win.fonts.items.len);
+    // A failure is retried later, at a growing distance, not never.
+    const first = win.font_misses.items[0].miss;
+    try std.testing.expect(first.retry_at != TextMiss.never);
+    win.frame = first.retry_at;
+    _ = win.measureTextStyled("abc", 20, .{});
+    try std.testing.expectEqual(@as(usize, 2), win.font_misses.items.len);
+    try std.testing.expectEqual(@as(u8, 1), win.font_misses.items[0].miss.tries);
+    try std.testing.expect(win.font_misses.items[0].miss.retry_at - win.frame > first.retry_at);
+    // The estimate is still positive.
+    try std.testing.expect(win.fontMetrics(20, .{}).ascent > 0);
+}
+
+test "underlined and struck text puts pixels where plain text has none" {
+    const win = try dummyWindow(.{ .title = "lines", .width = 160, .height = 80 });
+    defer win.destroy();
+    const size: f32 = 20;
+    const px = win.textPx(size) orelse return error.SkipZigTest;
+    const i = win.faceIndex(px, .{}) orelse return error.SkipZigTest;
+    const asc: usize = @intCast(c.TTF_GetFontAscent(win.fonts.items[i].font));
+    const oy: usize = @intFromFloat(@round(10 * win.density));
+    const ox: usize = @intFromFloat(@round(10 * win.density));
+    const baseline = oy + asc;
+
+    // "HHHH" has nothing below the baseline and nothing in the strike's row but the stems.
+    const rows = struct {
+        fn lit(w: *Window, bytes: []const u8, pitch: usize, row: usize, x0: usize, x1: usize) usize {
+            _ = w;
+            var n: usize = 0;
+            for (x0..x1) |x| {
+                const px4 = bytes[row * pitch + x * 4 ..][0..3];
+                if (@max(px4[0], @max(px4[1], px4[2])) > 128) n += 1;
+            }
+            return n;
+        }
+    }.lit;
+    const surf_pitch = struct {
+        fn of(w: *Window) usize {
+            const surf = c.SDL_RenderReadPixels(w.ren, null).?;
+            defer c.SDL_DestroySurface(surf);
+            const hdr: *const c.SurfaceHeader = @ptrCast(@alignCast(surf));
+            return @intCast(hdr.pitch);
+        }
+    }.of;
+
+    clearTo(win, 0);
+    win.drawText(10, 10, "HHHH", size, white, .left, .{});
+    win.flush();
+    const plain = try readBack(win);
+    defer std.testing.allocator.free(plain);
+    const pitch = surf_pitch(win);
+    const wpx: usize = @intFromFloat(@round(win.measureText("HHHH", size) * win.density));
+
+    clearTo(win, 0);
+    win.drawText(10, 10, "HHHH", size, white, .left, .{ .underline = true });
+    win.flush();
+    const under = try readBack(win);
+    defer std.testing.allocator.free(under);
+
+    const bar = underlineBar(px, @intCast(asc));
+    const urow = baseline + @as(usize, @intCast(bar.top)) - asc;
+    var below_plain: usize = 0;
+    var below_under: usize = 0;
+    for (baseline + 2..baseline + 2 + @as(usize, @intCast(bar.top)) + 4) |row| {
+        below_plain += rows(win, plain, pitch, row, ox, ox + wpx);
+        below_under += rows(win, under, pitch, row, ox, ox + wpx);
+    }
+    try std.testing.expectEqual(@as(usize, 0), below_plain);
+    // The bar spans the whole advance width, in its own rows.
+    try std.testing.expectEqual(wpx, rows(win, under, pitch, urow, ox, ox + wpx));
+    try std.testing.expect(below_under >= wpx);
+
+    clearTo(win, 0);
+    win.drawText(10, 10, "HHHH", size, white, .left, .{ .strikethrough = true });
+    win.flush();
+    const struck = try readBack(win);
+    defer std.testing.allocator.free(struck);
+    const sb = strikethroughBar(px, @intCast(asc));
+    const srow = oy + @as(usize, @intCast(sb.top));
+    try std.testing.expectEqual(wpx, rows(win, struck, pitch, srow, ox, ox + wpx));
+    // Between the stems the plain text has gap pixels in that row; the strike fills them.
+    try std.testing.expect(rows(win, plain, pitch, srow, ox, ox + wpx) < wpx);
 }

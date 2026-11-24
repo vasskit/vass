@@ -446,6 +446,10 @@ pub const LabelOpts = struct {
     @"align": gfx.Align = .left,
     /// Font weight (needs a window with fonts for it; see `backend.FontSet`).
     weight: gfx.Weight = .regular,
+    /// Full text style; when set it wins over `weight`, and drawing, wrapping, trimming,
+    /// hit-testing and selection rectangles of the label widgets all measure with it. Without
+    /// it only `weight` is drawn, and the wrapping widgets still measure at regular weight.
+    style: ?gfx.TextStyle = null,
     /// `textSelectable` only: a right click opens a Copy / Select All menu (needs `ui.state`).
     context_menu: bool = true,
 };
@@ -486,6 +490,10 @@ pub const MeterOpts = struct {
 pub const MeasureFn = *const fn (ctx: ?*anyopaque, str: []const u8, size: f32) f32;
 /// Like `MeasureFn`, for a given font weight.
 pub const MeasureWeightFn = *const fn (ctx: ?*anyopaque, str: []const u8, size: f32, weight: gfx.Weight) f32;
+/// Like `MeasureFn`, for a given text style.
+pub const MeasureStyledFn = *const fn (ctx: ?*anyopaque, str: []const u8, size: f32, style: gfx.TextStyle) f32;
+/// Font metrics at a size and style (see `gfx.FontMetrics`).
+pub const FontMetricsFn = *const fn (ctx: ?*anyopaque, size: f32, style: gfx.TextStyle) gfx.FontMetrics;
 
 pub const ChipOpts = struct {
     /// Fill; defaults to the theme's card colour.
@@ -600,6 +608,8 @@ pub const Ui = struct {
     measure_ctx: ?*anyopaque = null,
     measure_fn: ?MeasureFn = null,
     measure_w_fn: ?MeasureWeightFn = null,
+    measure_s_fn: ?MeasureStyledFn = null,
+    metrics_fn: ?FontMetricsFn = null,
     /// Focus and drag state that persists between frames; see `State`.
     state: ?*State = null,
     clipboard: Clipboard = .{},
@@ -654,6 +664,8 @@ pub const Ui = struct {
             .measure_ctx = win,
             .measure_fn = measureWindow,
             .measure_w_fn = measureWindowWeighted,
+            .measure_s_fn = measureWindowStyled,
+            .metrics_fn = fontMetricsWindow,
             .clipboard = .{ .get = systemClipGet, .set = systemClipSet },
         };
     }
@@ -673,6 +685,23 @@ pub const Ui = struct {
         return win.measureTextWeighted(str, size, weight);
     }
 
+    fn measureWindowStyled(ctx: ?*anyopaque, str: []const u8, size: f32, style: gfx.TextStyle) f32 {
+        const win: *backend.Window = @ptrCast(@alignCast(ctx.?));
+        return win.measureTextStyled(str, size, style);
+    }
+
+    fn fontMetricsWindow(ctx: ?*anyopaque, size: f32, style: gfx.TextStyle) gfx.FontMetrics {
+        const win: *backend.Window = @ptrCast(@alignCast(ctx.?));
+        return win.fontMetrics(size, style);
+    }
+
+    /// Makes a headless Ui measure styled text with `measure` and report font metrics with
+    /// `metrics` (null: the approximation `fontMetrics` documents). Both get `measure_ctx`.
+    pub fn setStyledMeasure(ui: *Ui, measure_fn: MeasureStyledFn, metrics: ?FontMetricsFn) void {
+        ui.measure_s_fn = measure_fn;
+        ui.metrics_fn = metrics;
+    }
+
     /// Width in points of `str` at `size`.
     pub fn measure(ui: *const Ui, str: []const u8, size: f32) f32 {
         const f = ui.measure_fn orelse return 0;
@@ -685,6 +714,23 @@ pub const Ui = struct {
         if (weight == .regular) return ui.measure(str, size);
         const f = ui.measure_w_fn orelse return ui.measure(str, size);
         return f(ui.measure_ctx, str, size, weight);
+    }
+
+    /// Width in points of `str` at `size` in `style`. Text in the plain face (regular, upright,
+    /// proportional) is always `measure`, whether or not a styled measurer was set. Without one
+    /// (headless Uis that did not set one) other styles are `measureWeighted` with the style's weight.
+    pub fn measureStyled(ui: *const Ui, str: []const u8, size: f32, style: gfx.TextStyle) f32 {
+        if (style.weight == .regular and !style.italic and !style.mono) return ui.measure(str, size);
+        const f = ui.measure_s_fn orelse return ui.measureWeighted(str, size, style.weight);
+        return f(ui.measure_ctx, str, size, style);
+    }
+
+    /// Ascent, descent and line height at `size` in `style`, in points. `gfx.FontMetrics` says
+    /// how they relate to the `y` of a text command. Headless Uis without a metrics function
+    /// get `ascent = 0.8 * size`, `descent = 0.2 * size` and `lineHeight(size)`.
+    pub fn fontMetrics(ui: *const Ui, size: f32, style: gfx.TextStyle) gfx.FontMetrics {
+        const f = ui.metrics_fn orelse return .{ .ascent = 0.8 * size, .descent = 0.2 * size, .line_height = ui.lineHeight(size) };
+        return f(ui.measure_ctx, size, style);
     }
 
     /// Hover and click state of `r` for this frame. Draws nothing. A pointer
@@ -880,7 +926,7 @@ pub const Ui = struct {
 
     /// Text anchored at `x`,`y` (top of the line); `opts.align` picks which side `x` is.
     pub fn labelAt(ui: *Ui, x: f32, y: f32, str: []const u8, opts: LabelOpts) void {
-        ui.list.textWeighted(x, y, opts.size orelse ui.theme.font_body, opts.color orelse ui.theme.text, opts.@"align", opts.weight, str);
+        ui.list.textStyled(x, y, opts.size orelse ui.theme.font_body, opts.color orelse ui.theme.text, opts.@"align", opts.style orelse .{ .weight = opts.weight }, str);
     }
 
     /// Text placed against the left, middle or right edge of `r`, at its top.
@@ -1045,13 +1091,18 @@ pub const Ui = struct {
 
     /// `fitText` measuring in `weight`.
     pub fn fitTextWeighted(ui: *const Ui, buf: []u8, str: []const u8, size: f32, weight: gfx.Weight, max_w: f32) []const u8 {
-        if (str.len == 0 or ui.measureWeighted(str, size, weight) <= max_w) return str;
+        return ui.fitTextStyled(buf, str, size, .{ .weight = weight }, max_w);
+    }
+
+    /// `fitText` measuring in `style`.
+    pub fn fitTextStyled(ui: *const Ui, buf: []u8, str: []const u8, size: f32, style: gfx.TextStyle, max_w: f32) []const u8 {
+        if (str.len == 0 or ui.measureStyled(str, size, style) <= max_w) return str;
         var n = @min(str.len - 1, buf.len -| 3);
         while (n > 0) : (n -= 1) {
             if (!grapheme.isBoundary(str, n)) continue; // not in the middle of a character or cluster
             @memcpy(buf[0..n], str[0..n]);
             @memcpy(buf[n..][0..3], "...");
-            if (ui.measureWeighted(buf[0 .. n + 3], size, weight) <= max_w) return buf[0 .. n + 3];
+            if (ui.measureStyled(buf[0 .. n + 3], size, style) <= max_w) return buf[0 .. n + 3];
         }
         return "";
     }
@@ -1177,7 +1228,7 @@ pub const Ui = struct {
             .center => r.x + r.w / 2,
             .right => r.x + r.w,
         };
-        var it = ui.wrapText(str, size, r.w);
+        var it = ui.wrapTextStyled(str, size, r.w, opts.style orelse .{});
         var y = r.y;
         var n: usize = 0;
         var cur = it.next();
@@ -1191,7 +1242,7 @@ pub const Ui = struct {
                 const keep = text_edit.snapCluster(line, @min(line.len, tmp.len - 3));
                 @memcpy(tmp[0..keep], line[0..keep]);
                 @memcpy(tmp[keep..][0..3], "...");
-                ui.labelAt(x, y, ui.fitTextWeighted(&out, tmp[0 .. keep + 3], size, opts.weight, r.w), opts);
+                ui.labelAt(x, y, ui.fitTextStyled(&out, tmp[0 .. keep + 3], size, opts.style orelse .{ .weight = opts.weight }, r.w), opts);
             } else if (line.len > 0) ui.labelAt(x, y, line, opts);
             y += lh;
         }
@@ -1208,12 +1259,22 @@ pub const Ui = struct {
     /// Iterates the lines `str` wraps to at `size` within `max_w` points.
     /// See `WrapIter`.
     pub fn wrapText(ui: *const Ui, str: []const u8, size: f32, max_w: f32) WrapIter {
-        return .{ .ui = ui, .str = str, .size = size, .max_w = max_w, .done = str.len == 0 };
+        return ui.wrapTextStyled(str, size, max_w, .{});
+    }
+
+    /// `wrapText` with the lines measured in `style`.
+    pub fn wrapTextStyled(ui: *const Ui, str: []const u8, size: f32, max_w: f32, style: gfx.TextStyle) WrapIter {
+        return .{ .ui = ui, .str = str, .size = size, .max_w = max_w, .style = style, .done = str.len == 0 };
     }
 
     /// Height of `str` wrapped to `max_w` (lines times line height; 0 for "").
     pub fn measureWrapped(ui: *const Ui, str: []const u8, size: f32, max_w: f32) f32 {
-        var it = ui.wrapText(str, size, max_w);
+        return ui.measureWrappedStyled(str, size, max_w, .{});
+    }
+
+    /// `measureWrapped` with the lines measured in `style`.
+    pub fn measureWrappedStyled(ui: *const Ui, str: []const u8, size: f32, max_w: f32, style: gfx.TextStyle) f32 {
+        var it = ui.wrapTextStyled(str, size, max_w, style);
         var n: usize = 0;
         while (it.next()) |_| n += 1;
         return @as(f32, @floatFromInt(n)) * ui.lineHeight(size);
@@ -1232,7 +1293,7 @@ pub const Ui = struct {
         };
         const vis = ui.clip();
         var y = r.y;
-        var it = ui.wrapText(str, size, r.w);
+        var it = ui.wrapTextStyled(str, size, r.w, opts.style orelse .{});
         while (it.next()) |line| : (y += lh) {
             if (vis) |v| if (y + lh < v.y or y > v.y + v.h) continue;
             if (line.len > 0) ui.labelAt(x, y, line, opts);
@@ -1272,6 +1333,8 @@ pub const Ui = struct {
     /// A single-line text leaf for `lay`: hug width (the text's width) and one line high.
     /// `opts` is used as given except `w` and `h`, which stay as the caller set them unless
     /// they are the default `.hug`. Draw it with `ui.label(lay.rect(node), str, .{ .size = size })`.
+    /// It is sized at regular width (`layTextWeighted`: at a weight's width) and cannot take a
+    /// `gfx.TextStyle` yet, so a label drawn in a style may not fit its node.
     pub fn layText(ui: *const Ui, lay: *layout.Layout, str: []const u8, size: f32, opts: layout.Opts) layout.Node {
         return ui.layTextWeighted(lay, str, size, .regular, opts);
     }
@@ -1288,7 +1351,8 @@ pub const Ui = struct {
 
     /// A wrapped-text leaf for `lay`: its height comes from `measureWrapped` at the width it
     /// is given (the same wrapping `labelWrapped` draws). Width defaults to `.grow(1)`.
-    /// Draw it with `ui.labelWrapped(lay.rect(node), str, .{ .size = size })`.
+    /// Draw it with `ui.labelWrapped(lay.rect(node), str, .{ .size = size })`. It wraps at
+    /// regular widths and cannot take a `gfx.TextStyle` yet, so a styled label may not fit it.
     pub fn layWrapped(ui: *const Ui, lay: *layout.Layout, str: []const u8, size: f32, opts: layout.Opts) layout.Node {
         var o = opts;
         if (o.w.kind == .hug) o.w = .grow(1);
@@ -1301,11 +1365,11 @@ pub const Ui = struct {
     // ---- selectable text ----------------------------------------------
 
     /// Horizontal offset of `line` from the left of a `max_w` wide block.
-    fn lineOffset(ui: *const Ui, line: []const u8, size: f32, max_w: f32, al: gfx.Align) f32 {
+    fn lineOffset(ui: *const Ui, line: []const u8, size: f32, style: gfx.TextStyle, max_w: f32, al: gfx.Align) f32 {
         return switch (al) {
             .left => 0,
-            .center => (max_w - ui.measure(line, size)) / 2,
-            .right => max_w - ui.measure(line, size),
+            .center => (max_w - ui.measureStyled(line, size, style)) / 2,
+            .right => max_w - ui.measureStyled(line, size, style),
         };
     }
 
@@ -1322,14 +1386,19 @@ pub const Ui = struct {
     /// `offsetAtPoint` for text drawn with `align` (centre/right lines are
     /// shifted inside the block).
     pub fn offsetAtPointAligned(ui: *const Ui, str: []const u8, size: f32, max_w: f32, x: f32, y: f32, al: gfx.Align) usize {
+        return ui.offsetAtPointStyled(str, size, .{}, max_w, x, y, al);
+    }
+
+    /// `offsetAtPointAligned` for text wrapped and drawn in `style`.
+    pub fn offsetAtPointStyled(ui: *const Ui, str: []const u8, size: f32, style: gfx.TextStyle, max_w: f32, x: f32, y: f32, al: gfx.Align) usize {
         if (str.len == 0 or y < 0) return 0;
         const lh = ui.lineHeight(size);
         var top: f32 = 0;
-        var it = ui.wrapText(str, size, max_w);
+        var it = ui.wrapTextStyled(str, size, max_w, style);
         while (it.next()) |line| : (top += lh) {
             if (y >= top + lh) continue;
             const start = @intFromPtr(line.ptr) - @intFromPtr(str.ptr);
-            return start + ui.offsetAtX(line, size, x - ui.lineOffset(line, size, max_w, al));
+            return start + ui.offsetAtXStyled(line, size, style, x - ui.lineOffset(line, size, style, max_w, al));
         }
         return str.len;
     }
@@ -1357,7 +1426,8 @@ pub const Ui = struct {
         const size = opts.size orelse ui.theme.font_body;
         const lh = ui.lineHeight(size);
         const al = opts.@"align";
-        const height = ui.measureWrapped(str, size, r.w);
+        const ms: gfx.TextStyle = opts.style orelse .{};
+        const height = ui.measureWrappedStyled(str, size, r.w, ms);
         const id: *const anyopaque = st;
         const in = &ui.input;
         var selected = false;
@@ -1367,7 +1437,7 @@ pub const Ui = struct {
             if (!selected) st.clear(); // lost the selection to another text or a field
             const area: Rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = height };
             const hv = ui.hit(area);
-            const off = ui.offsetAtPointAligned(str, size, r.w, in.mouse_x - r.x, in.mouse_y - r.y, al);
+            const off = ui.offsetAtPointStyled(str, size, ms, r.w, in.mouse_x - r.x, in.mouse_y - r.y, al);
             if (hv.clicked) {
                 const clicks = ui.clickCount();
                 const extend = selected and in.mouse_mods.shift and clicks <= 1;
@@ -1459,23 +1529,23 @@ pub const Ui = struct {
         const vis = ui.clip();
         if (selected and st.hasSelection(str)) {
             const sel = st.range(str);
-            const space_w = ui.measure(" ", size);
+            const space_w = ui.measureStyled(" ", size, ms);
             var y = r.y;
-            var it = ui.wrapText(str, size, r.w);
+            var it = ui.wrapTextStyled(str, size, r.w, ms);
             while (it.next()) |line| : (y += lh) {
                 if (vis) |v| if (y + lh < v.y or y > v.y + v.h) continue;
                 const ls = @intFromPtr(line.ptr) - @intFromPtr(str.ptr);
                 const le = ls + line.len;
                 const a = @max(sel.start, ls);
                 const b = @min(sel.end, le);
-                const lx = r.x + ui.lineOffset(line, size, r.w, al);
+                const lx = r.x + ui.lineOffset(line, size, ms, r.w, al);
                 var x0 = lx;
                 var x1 = lx;
                 if (a < b) {
-                    x0 = lx + ui.measure(line[0 .. a - ls], size);
-                    x1 = lx + ui.measure(line[0 .. b - ls], size);
+                    x0 = lx + ui.measureStyled(line[0 .. a - ls], size, ms);
+                    x1 = lx + ui.measureStyled(line[0 .. b - ls], size, ms);
                 } else if (sel.start <= le and sel.end > le) {
-                    x0 = lx + ui.measure(line, size);
+                    x0 = lx + ui.measureStyled(line, size, ms);
                     x1 = x0;
                 } else continue;
                 // The selection runs on past a line break: show the break as a small stub.
@@ -1492,23 +1562,29 @@ pub const Ui = struct {
     /// Byte offset in `str` whose caret position is nearest to `x` points
     /// from the start of the text.
     pub fn offsetAtX(ui: *const Ui, str: []const u8, size: f32, x: f32) usize {
+        return ui.offsetAtXStyled(str, size, .{}, x);
+    }
+
+    /// Like `offsetAtX`, for text drawn in `style`.
+    pub fn offsetAtXStyled(ui: *const Ui, str: []const u8, size: f32, style: gfx.TextStyle, x: f32) usize {
         if (x <= 0) return 0;
         const Narrower = struct {
             ui: *const Ui,
             str: []const u8,
             size: f32,
+            style: gfx.TextStyle,
             x: f32,
 
             fn ok(c: @This(), b: usize) bool {
-                return c.ui.measure(c.str[0..b], c.size) < c.x;
+                return c.ui.measureStyled(c.str[0..b], c.size, c.style) < c.x;
             }
         };
         // The last boundary left of `x`, then the nearer of it and the next one.
-        const i = lastBoundaryWhere(str, 0, str.len, Narrower{ .ui = ui, .str = str, .size = size, .x = x });
+        const i = lastBoundaryWhere(str, 0, str.len, Narrower{ .ui = ui, .str = str, .size = size, .style = style, .x = x });
         if (i >= str.len) return str.len;
         const nb = text_edit.nextBoundary(str, i);
-        const w = ui.measure(str[0..nb], size);
-        const prev_w: f32 = if (i == 0) 0 else ui.measure(str[0..i], size);
+        const w = ui.measureStyled(str[0..nb], size, style);
+        const prev_w: f32 = if (i == 0) 0 else ui.measureStyled(str[0..i], size, style);
         return if (x - prev_w < w - x) i else nb;
     }
 
@@ -2228,11 +2304,13 @@ pub const WrapIter = struct {
     str: []const u8,
     size: f32,
     max_w: f32,
+    /// What the lines are measured in.
+    style: gfx.TextStyle = .{},
     pos: usize = 0,
     done: bool,
 
     fn fits(it: *const WrapIter, str: []const u8) bool {
-        return it.ui.measure(str, it.size) <= it.max_w;
+        return it.ui.measureStyled(str, it.size, it.style) <= it.max_w;
     }
 
     /// Words longer than this are cut by searching for where the line ends, not by measuring
@@ -3368,7 +3446,7 @@ test "chip and listRow report the pointer; weight reaches the display list" {
     var ui = testUi(&list, 10, 10, true);
     const hit = ui.chip(r, "tag", .{ .weight = .semibold });
     try std.testing.expect(hit.clicked);
-    try std.testing.expectEqual(gfx.Weight.semibold, list.cmds.items[list.cmds.items.len - 1].text.weight);
+    try std.testing.expectEqual(gfx.Weight.semibold, list.cmds.items[list.cmds.items.len - 1].text.style.weight);
     try std.testing.expectEqual(@as(f32, 17), ui.chipWidth("tag", .{ .size = 2 }, 7));
 
     list.reset();
@@ -3849,4 +3927,191 @@ test "labelFmt cuts on a cluster boundary, not between a letter and its marks" {
     try std.testing.expect(got.len > 400 and got.len < full.len);
     try std.testing.expect(std.mem.startsWith(u8, full, got));
     try std.testing.expect(grapheme.isBoundary(full, got.len));
+}
+
+fn boldMeasure(_: ?*anyopaque, str: []const u8, size: f32, style: gfx.TextStyle) f32 {
+    const n: f32 = @floatFromInt(std.unicode.utf8CountCodepoints(str) catch str.len);
+    return n * size * (if (style.weight == .bold) @as(f32, 2) else 1) * (if (style.mono) @as(f32, 0.5) else 1);
+}
+
+fn fixedMetrics(_: ?*anyopaque, size: f32, _: gfx.TextStyle) gfx.FontMetrics {
+    return .{ .ascent = size * 0.9, .descent = size * 0.3, .line_height = size * 1.4 };
+}
+
+test "styled measure without a styled measurer is the weighted measure; metrics are an approximation" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    const ui = wrapUi(&list);
+    try std.testing.expectEqual(@as(f32, 30), ui.measureStyled("abc", 10, .{ .italic = true, .mono = true }));
+    try std.testing.expectEqual(ui.measureWeighted("abc", 10, .bold), ui.measureStyled("abc", 10, .{ .weight = .bold }));
+    const m = ui.fontMetrics(10, .{ .weight = .bold });
+    try std.testing.expectEqual(@as(f32, 8), m.ascent);
+    try std.testing.expectEqual(@as(f32, 2), m.descent);
+    try std.testing.expectEqual(ui.lineHeight(10), m.line_height);
+}
+
+test "a styled measurer and metrics function can be set on a headless Ui" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    ui.setStyledMeasure(boldMeasure, fixedMetrics);
+    try std.testing.expectEqual(@as(f32, 60), ui.measureStyled("abc", 10, .{ .weight = .bold }));
+    try std.testing.expectEqual(@as(f32, 15), ui.measureStyled("abc", 10, .{ .mono = true }));
+    try std.testing.expectEqual(@as(f32, 9), ui.fontMetrics(10, .{}).ascent);
+    try std.testing.expectEqual(@as(f32, 14), ui.fontMetrics(10, .{}).line_height);
+    // The old entry points are unchanged.
+    try std.testing.expectEqual(@as(f32, 30), ui.measure("abc", 10));
+}
+
+test "offsetAtXStyled picks the nearest grapheme edge with the style's widths" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    // Regular: 10 per character, edges at 0, 10, 20, 30.
+    const regular: gfx.TextStyle = .{};
+    try std.testing.expectEqual(@as(usize, 0), ui.offsetAtXStyled("abc", 10, regular, -3));
+    try std.testing.expectEqual(@as(usize, 0), ui.offsetAtXStyled("abc", 10, regular, 4));
+    try std.testing.expectEqual(@as(usize, 1), ui.offsetAtXStyled("abc", 10, regular, 6));
+    try std.testing.expectEqual(@as(usize, 2), ui.offsetAtXStyled("abc", 10, regular, 16));
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtXStyled("abc", 10, regular, 26));
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtXStyled("abc", 10, regular, 99));
+    ui.setStyledMeasure(boldMeasure, null);
+    const bold: gfx.TextStyle = .{ .weight = .bold };
+    // Bold: 20 per character; edges at 0, 20, 40, 60.
+    try std.testing.expectEqual(@as(usize, 0), ui.offsetAtXStyled("abc", 10, bold, 9));
+    try std.testing.expectEqual(@as(usize, 1), ui.offsetAtXStyled("abc", 10, bold, 11));
+    try std.testing.expectEqual(@as(usize, 2), ui.offsetAtXStyled("abc", 10, bold, 31));
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtXStyled("abc", 10, bold, 59));
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtXStyled("abc", 10, bold, 500));
+    // A multi-codepoint cluster is one step: "e" + combining acute is never split.
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtXStyled("e\u{301}x", 10, regular, 12));
+}
+
+test "labelAt: style wins over weight, and without one the weight is used" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    ui.labelAt(0, 0, "a", .{ .weight = .medium });
+    ui.labelAt(0, 0, "b", .{ .weight = .medium, .style = .{ .italic = true, .underline = true } });
+    ui.label(.{ .x = 0, .y = 0, .w = 50, .h = 10 }, "c", .{ .style = .{ .weight = .bold, .mono = true } });
+    const t = list.cmds.items;
+    try std.testing.expectEqual(gfx.TextStyle{ .weight = .medium }, t[0].text.style);
+    try std.testing.expectEqual(gfx.TextStyle{ .italic = true, .underline = true }, t[1].text.style);
+    try std.testing.expectEqual(gfx.TextStyle{ .weight = .bold, .mono = true }, t[2].text.style);
+}
+
+test "styled labels wrap, trim, hit-test and select at the styled widths" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    ui.theme.line_spacing = 1;
+    ui.setStyledMeasure(boldMeasure, null); // bold characters are twice as wide
+    const bold: gfx.TextStyle = .{ .weight = .bold };
+    const r: Rect = .{ .x = 0, .y = 0, .w = 6, .h = 0 };
+
+    // Regular: "aa bb" fits in 6 (5 wide); bold: every word is a line.
+    try std.testing.expectEqual(@as(f32, 2), ui.measureWrapped("aa bb cc", 1, 6));
+    try std.testing.expectEqual(@as(f32, 3), ui.measureWrappedStyled("aa bb cc", 1, 6, bold));
+    var lines: [4][]const u8 = undefined;
+    var n: usize = 0;
+    var it = ui.wrapTextStyled("aa bb cc", 1, 6, bold);
+    while (it.next()) |l| : (n += 1) lines[n] = l;
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("bb", lines[1]);
+
+    // labelWrapped draws the same lines it measured, in the style.
+    const h = ui.labelWrapped(r, "aa bb cc", .{ .size = 1, .style = bold });
+    try std.testing.expectEqual(@as(f32, 3), h);
+    try std.testing.expectEqual(@as(usize, 3), list.cmds.items.len);
+    try std.testing.expectEqual(bold, list.cmds.items[0].text.style);
+    list.reset();
+    try std.testing.expectEqual(@as(f32, 2), ui.labelWrapped(r, "aa bb cc", .{ .size = 1 }));
+
+    // labelLines: two lines of bold text, the last one cut with an ellipsis at bold widths.
+    list.reset();
+    _ = ui.labelLines(.{ .x = 0, .y = 0, .w = 10, .h = 0 }, "aaaa bbbb cccc", 2, .{ .size = 1, .style = bold });
+    try std.testing.expectEqualStrings("aaaa", list.cmds.items[0].text.str);
+    try std.testing.expectEqualStrings("bb...", list.cmds.items[1].text.str);
+
+    // Hit-testing: bold characters are 2 wide, so on the second line ("bb", from offset 3)
+    // x = 1.4 is nearest the edge after one character and 3.5 the one after two.
+    try std.testing.expectEqual(@as(usize, 4), ui.offsetAtPointStyled("aa bb cc", 1, bold, 6, 1.4, 1.5, .left));
+    try std.testing.expectEqual(@as(usize, 5), ui.offsetAtPointStyled("aa bb cc", 1, bold, 6, 3.5, 1.5, .left));
+    try std.testing.expectEqual(@as(usize, 3), ui.offsetAtPointStyled("aa bb cc", 1, bold, 6, -1, 1.5, .left));
+    // Right-aligned lines are shifted by their styled width: "bb" (4 wide) in 6 starts at 2.
+    try std.testing.expectEqual(@as(usize, 4), ui.offsetAtPointStyled("aa bb cc", 1, bold, 6, 4.1, 1.5, .right));
+}
+
+test "textSelectable measures its block with the style it draws" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    ui.theme.line_spacing = 1;
+    ui.setStyledMeasure(boldMeasure, null);
+    var sel: SelectState = .{};
+    const r: Rect = .{ .x = 0, .y = 0, .w = 6, .h = 0 };
+    try std.testing.expectEqual(@as(f32, 3), ui.textSelectable(r, "aa bb cc", &sel, .{ .size = 1, .style = .{ .weight = .bold } }));
+    try std.testing.expectEqual(@as(f32, 2), ui.textSelectable(r, "aa bb cc", &sel, .{ .size = 1 }));
+}
+
+test "textSelectable's selection rectangles use the styled widths, for left and right alignment" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    ui.theme.line_spacing = 1;
+    ui.setStyledMeasure(boldMeasure, null);
+    var state: State = .{};
+    ui.state = &state;
+    ui.input.mouse_x = -100; // far from the text: no click
+    var sel: SelectState = .{ .anchor = 0, .cursor = 1 };
+    state.select = &sel;
+    const bold: gfx.TextStyle = .{ .weight = .bold };
+    const r: Rect = .{ .x = 0, .y = 0, .w = 6, .h = 0 };
+    const sel_col = ui.theme.selection;
+
+    // "aa bb" at width 6 in bold is two lines; one selected character of "aa" is 2 wide.
+    _ = ui.textSelectable(r, "aa bb", &sel, .{ .size = 1, .style = bold });
+    const left = list.cmds.items[0].rrect;
+    try std.testing.expectEqual(sel_col, left.color);
+    try std.testing.expectEqual(@as(f32, 0), left.rect.x);
+    try std.testing.expectEqual(@as(f32, 2), left.rect.w);
+
+    // Right-aligned: the line "aa" is 4 wide, so it starts at 2; its first character spans 2..4.
+    list.reset();
+    state.select = &sel;
+    _ = ui.textSelectable(r, "aa bb", &sel, .{ .size = 1, .style = bold, .@"align" = .right });
+    const right = list.cmds.items[0].rrect;
+    try std.testing.expectEqual(@as(f32, 2), right.rect.x);
+    try std.testing.expectEqual(@as(f32, 2), right.rect.w);
+
+    // Selecting all of "aa": 4 wide, whole line.
+    list.reset();
+    sel = .{ .anchor = 0, .cursor = 2 };
+    state.select = &sel;
+    _ = ui.textSelectable(r, "aa bb", &sel, .{ .size = 1, .style = bold });
+    try std.testing.expectEqual(@as(f32, 4), list.cmds.items[0].rrect.rect.w);
+}
+
+fn threePerChar(_: ?*anyopaque, str: []const u8, size: f32, _: gfx.TextStyle) f32 {
+    const n: f32 = @floatFromInt(std.unicode.utf8CountCodepoints(str) catch str.len);
+    return n * size * 3;
+}
+
+test "setting a styled measurer does not change how plain text wraps or hit-tests" {
+    var list = DisplayList.init(std.testing.allocator);
+    defer list.deinit();
+    var ui = wrapUi(&list);
+    const str = "aaa bbb ccc";
+    const h0 = ui.measureWrapped(str, 10, 70);
+    const o0 = ui.offsetAtX("abcdef", 10, 24);
+    const m0 = ui.measureStyled("abc", 10, .{});
+    ui.setStyledMeasure(threePerChar, null);
+    try std.testing.expectEqual(h0, ui.measureWrapped(str, 10, 70));
+    try std.testing.expectEqual(o0, ui.offsetAtX("abcdef", 10, 24));
+    try std.testing.expectEqual(m0, ui.measureStyled("abc", 10, .{}));
+    try std.testing.expectEqual(m0, ui.measure("abc", 10));
+    // Underline alone does not change the face, so not the width.
+    try std.testing.expectEqual(m0, ui.measureStyled("abc", 10, .{ .underline = true }));
+    // A face that differs does use the styled measurer.
+    try std.testing.expectEqual(@as(f32, 90), ui.measureStyled("abc", 10, .{ .italic = true }));
 }

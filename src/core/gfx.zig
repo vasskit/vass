@@ -12,9 +12,34 @@ pub const SvgIcon = image_mod.SvgIcon;
 
 pub const Align = enum { left, center, right };
 
-/// Font weight of a text command. A window with only one font (or without a
-/// face for the requested weight) draws every weight with its regular face.
-pub const Weight = enum { regular, medium, semibold };
+/// Font weight of a text command. A window whose fonts lack a face for the requested weight
+/// draws the nearest one it has; see `backend.FontSet` for the order.
+pub const Weight = enum { regular, medium, semibold, bold };
+
+/// How a text command looks besides its size and colour. Weight, italic and mono pick the face
+/// (a missing one is synthesised from the nearest); underline and strikethrough are drawn as
+/// lines over the whole string in the text colour. The baseline relation in `FontMetrics` holds
+/// for text within the face's ascent; see there for when it does not.
+pub const TextStyle = struct {
+    weight: Weight = .regular,
+    italic: bool = false,
+    /// The monospace family.
+    mono: bool = false,
+    /// Underline and strikethrough are filled lines in the text colour: with a translucent colour
+    /// the line and the glyphs it crosses blend twice where they overlap.
+    underline: bool = false,
+    strikethrough: bool = false,
+};
+
+/// Vertical metrics of a face at one size, in points, all positive. For a text command at `y`
+/// the baseline is at `y + ascent`, so to put runs of different faces on one baseline `b`,
+/// draw each at `y = b - metrics.ascent` using that run's own metrics. `descent` is the
+/// distance from the baseline to the bottom of the line box; `line_height` is the face's
+/// recommended distance between baselines (at least `ascent + descent`). The baseline sits at
+/// `y + ascent` for text whose glyphs stay within the face's ascent; SDL_ttf moves a line down
+/// when a glyph rises above it, and glyphs from a fallback font sit on that font's own ascent, so
+/// tall glyphs and fallback runs (CJK, symbols) can be a few pixels off.
+pub const FontMetrics = struct { ascent: f32, descent: f32, line_height: f32 };
 
 pub const Command = union(enum) {
     rrect: struct { rect: Rect, radius: f32, color: Color },
@@ -23,7 +48,9 @@ pub const Command = union(enum) {
     arc: struct { cx: f32, cy: f32, r: f32, a0: f32, a1: f32, width: f32, color: Color },
     /// Stroked straight segment with round caps.
     line: struct { x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Color },
-    text: struct { x: f32, y: f32, str: []const u8, size: f32, color: Color, alignment: Align, weight: Weight = .regular },
+    /// `y` is the top of the line box: the baseline is `y + ascent` (see `FontMetrics`, which also
+    /// says when a glyph can sit off it).
+    text: struct { x: f32, y: f32, str: []const u8, size: f32, color: Color, alignment: Align, style: TextStyle = .{} },
     /// A loaded image (see `Window.loadImage`) fitted into `rect`. Drawn as nothing if the
     /// handle is not (or no longer) valid for the window.
     image: struct { rect: Rect, image: Image, opts: ImageOpts },
@@ -188,8 +215,14 @@ pub const DisplayList = struct {
 
     /// Like `text`, in the given font weight.
     pub fn textWeighted(l: *DisplayList, x: f32, y: f32, size: f32, color: Color, alignment: Align, weight: Weight, str: []const u8) void {
+        l.textStyled(x, y, size, color, alignment, .{ .weight = weight }, str);
+    }
+
+    /// Like `text`, in `style`. `y` is the top of the line box; see `FontMetrics` for where the
+    /// baseline is.
+    pub fn textStyled(l: *DisplayList, x: f32, y: f32, size: f32, color: Color, alignment: Align, style: TextStyle, str: []const u8) void {
         const copy = l.arena.allocator().dupe(u8, str) catch @panic("out of memory");
-        l.push(.{ .text = .{ .x = x, .y = y, .str = copy, .size = size, .color = color, .alignment = alignment, .weight = weight } });
+        l.push(.{ .text = .{ .x = x, .y = y, .str = copy, .size = size, .color = color, .alignment = alignment, .style = style } });
     }
 
     pub fn textFmt(l: *DisplayList, x: f32, y: f32, size: f32, color: Color, alignment: Align, comptime fmt: []const u8, args: anytype) void {
@@ -258,4 +291,18 @@ test "shadow records stacked rounded rects, widest first" {
     const last = l.cmds.items[l.cmds.items.len - 1].rrect.rect;
     try std.testing.expect(first.w > last.w);
     try std.testing.expect(l.cmds.items[l.cmds.items.len - 1].rrect.color.a > l.cmds.items[0].rrect.color.a);
+}
+
+test "textWeighted and textStyled record the style" {
+    var l = DisplayList.init(std.testing.allocator);
+    defer l.deinit();
+    const col: Color = .{ .r = 1, .g = 2, .b = 3 };
+    l.text(0, 0, 10, col, .left, "a");
+    l.textWeighted(0, 0, 10, col, .left, .bold, "b");
+    l.textStyled(0, 0, 10, col, .left, .{ .italic = true, .mono = true, .underline = true }, "c");
+    try std.testing.expectEqual(TextStyle{}, l.cmds.items[0].text.style);
+    try std.testing.expectEqual(Weight.bold, l.cmds.items[1].text.style.weight);
+    try std.testing.expect(!l.cmds.items[1].text.style.italic);
+    const st = l.cmds.items[2].text.style;
+    try std.testing.expect(st.italic and st.mono and st.underline and !st.strikethrough);
 }
